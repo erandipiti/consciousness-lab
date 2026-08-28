@@ -4,6 +4,11 @@
 format must satisfy and what is still undecided. The schema itself is CL-002
 work. Nothing here should be read as a field list.
 
+> A design **proposal** answering R1–R7 and Q1–Q8 now exists at
+> [`SESSION_SCHEMA_PROPOSAL.md`](SESSION_SCHEMA_PROPOSAL.md) (CL-002A). It is a
+> proposal, not a decision: `DECISIONS.md` is unchanged and this document's
+> questions stay open until a human approves it.
+
 Writing a schema before these questions are answered would freeze guesses into
 the data contract, and the data contract is the one thing that cannot be
 cheaply changed later — every recording made under it inherits it.

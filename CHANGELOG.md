@@ -9,6 +9,31 @@ Versioning policy is unresolved — see `docs/OPERATIONS.md`.
 
 ## [Unreleased]
 
+### Added — CL-002A: session schema design proposal (documentation only)
+
+- `docs/SESSION_SCHEMA_PROPOSAL.md` — Session Package v1 and Session Registry
+  design proposal. Answers `SESSION_FORMAT.md` Q1–Q8 and the CL-002A special
+  review questions. Directory-per-session packages, Arrow IPC immutable chunks,
+  canonical device payload capture, separate packet/sample/observation tables,
+  a fully derived SQLite registry, and an eight-condition completion predicate.
+- Pointer from `docs/SESSION_FORMAT.md` to the proposal.
+
+### Notes
+
+- **No code was written.** No Python module, schema model, storage writer,
+  registry or migration exists. CL-002B is not started.
+- **`docs/DECISIONS.md` is deliberately unchanged.** Every design point in the
+  proposal is labelled PROPOSED / OPEN — HUMAN DECISION REQUIRED /
+  OPEN — HARDWARE VALIDATION REQUIRED / DEFERRED SAFELY. Nothing is decided
+  until a human approves it.
+- Independently reviewed in three adversarial passes by OpenAI Codex CLI 0.133.0
+  (read-only). 4 blocking + 10 serious findings in pass 1, 2 blocking + 3 serious
+  plus three constructed false-complete states in pass 2, and 9 required changes
+  in the final pass. Final verdict `GO WITH REQUIRED CHANGES`; all 9 applied.
+  Trace in §25 of the proposal.
+- No scientific threshold, band definition, duration or state definition was
+  introduced.
+
 ## [0.1.0] — 2026-08-28
 
 ### Added — CL-001: repository bootstrap and engineering contract
