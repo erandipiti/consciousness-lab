@@ -1,0 +1,79 @@
+[project]
+name = "consciousness-lab"
+version = "0.1.0"
+description = "Research platform for Consciousness Lab Study 001 physiological acquisition and analysis."
+readme = "README.md"
+requires-python = ">=3.11,<3.12"
+license = { text = "Proprietary" }
+
+# Runtime dependency plan for Study 001 (CL-001).
+# Deliberately unpinned here: exact versions are frozen in uv.lock, which is the
+# reproducibility contract. Nothing in this list implies a component exists yet.
+dependencies = [
+    # Acquisition / device I/O
+    "brainflow",      # Muse S Athena and other BCI board I/O
+    "bleak",          # Bluetooth Low Energy transport
+    "polar-python",   # Polar H10 BLE streams (third-party, unverified — see docs/HARDWARE.md)
+    "pyserial",       # QT Py / serial marker channel
+    # Signal handling
+    "mne",
+    "numpy",
+    "scipy",
+    # Storage / tabular
+    "pandas",
+    "pyarrow",
+    "duckdb",
+    # Configuration and models
+    "pydantic",
+    "pydantic-settings",
+    # Operator surface
+    "typer",
+    "rich",
+    "structlog",
+    # Inspection
+    "matplotlib",
+]
+
+[project.scripts]
+consciousness-lab = "consciousness_lab.cli:app"
+
+[dependency-groups]
+dev = [
+    "pytest",
+    "pytest-asyncio",
+    "hypothesis",
+    "ruff",
+    "mypy",
+    "pre-commit",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/consciousness_lab"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "UP", "B", "SIM", "RUF"]
+
+[tool.mypy]
+python_version = "3.11"
+strict = true
+files = ["src", "tests"]
+# Third-party device and science libraries ship incomplete or absent stubs.
+# Silencing the *import* is not the same as trusting the library: see AGENTS.md.
+[[tool.mypy.overrides]]
+module = ["brainflow.*", "polar_python.*", "serial.*", "mne.*", "scipy.*", "duckdb.*"]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+asyncio_mode = "strict"
+asyncio_default_fixture_loop_scope = "function"

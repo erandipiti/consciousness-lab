@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+*.egg-info/
+
+# Tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+
+# Recorded data.
+# Raw physiological data is immutable and is NOT versioned in git: it is large,
+# it is binary, and a git history that can be rewritten is the wrong custody
+# model for it. Storage location and retention are unresolved — see
+# docs/SESSION_FORMAT.md and docs/OPERATIONS.md. The directory is tracked so the
+# layout is stable; its contents are not.
+data/*
+!data/.gitkeep
+
+# OS
+.DS_Store
