@@ -49,6 +49,12 @@ class ChunkRecordOnDisk:
     model: ChunkCommit
     canonical_bytes: bytes
     record_sha256: str
+    #: Whether the ``payloads`` KEY is present in the document, regardless of
+    #: its value. §12.2 requires the key omitted entirely at non-payload capture
+    #: levels — "never written as a null" — and two records that both carry an
+    #: explicit null agree with each other while both violating the contract.
+    #: Pairwise equality cannot see that; key presence can (matrix row R12).
+    payloads_key_present: bool
 
     @property
     def chunk_id(self) -> int:
@@ -61,7 +67,7 @@ class ChunkRecordOnDisk:
 
 @dataclass(frozen=True)
 class PhysicalChunk:
-    """A committed chunk reconciled against its physical packets artifact."""
+    """A committed chunk reconciled against its physical artifacts."""
 
     record: ChunkRecordOnDisk
     #: First/last ``packet_seq`` actually present in ``packets/NNNNNN.arrow``.
@@ -70,6 +76,16 @@ class PhysicalChunk:
     physical_last_packet_seq: int | None
     packet_rows: int
     packet_error: str | None
+    #: ``packet_seq -> n_samples`` from the physical packets rows, for the
+    #: foreign-key checks in matrix rows R20-R23.
+    packet_sample_counts: dict[int, int]
+    #: Structural foreign-key violations found between samples/observations and
+    #: the packets of the same chunk.
+    reference_errors: tuple[str, ...]
+
+    @property
+    def chunk_id(self) -> int:
+        return self.record.chunk_id
 
 
 @dataclass(frozen=True)
@@ -91,6 +107,10 @@ class PhysicalStreamState:
     #: authoritative commit log, so a sidecar must never contradict it.
     sidecars: dict[int, ChunkRecordOnDisk]
     sidecar_errors: tuple[str, ...]
+    #: Chain-level ordering violations (matrix rows R24, R25). Per-chunk
+    #: validation does not imply chain validation: every chunk of a reversed
+    #: chain still matches its own artifact.
+    order_errors: tuple[str, ...]
 
     @property
     def commits(self) -> tuple[ChunkCommit, ...]:
@@ -160,6 +180,7 @@ def parse_chunk_record(raw: bytes) -> ChunkRecordOnDisk | str:
         model=model,
         canonical_bytes=canonical_json.canonicalize(obj),
         record_sha256=str(obj[canonical_json.RECORD_HASH_KEY]),
+        payloads_key_present="payloads" in obj,
     )
 
 
@@ -217,6 +238,76 @@ def read_sidecars(stream_root: Path) -> tuple[dict[int, ChunkRecordOnDisk], tupl
     return sidecars, tuple(errors)
 
 
+def _read_column(path: Path, column: str) -> tuple[list[object] | None, str | None]:
+    """Read one column from an Arrow IPC stream file, reporting rather than raising."""
+    try:
+        with path.open("rb") as handle:
+            table = pa.ipc.open_stream(handle).read_all()
+        return list(table.column(column).to_pylist()), None
+    except (pa.ArrowException, OSError, KeyError, TypeError, ValueError) as exc:
+        return None, f"{path.name} unreadable ({exc})"
+
+
+def _read_packet_facts(path: Path) -> tuple[dict[int, int] | None, str | None]:
+    """Return ``packet_seq -> n_samples`` from a physical packets artifact."""
+    try:
+        with path.open("rb") as handle:
+            table = pa.ipc.open_stream(handle).read_all()
+        rows = table.select(["packet_seq", "n_samples"]).to_pylist()
+    except (pa.ArrowException, OSError, KeyError, TypeError, ValueError) as exc:
+        return None, f"packets artifact unreadable ({exc})"
+    return {int(r["packet_seq"]): int(r["n_samples"]) for r in rows}, None
+
+
+def _check_references(
+    stream_root: Path, record: ChunkRecordOnDisk, packet_counts: dict[int, int]
+) -> tuple[str, ...]:
+    """Structural foreign keys from samples/observations to this chunk's packets.
+
+    Matrix rows R20-R23. These follow from §9.1's own statements — that
+    ``(packet_seq, sample_index_in_packet)`` is the sample primary key and that
+    ``n_samples`` is "samples carried in this packet" — and are structural, not
+    scientific: no minimum count is implied or enforced.
+    """
+    errors: list[str] = []
+    commit = record.model
+    for label, artifact, index_required in (
+        ("samples", commit.samples, True),
+        ("observations", commit.observations, False),
+    ):
+        target = stream_root / artifact.path
+        if not target.is_file():
+            continue
+        try:
+            with target.open("rb") as handle:
+                table = pa.ipc.open_stream(handle).read_all()
+            rows = table.select(["packet_seq", "sample_index_in_packet"]).to_pylist()
+        except (pa.ArrowException, OSError, KeyError, TypeError, ValueError) as exc:
+            errors.append(f"{label} artifact unreadable ({exc})")
+            continue
+        for position, row in enumerate(rows):
+            seq = int(row["packet_seq"])
+            if seq not in packet_counts:
+                errors.append(
+                    f"{label} row {position} references packet_seq {seq}, "
+                    "absent from this chunk's packets"
+                )
+                break
+            index = row["sample_index_in_packet"]
+            if index is None:
+                if index_required:
+                    errors.append(f"{label} row {position} has a null sample index")
+                    break
+                continue
+            if not 0 <= int(index) < packet_counts[seq]:
+                errors.append(
+                    f"{label} row {position} sample index {index} is outside "
+                    f"n_samples={packet_counts[seq]} for packet {seq}"
+                )
+                break
+    return tuple(errors)
+
+
 def read_packet_range(path: Path) -> tuple[int | None, int | None, int, str | None]:
     """Read the actual ``packet_seq`` values from a committed packets artifact.
 
@@ -254,12 +345,16 @@ def read_packet_range(path: Path) -> tuple[int | None, int | None, int, str | No
 
 
 def _reconcile_chunk(stream_root: Path, record: ChunkRecordOnDisk) -> PhysicalChunk:
-    """Attach a chunk's physical packet range to its commit record."""
+    """Reconcile a commit record against every physical artifact it names."""
     packets_path = stream_root / record.model.packets.path
     if not packets_path.is_file():
-        return PhysicalChunk(record, None, None, 0, "packets artifact is absent")
+        return PhysicalChunk(record, None, None, 0, "packets artifact is absent", {}, ())
     first, last, rows, error = read_packet_range(packets_path)
-    return PhysicalChunk(record, first, last, rows, error)
+    counts, counts_error = _read_packet_facts(packets_path)
+    if counts is None:
+        return PhysicalChunk(record, first, last, rows, error or counts_error, {}, ())
+    references = _check_references(stream_root, record, counts)
+    return PhysicalChunk(record, first, last, rows, error, counts, references)
 
 
 def read_physical_stream(paths: PackagePaths, stream_id: str) -> PhysicalStreamState:
@@ -302,9 +397,40 @@ def read_physical_stream(paths: PackagePaths, stream_id: str) -> PhysicalStreamS
         descriptor_error=descriptor_error,
         chunks=chunks,
         chain_error=chain_error,
+        order_errors=_check_chain_order(chunks),
         sidecars=sidecars,
         sidecar_errors=sidecar_errors,
     )
+
+
+def _check_chain_order(chunks: tuple[PhysicalChunk, ...]) -> tuple[str, ...]:
+    """Chain-level ordering across the whole authoritative sequence.
+
+    ``chunk_id`` strictly increases because the index is append-only and chunks
+    are sealed in order, and ``packet_seq`` is "strictly increasing at arrival"
+    (§9.1) for the whole stream, so chunk N+1 must begin after chunk N ends.
+
+    Contiguity is deliberately NOT required for either: a gap in ``packet_seq``
+    is a device fact for a later ticket, and requiring consecutiveness here
+    would be a packet-loss criterion.
+    """
+    errors: list[str] = []
+    for previous, current in itertools.pairwise(chunks):
+        if current.chunk_id <= previous.chunk_id:
+            errors.append(
+                f"chunk_id does not increase along the chain "
+                f"({previous.chunk_id} then {current.chunk_id})"
+            )
+        previous_last = previous.physical_last_packet_seq
+        current_first = current.physical_first_packet_seq
+        if previous_last is None or current_first is None:
+            continue
+        if current_first <= previous_last:
+            errors.append(
+                f"chunk {current.chunk_id} begins at packet {current_first}, "
+                f"which does not follow chunk {previous.chunk_id} ending at {previous_last}"
+            )
+    return tuple(errors)
 
 
 def read_all_physical_streams(paths: PackagePaths) -> dict[str, PhysicalStreamState]:

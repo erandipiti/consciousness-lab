@@ -323,33 +323,53 @@ def test_c2_7_consistently_rewritten_packets_and_summaries_verify(
 ) -> None:
     """C2-7 positive control: when everything genuinely agrees, it passes.
 
-    The packets artifact is rewritten in fixture code with a real, shifted
-    packet range, and every dependent hash and summary is recomputed. This
-    proves the new checks accept truth, not merely that they reject change.
+    The packets, samples and observations artifacts are all rewritten in fixture
+    code with a real shifted packet range, and every dependent hash and summary
+    is recomputed. This proves the checks accept truth rather than merely
+    rejecting change.
+
+    An earlier version of this fixture shifted only the packets artifact and was
+    caught by the samples/observations foreign-key checks — the fixture, not the
+    production code, was the inconsistent one. That is why the shift is applied
+    to all three artifacts here.
     """
-    from consciousness_lab.storage.arrow_schema import PACKETS_SCHEMA
+    from consciousness_lab.session.model import SampleLayout
+    from consciousness_lab.storage.arrow_schema import (
+        OBSERVATIONS_SCHEMA,
+        PACKETS_SCHEMA,
+        samples_schema,
+    )
 
     built = build_session(data_root, streams=[SYN], required=(SYN.stream_id,), chunks=1)
     paths = built.allocated.paths
-    packets_path = paths.stream(SYN.stream_id).root / "packets/000000.arrow"
-
-    with packets_path.open("rb") as handle:
-        rows = pa.ipc.open_stream(handle).read_all().to_pylist()
+    root = paths.stream(SYN.stream_id).root
     shift = 1000
-    for row in rows:
-        row["packet_seq"] = int(row["packet_seq"]) + shift
-    table = pa.Table.from_pylist(rows, schema=PACKETS_SCHEMA)
-    with packets_path.open("wb") as sink, pa.ipc.new_stream(sink, PACKETS_SCHEMA) as writer:
-        writer.write_table(table)
+
+    schemas = {
+        "packets": PACKETS_SCHEMA,
+        "observations": OBSERVATIONS_SCHEMA,
+        "samples": samples_schema(SampleLayout.DENSE_FIXED_LIST, SYN.n_channels),
+    }
+    for kind, schema in schemas.items():
+        target = root / f"{kind}/000000.arrow"
+        with target.open("rb") as handle:
+            rows = pa.ipc.open_stream(handle).read_all().to_pylist()
+        for row in rows:
+            row["packet_seq"] = int(row["packet_seq"]) + shift
+        table = pa.Table.from_pylist(rows, schema=schema)
+        with target.open("wb") as sink, pa.ipc.new_stream(sink, schema) as writer:
+            writer.write_table(table)
 
     def shift_range(chunk_id: int, record: dict[str, Any]) -> None:
         record["first_packet_seq"] = str(int(record["first_packet_seq"]) + shift)
         record["last_packet_seq"] = str(int(record["last_packet_seq"]) + shift)
-        record["packets"] = dict(
-            record["packets"],
-            sha256=sha256_bytes(packets_path.read_bytes()),
-            bytes=str(packets_path.stat().st_size),
-        )
+        for kind in schemas:
+            target = root / f"{kind}/000000.arrow"
+            record[kind] = dict(
+                record[kind],
+                sha256=sha256_bytes(target.read_bytes()),
+                bytes=str(target.stat().st_size),
+            )
 
     forge_chain(paths, SYN.stream_id, shift_range)
     refresh_manifest(paths, SYN.stream_id)

@@ -153,6 +153,25 @@ def _assert_streams_on_disk(writer: SessionWriter, run: Run) -> None:
                     "writer committed"
                 )
 
+        # Chain-level ordering and structural references, from the same shared
+        # physical state the verifier uses. Per-chunk agreement does not imply
+        # chain agreement (matrix rows R24, R25).
+        if state.order_errors:
+            raise FinalizationError(
+                f"stream {stream_id}: chain ordering is invalid: {list(state.order_errors)}"
+            )
+        expects_payload = state.descriptor is not None and state.descriptor.expects_payload_artifact
+        for chunk in state.chunks:
+            if chunk.record.payloads_key_present != expects_payload:
+                raise FinalizationError(
+                    f"stream {stream_id}: chunk {chunk.chunk_id} payloads key presence "
+                    "violates the capture-level contract"
+                )
+            if chunk.reference_errors:
+                raise FinalizationError(
+                    f"stream {stream_id}: chunk {chunk.chunk_id} row references are "
+                    f"invalid: {list(chunk.reference_errors)}"
+                )
         if state.sidecar_errors:
             raise FinalizationError(
                 f"stream {stream_id}: unreadable or misnamed sidecar(s): "

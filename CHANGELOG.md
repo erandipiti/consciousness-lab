@@ -9,6 +9,61 @@ Versioning policy is unresolved — see `docs/OPERATIONS.md`.
 
 ## [Unreleased]
 
+### Added — CL-002B-R1-C3: chunk representation equivalence matrix
+
+**Why single-attack patching stopped.** Three review cycles produced the same
+shape of defect, never the same bug twice: manifest vs missing raw directory,
+sidecar vs `chunks.jsonl`, parsed-model equality vs canonical record identity,
+asymmetric null handling, then chain ordering and symmetric null. Each fix
+closed the reported attack and left an adjacent state of the *same relation*
+unenumerated. The failure was never a missing `if`; it was an unenumerated
+relation. So this round enumerated them before touching code.
+
+**`docs/CHUNK_EQUIVALENCE.md`** records the 10 representations of a committed
+chunk, field-by-field authority (no artifact is universally authoritative — that
+assumption caused two of the defects), 34 required relations R01–R34, the
+nullability matrix including symmetric-invalid states, the collection/order
+matrix, the structural foreign keys actually enforced, zero-chunk semantics, and
+what is deliberately not enforced.
+
+**Newly enforced matrix rows**
+
+- **R12 payload key *presence*** — §12.2 requires the `payloads` key omitted at
+  `library_decoded` / `synthetic`, "never written as a null". Two records both
+  carrying an explicit null agree with each other and both violate the contract;
+  pairwise equality is blind to it, so key presence is now checked directly.
+- **R19 / R24 / R25 ordering** — `packet_seq` is strictly increasing within a
+  chunk and across the chain (§9.1), and `chunk_id` strictly increases along the
+  append-only chain. A reversed or swapped chain previously passed because every
+  chunk still matched its own artifact. Contiguity is **not** required for
+  either: a gap is a device fact for a later ticket.
+- **R20–R23 structural foreign keys** — `samples.packet_seq` and
+  `observations.packet_seq` must reference a packet in the same chunk, and
+  sample indices must fall within that packet's `n_samples`. These follow from
+  §9.1's own statements and are structural, not scientific.
+
+**Property-based mutation testing.** A Hypothesis sweep over 15 mutation
+dimensions × capture level × chunk position asserts one property: mutate any
+single representation so a required relation is violated, recompute every
+attacker-controlled hash, and `is_completed` must be false. An explicit audit
+confirmed 28 of 30 mutation/capture-level combinations apply and **all 28 are
+caught**; the 2 skips are genuinely inapplicable.
+
+**Explicit regressions.** E1–E25 name the high-value attack classes, plus
+adjacent-swap, duplicate chunk id, per-position (first/middle/last) forging,
+cardinality 0/1/2/3/5, and finalizer parity for ordering and key presence.
+
+**Test-fixture integrity.** The new foreign-key checks caught the C2-7 "consistent
+rewrite" fixture, which shifted the packets artifact but not the samples and
+observations referencing it. The *fixture* was inconsistent, not the production
+code. It was corrected rather than the check weakened.
+
+**Closed from the previous review:** both remaining BLOCKING findings — reordered
+chain, and symmetric `"payloads": null` — each with named tests (E12, E7).
+
+311 tests. No scientific completeness rule: zero-chunk streams remain valid and
+no minimum chunk, packet, sample or duration criterion exists.
+
 ### Fixed — CL-002B-R1-C2: canonical record and physical packet reconciliation
 
 Previous Codex verdict: **`GO WITH REQUIRED CHANGES`**, three BLOCKING findings.

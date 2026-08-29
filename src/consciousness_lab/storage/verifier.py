@@ -103,6 +103,9 @@ class Finding(StrEnum):
     UNREADABLE_PACKETS_ARTIFACT = "unreadable_packets_artifact"
     ARTIFACT_PATH_NOT_CANONICAL = "artifact_path_not_canonical"
     ARTIFACT_PATH_REUSED = "artifact_path_reused"
+    CHAIN_ORDER_INVALID = "chain_order_invalid"
+    PAYLOAD_KEY_PRESENCE_INVALID = "payload_key_presence_invalid"
+    ROW_REFERENCE_INVALID = "row_reference_invalid"
     UNEXPECTED_FILE = "unexpected_file"
     SYMLINK_IN_PACKAGE = "symlink_in_package"
     UNSAFE_PATH = "unsafe_path"
@@ -526,6 +529,11 @@ def _verify_stream(
     if state.chain_error is not None:
         result.add(Finding.BROKEN_CHUNK_CHAIN, state.chain_error, stream_id)
         ok = False
+    for order_error in state.order_errors:
+        # Chain-level, not per-chunk: every chunk of a reversed chain still
+        # matches its own artifact (matrix rows R24, R25).
+        result.add(Finding.CHAIN_ORDER_INVALID, order_error, stream_id)
+        ok = False
 
     if entry is not None:
         if entry.chunk_count != state.chunk_count:
@@ -582,6 +590,37 @@ def _verify_stream(
                 f"chunk {chunk_id} claims packets "
                 f"({commit.first_packet_seq}, {commit.last_packet_seq}) but the artifact "
                 f"holds ({chunk.physical_first_packet_seq}, {chunk.physical_last_packet_seq})",
+                stream_id,
+            )
+            ok = False
+
+        # --- payload KEY presence, which pairwise equality cannot see -------
+        # Both copies carrying an explicit null agree with each other and both
+        # violate §12.2, which requires the key omitted (matrix row R12).
+        expects_payload = state.descriptor.expects_payload_artifact
+        if chunk.record.payloads_key_present != expects_payload:
+            result.add(
+                Finding.PAYLOAD_KEY_PRESENCE_INVALID,
+                f"chunk {chunk_id}: payloads key is "
+                f"{'present' if chunk.record.payloads_key_present else 'absent'} at "
+                f"raw_capture_level={state.descriptor.acquisition.raw_capture_level.value}",
+                stream_id,
+            )
+            ok = False
+        sidecar_record = state.sidecars.get(chunk_id)
+        if sidecar_record is not None and sidecar_record.payloads_key_present != expects_payload:
+            result.add(
+                Finding.PAYLOAD_KEY_PRESENCE_INVALID,
+                f"chunk {chunk_id} sidecar: payloads key presence violates §12.2",
+                stream_id,
+            )
+            ok = False
+
+        # --- structural foreign keys from samples/observations to packets ---
+        for reference_error in chunk.reference_errors:
+            result.add(
+                Finding.ROW_REFERENCE_INVALID,
+                f"chunk {chunk_id}: {reference_error}",
                 stream_id,
             )
             ok = False
