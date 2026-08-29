@@ -72,6 +72,44 @@ produced by a step that only exists in someone's shell history.
 - Where recordings ultimately live, how they are backed up, and how long they
   are kept are **open** — `SESSION_FORMAT.md` Q8, `SAFETY.md`.
 
+## Recording a session (CL-002B)
+
+The storage and session layer is implemented. A deterministic synthetic session,
+end to end, with no hardware attached:
+
+```python
+from consciousness_lab.session.allocator import allocate_session
+from consciousness_lab.session.finalizer import finalize
+from consciousness_lab.session.model import ClockReading, RawCaptureLevel, RecordingOutcome, Run
+from consciousness_lab.session.writer import SessionWriter
+from consciousness_lab.session import registry
+from consciousness_lab.storage.paths import DataRoot
+from consciousness_lab.storage.reader import open_package
+from consciousness_lab.storage.verifier import verify_package
+from consciousness_lab.synthetic.source import SyntheticSource, SyntheticStreamSpec, build_descriptor
+
+root = DataRoot(Path("data"))
+allocated = allocate_session(root, participant_pseudonym="P001")   # durable before anything else
+writer = SessionWriter.open(allocated.paths)
+writer.start_recording(Run(sealed_at=reading, required_streams=["synthetic.eeg"]))
+
+spec = SyntheticStreamSpec("synthetic.eeg", RawCaptureLevel.TRANSPORT_PAYLOAD)
+writer.open_stream(build_descriptor(spec))
+source = SyntheticSource(spec, seed=7)
+for _ in range(2):
+    writer.commit_chunk("synthetic.eeg", source.next_chunk(3))
+
+finalize(writer, outcome=RecordingOutcome.COMPLETED, data_root=root)
+assert verify_package(allocated.paths).is_completed
+registry.rebuild(root)                     # the index is derived; this recovers it entirely
+package = open_package(allocated.paths)    # verifies before handing out any raw data
+```
+
+`verify_package()` returns structured findings, not a bare boolean. Use
+`registry.query_sessions()` rather than `read_sessions()` when the answer
+matters: the latter reads the cache as-is and may be stale, and the package is
+always the authority.
+
 ## Change hygiene
 
 - One CL ticket per change.

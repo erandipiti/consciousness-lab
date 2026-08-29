@@ -462,6 +462,19 @@ class AnnotationHead(Strict):
     head_record_sha256: str | None = None
 
 
+class RawRef(Strict):
+    """A pointer from a semantic event to the raw row it refers to (spec §11).
+
+    ``packet_seq`` is an int64 domain, so on disk it is a decimal string like
+    every other 64-bit value; ``sample_index_in_packet`` is a bounded int32 and
+    stays a JSON Number (§12.2.1).
+    """
+
+    stream_id: str
+    packet_seq: Int64Decimal
+    sample_index_in_packet: int | None = None
+
+
 class EventRecord(Strict):
     """One entry in the shared ``events/events.jsonl`` (spec §11)."""
 
@@ -475,7 +488,7 @@ class EventRecord(Strict):
     host_arrival_utc_ns: Int64Decimal
     host_arrival_monotonic_clock_id: str = "CLOCK_MONOTONIC"
     host_arrival_utc_clock_id: str = "CLOCK_REALTIME"
-    raw_ref: dict[str, Any] | None = None
+    raw_ref: RawRef | None = None
     payload: dict[str, Any] = Field(default_factory=dict)
     record_sha256: str | None = None
 

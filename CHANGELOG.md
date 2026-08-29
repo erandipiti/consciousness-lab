@@ -9,6 +9,70 @@ Versioning policy is unresolved — see `docs/OPERATIONS.md`.
 
 ## [Unreleased]
 
+### Added — CL-002B: Session Package v1 implementation
+
+Implements the approved schema (`DECISIONS.md` D8–D26,
+`SESSION_SCHEMA_PROPOSAL.md`). No hardware adapter, no analysis, no timing
+reconstruction, no Focus logic. **Zero specification deviations.**
+
+**storage/** — `integer_types` (`int64_decimal` / `uint64_decimal`, refusing
+JSON Numbers on disk), `canonical_json` (RFC 8785 JCS + the `record_sha256`
+procedure), `payload` (PYLD framing + CRC-32C), `safe_paths` (traversal and
+symlink refusal), `arrow_schema` (packets / samples / observations),
+`observations` (exactly-one-value-column rule), `chunk_writer` (atomic commit +
+hash chain), `checksums` (atomic and no-clobber writes), `paths`, `verifier`
+(the eight-condition predicate with structured findings), `reader`
+(read + replay).
+
+**session/** — `model` (typed on-disk contract, capture-level invariant),
+`allocator` (mkdir-first ordering), `lifecycle`, `annotations` (effective
+outcome, fail-closed), `writer`, `finalizer`, `registry` (derived SQLite,
+rebuildable), `recovery` (reports, never repairs).
+
+**synthetic/** — a deterministic seeded source, scoped to exercising v1.
+The asynchronous multi-device recorder is CL-003 and is deliberately absent.
+
+**232 tests**, including 6 property tests, fault injection at every chunk
+commit stage, and a regression for every constructed false-complete package.
+
+### Implementation review — CL-002B
+
+Three read-only Codex passes. All findings fixed, each with a regression test.
+
+| Pass | Finding | Sev | Disposition |
+|---|---|---|---|
+| 1 | Immutable package content overwritable via public APIs (sealed reopen, `run.json`, descriptors, chunk 0 restart) | BLOCKING | Fixed: `SealedPackageError` guards, `atomic_write_new`, `ChunkWriter` refuses an occupied stream |
+| 1 | Verifier wrote a temp file inside the sealed package | SERIOUS | Fixed: sealed prefix parsed in memory |
+| 1 | `finalize()` could seal `COMPLETED` when not clean | SERIOUS | Fixed: refuses before writing the terminal record |
+| 1 | `read_sessions()` could be read as truth | SERIOUS | Fixed: documented as cache, added `query_sessions()`, wired the derived upsert into allocation and finalization |
+| 1 | int64/uint64 accepted JSON Numbers on disk | SERIOUS | Fixed: `load_on_disk()` on every disk read |
+| 1 | Observation rows unvalidated | SERIOUS | Fixed: enum + exactly-one-value-column checks before write |
+| 1 | `hardware_verification` shape mismatch | SERIOUS | Fixed: `HardwareVerification{status, ref}` |
+| 1 | Reader did not verify; no minor-version tolerance; replay/synthetic origins unconstrained | MODERATE | Fixed |
+| 1 | Unknown git provenance recorded as clean; event payloads unvalidated | MINOR | Fixed |
+| 2 | **Extra immutable files added after sealing were invisible** | BLOCKING | Fixed: condition 2 now checks both directions |
+| 2 | **A symlink could stand in for a moved raw artifact** | BLOCKING | Fixed: symlinks rejected in sealed content and at seal time |
+| 2 | **Annotation files parsed non-strictly** | BLOCKING | Fixed: `load_on_disk()` |
+| 2 | Corrupt Arrow raised out of the verifier | SERIOUS | Fixed: `UNREADABLE_CHUNK_ARTIFACT` finding |
+| 2 | Path traversal in artifact paths and `payload_ref.file` | SERIOUS | Fixed: `safe_paths`, and `payload_ref.file` must name its own chunk |
+| 2 | `ENOSPC` escaped as a bare `OSError` | SERIOUS | Fixed: closes `CLEAN` / `TECHNICAL_FAILURE` with a reason |
+| 2 | `recovery.scan` called any manifest pair sealed | SERIOUS | Fixed: requires verifier condition 1 |
+| 3 | `raw_ref.packet_seq` written as a JSON Number | SERIOUS | Fixed: typed `RawRef` with `Int64Decimal` |
+| 3 | Manifest parsed non-strictly | SERIOUS | Fixed: `load_on_disk(Manifest, …)` |
+| 3 | Per-record hashes inside the sealed lifecycle and events regions unverified | SERIOUS | Fixed: `_verify_sealed_jsonl()` in condition 3 |
+
+Pass 2 constructed three packages that reported `is_completed() == True` while
+missing or carrying tampered data. Each has a named regression test.
+
+### Notes
+
+- No hardware adapter, BLE, serial, MNE, HRV, feature extraction, timing
+  reconstruction, cross-device sync, Focus logic, ML, UI or cloud code exists.
+- No scientific threshold was introduced.
+- No `D8`–`D26` decision was changed.
+- `pyproject.toml`: `pyarrow` added to the untyped-import override; it ships no
+  `py.typed`.
+
 ### Approved — CL-002A-APPROVAL: Session Package v1 frozen (documentation only)
 
 **Session Package v1 received human approval.** The design from CL-002A,

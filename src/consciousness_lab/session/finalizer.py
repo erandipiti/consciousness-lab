@@ -43,6 +43,7 @@ from consciousness_lab.session.model import (
     SchemaSnapshot,
     SealPointer,
     StreamCloseStatus,
+    load_on_disk,
 )
 from consciousness_lab.session.writer import SessionWriter
 from consciousness_lab.storage import canonical_json
@@ -237,6 +238,6 @@ def read_manifest(path: Path) -> Manifest | None:
     if not path.exists():
         return None
     try:
-        return Manifest.model_validate(canonical_json.loads(path.read_bytes()))
+        return load_on_disk(Manifest, canonical_json.loads(path.read_bytes()))
     except (canonical_json.CanonicalizationError, ValueError):
         return None

@@ -14,6 +14,7 @@ from enum import StrEnum
 from pathlib import Path
 
 import pyarrow as pa
+from pydantic import BaseModel
 
 from consciousness_lab.session import annotations as annotations_mod
 from consciousness_lab.session.finalizer import read_manifest
@@ -22,6 +23,8 @@ from consciousness_lab.session.model import (
     SCHEMA_MAJOR,
     ChunkCommit,
     ClosureCondition,
+    EventRecord,
+    LifecycleRecord,
     LifecycleState,
     Manifest,
     RecordingOutcome,
@@ -116,6 +119,30 @@ class VerificationResult:
 
     def add(self, finding: Finding, detail: str, path: str | None = None) -> None:
         self.issues.append(Issue(finding, detail, path))
+
+
+def _verify_sealed_jsonl(
+    raw: bytes, model: type[BaseModel], label: str, result: VerificationResult
+) -> bool:
+    """Every record in a sealed JSONL region parses, verifies and validates."""
+    finding = Finding.BROKEN_LIFECYCLE_SEAL if label == "lifecycle" else Finding.BROKEN_EVENTS_SEAL
+    for number, line in enumerate(raw.split(b"\n")):
+        if not line.strip():
+            continue
+        try:
+            obj = canonical_json.loads(line)
+        except (canonical_json.CanonicalizationError, ValueError) as exc:
+            result.add(finding, f"{label} line {number} is not parseable ({exc})")
+            return False
+        if not isinstance(obj, dict) or not canonical_json.verify_record(obj):
+            result.add(finding, f"{label} line {number}: record_sha256 does not verify")
+            return False
+        try:
+            load_on_disk(model, obj)
+        except ValueError as exc:
+            result.add(finding, f"{label} line {number} is invalid on disk ({exc})")
+            return False
+    return True
 
 
 def read_chunk_index(paths: PackagePaths, stream_id: str) -> tuple[list[ChunkCommit], str | None]:
@@ -230,16 +257,25 @@ def verify_package(paths: PackagePaths) -> VerificationResult:
     if manifest is not None and paths.lifecycle.exists():
         raw = paths.lifecycle.read_bytes()
         sealed_len = manifest.lifecycle_seal.sealed_len
+        prefix_bytes = raw[:sealed_len]
         if len(raw) < sealed_len:
             result.add(Finding.BROKEN_LIFECYCLE_SEAL, "lifecycle.jsonl is shorter than its seal")
         elif sha256_bytes(raw[:sealed_len]) != manifest.lifecycle_seal.sealed_sha256:
             result.add(Finding.BROKEN_LIFECYCLE_SEAL, "sealed lifecycle prefix hash mismatch")
         else:
             seal_ok = True
+        # The file hash proves the bytes are the sealed bytes. It does NOT prove
+        # each record's own record_sha256 still verifies, and a tamperer who can
+        # rewrite the manifest can restore the file hash. So every record inside
+        # the sealed region is checked individually.
+        if seal_ok and not _verify_sealed_jsonl(prefix_bytes, LifecycleRecord, "lifecycle", result):
+            seal_ok = False
         if manifest.events_seal.bytes or paths.events.exists():
             events = paths.events.read_bytes() if paths.events.exists() else b""
             if sha256_bytes(events) != manifest.events_seal.sha256:
                 result.add(Finding.BROKEN_EVENTS_SEAL, "events seal hash mismatch")
+                seal_ok = False
+            elif not _verify_sealed_jsonl(events, EventRecord, "events", result):
                 seal_ok = False
     elif manifest is not None:
         result.add(Finding.BROKEN_LIFECYCLE_SEAL, "lifecycle.jsonl is absent")

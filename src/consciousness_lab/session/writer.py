@@ -17,6 +17,7 @@ from consciousness_lab.session.model import (
     ClosureCondition,
     EventRecord,
     LifecycleState,
+    RawRef,
     RecordingOutcome,
     Run,
     StreamCloseStatus,
@@ -241,7 +242,7 @@ class SessionWriter:
         *,
         origin: str = "system",
         payload: dict[str, Any] | None = None,
-        raw_ref: dict[str, Any] | None = None,
+        raw_ref: RawRef | None = None,
     ) -> EventRecord:
         if payload_schema not in EVENT_SCHEMAS:
             raise KeyError(f"unknown event payload schema {payload_schema}")
@@ -255,7 +256,7 @@ class SessionWriter:
                 "origin": origin,
                 "host_arrival_monotonic_ns": monotonic_ns,
                 "host_arrival_utc_ns": utc_ns,
-                "raw_ref": raw_ref,
+                "raw_ref": raw_ref.model_dump(mode="json") if raw_ref else None,
                 "payload": payload or {},
             }
         )

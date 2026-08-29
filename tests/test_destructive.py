@@ -217,3 +217,92 @@ def test_a_tampered_manifest_is_not_classified_sealed(data_root: DataRoot) -> No
     report = recovery.scan(built.allocated.paths)
     assert report.state is not recovery.StructuralState.SEALED
     assert not verify_package(built.allocated.paths).is_completed
+
+
+# --- final review: strict on-disk parsing everywhere -------------------------
+
+
+def test_raw_ref_packet_seq_is_a_decimal_string_on_disk(data_root: DataRoot) -> None:
+    """§11 / §12.2.1: packet_seq is an int64 domain, so it is never a JSON Number."""
+    from consciousness_lab.session.model import RawRef
+
+    built = build_session(data_root, finalize_outcome=None)
+    built.writer.emit_event(
+        "USER_MARKER",
+        "technical_error.v1",
+        origin="operator",
+        payload={"message": "marker"},
+        raw_ref=RawRef(stream_id="synthetic.eeg", packet_seq=9912, sample_index_in_packet=3),
+    )
+    line = built.allocated.paths.events.read_bytes().strip().split(b"\n")[-1]
+    record = canonical_json.loads(line)
+    assert record["raw_ref"]["packet_seq"] == "9912"
+    assert record["raw_ref"]["sample_index_in_packet"] == 3
+
+
+def test_a_manifest_with_json_numbers_does_not_verify(data_root: DataRoot) -> None:
+    """Rewriting the manifest non-canonically and re-hashing must not pass."""
+    built = build_session(data_root)
+    manifest = built.allocated.paths.manifest
+    obj = canonical_json.loads(manifest.read_bytes())
+    obj["lifecycle_seal"]["sealed_len"] = int(obj["lifecycle_seal"]["sealed_len"])
+    body = canonical_json.canonicalize(obj)
+    manifest.write_bytes(body)
+    from consciousness_lab.storage.checksums import sha256_bytes
+
+    built.allocated.paths.manifest_sha256.write_text(sha256_bytes(body) + "\n", encoding="utf-8")
+    result = verify_package(built.allocated.paths)
+    assert not result.is_completed
+    assert Finding.UNREADABLE_MANIFEST in result.findings()
+
+
+def test_a_tampered_lifecycle_record_hash_does_not_verify(data_root: DataRoot) -> None:
+    """The file hash can be restored by whoever rewrote the manifest; the
+    per-record hashes cannot."""
+    from consciousness_lab.storage.checksums import sha256_bytes
+
+    built = build_session(data_root)
+    paths = built.allocated.paths
+    raw = paths.lifecycle.read_bytes()
+    tampered = raw.replace(b'"actor":"system"', b'"actor":"forged"', 1)
+    assert tampered != raw
+    paths.lifecycle.write_bytes(tampered)
+
+    # Restore both seals so only the per-record hash is wrong.
+    obj = canonical_json.loads(paths.manifest.read_bytes())
+    obj["lifecycle_seal"]["sealed_len"] = str(len(tampered))
+    obj["lifecycle_seal"]["sealed_sha256"] = sha256_bytes(tampered)
+    body = canonical_json.canonicalize(obj)
+    paths.manifest.write_bytes(body)
+    paths.manifest_sha256.write_text(sha256_bytes(body) + "\n", encoding="utf-8")
+
+    result = verify_package(paths)
+    assert not result.is_completed
+    assert Finding.BROKEN_LIFECYCLE_SEAL in result.findings()
+
+
+def test_a_tampered_event_record_hash_does_not_verify(data_root: DataRoot) -> None:
+    from consciousness_lab.storage.checksums import sha256_bytes
+
+    built = build_session(data_root)
+    paths = built.allocated.paths
+    raw = paths.events.read_bytes()
+    tampered = raw.replace(b'"origin":"system"', b'"origin":"operator"', 1)
+    assert tampered != raw
+    paths.events.write_bytes(tampered)
+
+    obj = canonical_json.loads(paths.manifest.read_bytes())
+    obj["events_seal"]["bytes"] = str(len(tampered))
+    obj["events_seal"]["sha256"] = sha256_bytes(tampered)
+    # events/events.jsonl is inventoried too, so restore that entry as well.
+    for entry in obj["inventory"]:
+        if entry["path"] == "events/events.jsonl":
+            entry["bytes"] = str(len(tampered))
+            entry["sha256"] = sha256_bytes(tampered)
+    body = canonical_json.canonicalize(obj)
+    paths.manifest.write_bytes(body)
+    paths.manifest_sha256.write_text(sha256_bytes(body) + "\n", encoding="utf-8")
+
+    result = verify_package(paths)
+    assert not result.is_completed
+    assert Finding.BROKEN_EVENTS_SEAL in result.findings()
