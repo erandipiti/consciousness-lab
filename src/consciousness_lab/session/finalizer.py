@@ -56,6 +56,7 @@ from consciousness_lab.storage.checksums import (
 )
 from consciousness_lab.storage.paths import DataRoot, PackagePaths
 from consciousness_lab.storage.safe_paths import find_symlinks
+from consciousness_lab.storage.stream_state import read_all_physical_streams
 
 #: Never inventoried: post-seal mutable objects (§14.1) and operational logs.
 #: Hashing these would invalidate manifest.sha256 on the first annotation.
@@ -101,6 +102,49 @@ def _assert_completable(
         raise FinalizationError(
             f"{len(incomplete)} incomplete write marker(s) present; the session is not complete"
         )
+    _assert_streams_on_disk(writer, run)
+
+
+def _assert_streams_on_disk(writer: SessionWriter, run: Run) -> None:
+    """Refuse to seal COMPLETED when writer memory contradicts the disk.
+
+    Defence in depth. The verifier is authoritative after sealing, but a
+    lifecycle record claiming COMPLETED is immutable, so it must not be written
+    while the streams it describes are known to be missing (CL-002B-R1).
+    """
+    physical = read_all_physical_streams(writer.paths)
+
+    for stream_id in run.required_streams:
+        state = physical.get(stream_id)
+        if state is None or not state.directory_exists:
+            raise FinalizationError(f"required stream {stream_id} has no raw directory on disk")
+
+    for stream_id, open_stream in sorted(writer.streams.items()):
+        state = physical.get(stream_id)
+        if state is None or not state.structurally_complete:
+            detail = "absent" if state is None else (state.chain_error or "incomplete structure")
+            raise FinalizationError(f"stream {stream_id} is not intact on disk: {detail}")
+        if state.descriptor_sha256 != open_stream.descriptor_sha256:
+            raise FinalizationError(f"stream {stream_id} descriptor changed since it was opened")
+
+        # Every chunk the writer believes it committed must still be in the
+        # index, and its artifacts must still exist.
+        expected = {commit.chunk_id: commit for commit in open_stream.writer.committed}
+        actual = {commit.chunk_id: commit for commit in state.commits}
+        missing = sorted(set(expected) - set(actual))
+        if missing:
+            raise FinalizationError(
+                f"stream {stream_id}: committed chunk(s) {missing} are absent from chunks.jsonl"
+            )
+        for chunk_id, commit in actual.items():
+            artifacts = [commit.packets, commit.observations, commit.samples]
+            if commit.payloads is not None:
+                artifacts.append(commit.payloads)
+            for artifact in artifacts:
+                if not (writer.paths.stream(stream_id).root / artifact.path).is_file():
+                    raise FinalizationError(
+                        f"stream {stream_id}: chunk {chunk_id} artifact {artifact.path} is missing"
+                    )
 
 
 def _inventory(paths: PackagePaths) -> list[FileEntry]:
@@ -183,20 +227,33 @@ def finalize(
 
     # 7 — seal pointers and stream summaries.
     lifecycle_bytes = writer.paths.lifecycle.read_bytes()
+    # Stream summaries are derived from what is ON DISK, not from writer memory.
+    # Building them from memory is what let a manifest describe a stream whose
+    # raw directory had been deleted (CL-002B-R1). ``close_status`` is the one
+    # field with no on-disk representation, so it still comes from the writer;
+    # ``required`` comes from run.json, which is the declaration of record.
     required = set(run.required_streams)
+    physical = read_all_physical_streams(writer.paths)
     streams: list[ManifestStream] = []
-    for stream_id, stream in sorted(writer.streams.items()):
-        commits = stream.writer.committed
+    for stream_id in sorted(physical):
+        state = physical[stream_id]
+        if state.descriptor_sha256 is None:
+            raise FinalizationError(
+                f"stream {stream_id} has no readable descriptor and cannot be summarised"
+            )
+        open_stream = writer.streams.get(stream_id)
         streams.append(
             ManifestStream(
                 stream_id=stream_id,
                 required=stream_id in required,
-                close_status=stream.close_status,
-                descriptor_sha256=stream.descriptor_sha256,
-                chunk_count=len(commits),
-                chunk_chain_head_sha256=stream.writer.chain_head,
-                first_packet_seq=commits[0].first_packet_seq if commits else None,
-                last_packet_seq=commits[-1].last_packet_seq if commits else None,
+                close_status=(
+                    open_stream.close_status if open_stream else StreamCloseStatus.FAILED
+                ),
+                descriptor_sha256=state.descriptor_sha256,
+                chunk_count=state.chunk_count,
+                chunk_chain_head_sha256=state.chain_head_sha256,
+                first_packet_seq=state.first_packet_seq,
+                last_packet_seq=state.last_packet_seq,
             )
         )
 

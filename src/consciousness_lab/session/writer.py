@@ -175,6 +175,10 @@ class SessionWriter:
         stream_paths.root.mkdir(parents=True, exist_ok=True)
         body = canonical_json.canonicalize(descriptor.model_dump(mode="json", exclude_none=True))
         atomic_write_new(stream_paths.descriptor, body)
+        # Created empty at open so every stream directory has the same shape.
+        # Otherwise a zero-chunk stream is indistinguishable from a stream whose
+        # index was deleted, and the verifier would have to guess.
+        stream_paths.chunks_index.touch()
         opened = OpenStream(
             descriptor=descriptor,
             descriptor_sha256=sha256_bytes(body),

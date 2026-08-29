@@ -122,7 +122,10 @@ class ChunkWriter:
         self.descriptor_sha256 = descriptor_sha256
         # Refuse to reuse a stream directory that already holds chunks: a fresh
         # writer would restart at chunk 0 and overwrite immutable raw files.
-        if paths.chunks_index.exists() or any(
+        index_has_commits = paths.chunks_index.is_file() and bool(
+            paths.chunks_index.read_bytes().strip()
+        )
+        if index_has_commits or any(
             (paths.root / kind).exists()
             for kind in ("payloads", "packets", "observations", "samples")
         ):

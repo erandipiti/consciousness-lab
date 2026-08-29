@@ -27,6 +27,7 @@ from consciousness_lab.session.model import (
     LifecycleRecord,
     LifecycleState,
     Manifest,
+    ManifestStream,
     RecordingOutcome,
     Run,
     StreamCloseStatus,
@@ -41,6 +42,11 @@ from consciousness_lab.storage.safe_paths import (
     UnsafePathError,
     find_symlinks,
     resolve_within,
+)
+from consciousness_lab.storage.stream_state import (
+    REQUIRED_STREAM_FILES,
+    PhysicalStreamState,
+    read_all_physical_streams,
 )
 
 #: The only files a sealed package may hold outside the manifest inventory
@@ -80,6 +86,18 @@ class Finding(StrEnum):
     UNREADABLE_DESCRIPTOR = "unreadable_descriptor"
     UNREADABLE_RUN = "unreadable_run"
     UNREADABLE_CHUNK_ARTIFACT = "unreadable_chunk_artifact"
+    MANIFEST_STREAM_MISSING_RAW = "manifest_stream_missing_raw"
+    RAW_STREAM_MISSING_MANIFEST = "raw_stream_missing_manifest"
+    DUPLICATE_MANIFEST_STREAM = "duplicate_manifest_stream"
+    REQUIRED_FLAG_MISMATCH = "required_flag_mismatch"
+    MISSING_DESCRIPTOR = "missing_descriptor"
+    DESCRIPTOR_STREAM_ID_MISMATCH = "descriptor_stream_id_mismatch"
+    MANIFEST_DESCRIPTOR_HASH_MISMATCH = "manifest_descriptor_hash_mismatch"
+    CHUNK_DESCRIPTOR_HASH_MISMATCH = "chunk_descriptor_hash_mismatch"
+    CHUNK_COUNT_MISMATCH = "chunk_count_mismatch"
+    CHAIN_HEAD_MISMATCH = "chain_head_mismatch"
+    PACKET_RANGE_MISMATCH = "packet_range_mismatch"
+    MISSING_STREAM_STRUCTURE = "missing_stream_structure"
     UNEXPECTED_FILE = "unexpected_file"
     SYMLINK_IN_PACKAGE = "symlink_in_package"
     UNSAFE_PATH = "unsafe_path"
@@ -313,19 +331,44 @@ def verify_package(paths: PackagePaths) -> VerificationResult:
         except (canonical_json.CanonicalizationError, ValueError) as exc:
             result.add(Finding.UNREADABLE_RUN, f"run.json could not be parsed ({exc})")
     result.run = run
+    # Condition 5 owns SEMANTIC required-stream closure: run declares it, the
+    # manifest agrees it is required, and it closed CLEAN — and the stream
+    # physically exists, because a manifest entry alone proves nothing about
+    # what is on disk (CL-002B-R1).
+    physical = read_all_physical_streams(paths)
     required_ok = run is not None and manifest is not None
     if run is not None and manifest is not None:
         by_id = {s.stream_id: s for s in manifest.streams}
+        declared_required = set(run.required_streams)
         for stream_id in run.required_streams:
             stream_entry = by_id.get(stream_id)
             if stream_entry is None:
                 result.add(Finding.REQUIRED_STREAM_MISSING, "required stream absent", stream_id)
                 required_ok = False
-            elif stream_entry.close_status is not StreamCloseStatus.CLEAN:
+                continue
+            if stream_id not in physical or not physical[stream_id].directory_exists:
+                result.add(
+                    Finding.MANIFEST_STREAM_MISSING_RAW,
+                    "required stream has no raw directory on disk",
+                    stream_id,
+                )
+                required_ok = False
+            if stream_entry.close_status is not StreamCloseStatus.CLEAN:
                 result.add(
                     Finding.REQUIRED_STREAM_UNCLEAN,
                     f"required stream closed {stream_entry.close_status}",
                     stream_id,
+                )
+                required_ok = False
+        # The required flag is fully determined by run.json, for every stream.
+        for stream_summary in manifest.streams:
+            expected = stream_summary.stream_id in declared_required
+            if stream_summary.required is not expected:
+                result.add(
+                    Finding.REQUIRED_FLAG_MISMATCH,
+                    f"manifest says required={stream_summary.required}, "
+                    f"run.json implies {expected}",
+                    stream_summary.stream_id,
                 )
                 required_ok = False
     result.conditions[5] = required_ok
@@ -340,8 +383,8 @@ def verify_package(paths: PackagePaths) -> VerificationResult:
         )
     result.conditions[6] = not incomplete
 
-    # --- Condition 7: chunk chains verify, no orphans, payload shape correct -
-    chains_ok = _verify_streams(paths, manifest, result)
+    # --- Condition 7: physical raw integrity, reconciled with the manifest ---
+    chains_ok = _verify_streams(paths, manifest, result, physical)
     result.conditions[7] = chains_ok
 
     # --- Condition 8: the effective outcome is COMPLETED --------------------
@@ -373,87 +416,201 @@ def verify_package(paths: PackagePaths) -> VerificationResult:
 
 
 def _verify_streams(
-    paths: PackagePaths, manifest: Manifest | None, result: VerificationResult
+    paths: PackagePaths,
+    manifest: Manifest | None,
+    result: VerificationResult,
+    physical: dict[str, PhysicalStreamState],
 ) -> bool:
+    """Condition 7: physical raw integrity, reconciled against the manifest.
+
+    Every summary the manifest carries about a stream is re-derived from disk
+    and compared. The manifest is a *summary of* the raw data, never evidence
+    that the raw data exists (CL-002B-R1).
+    """
     ok = True
-    if not paths.raw.is_dir():
-        return manifest is not None
-    for stream_dir in sorted(p for p in paths.raw.iterdir() if p.is_dir()):
-        stream_id = stream_dir.name
-        stream_paths = paths.stream(stream_id)
-        try:
-            descriptor = load_on_disk(
-                StreamDescriptor, canonical_json.loads(stream_paths.descriptor.read_bytes())
+    if manifest is None:
+        # No manifest yet (an unfinalized or interrupted package). The
+        # manifest-reconciliation checks do not apply, but the physical checks
+        # still do: recovery relies on orphan and chain reporting here.
+        for stream_id in sorted(physical):
+            if not _verify_stream(paths, None, physical[stream_id], result):
+                ok = False
+        return False
+
+    # --- bidirectional stream-set reconciliation ---------------------------
+    manifest_ids = [entry.stream_id for entry in manifest.streams]
+    seen: set[str] = set()
+    for stream_id in manifest_ids:
+        if stream_id in seen:
+            result.add(
+                Finding.DUPLICATE_MANIFEST_STREAM, "stream listed twice in the manifest", stream_id
             )
-        except (OSError, canonical_json.CanonicalizationError, ValueError) as exc:
-            result.add(Finding.UNREADABLE_DESCRIPTOR, f"{exc}", stream_id)
             ok = False
-            continue
+        seen.add(stream_id)
 
-        commits, chain_error = read_chunk_index(paths, stream_id)
-        if chain_error is not None:
-            result.add(Finding.BROKEN_CHUNK_CHAIN, chain_error, stream_id)
+    physical_ids = set(physical)
+    for stream_id in sorted(seen - physical_ids):
+        result.add(
+            Finding.MANIFEST_STREAM_MISSING_RAW,
+            "manifest describes a stream with no raw directory",
+            stream_id,
+        )
+        ok = False
+    for stream_id in sorted(physical_ids - seen):
+        result.add(
+            Finding.RAW_STREAM_MISSING_MANIFEST,
+            "raw directory is not described by the manifest",
+            stream_id,
+        )
+        ok = False
+
+    for entry in manifest.streams:
+        state = physical.get(entry.stream_id)
+        if state is None:
+            continue  # already reported above
+        if not _verify_stream(paths, entry, state, result):
+            ok = False
+    return ok
+
+
+def _verify_stream(
+    paths: PackagePaths,
+    entry: ManifestStream | None,
+    state: PhysicalStreamState,
+    result: VerificationResult,
+) -> bool:
+    """Verify one physical stream, reconciling it against its manifest summary.
+
+    ``entry`` is ``None`` for a package with no manifest yet: the physical
+    checks still run, only the summary comparisons are skipped. Recovery relies
+    on the orphan and chain reporting here.
+    """
+    stream_id = state.stream_id
+    stream_dir = paths.stream(stream_id).root
+    ok = True
+
+    # --- structural files ---------------------------------------------------
+    for name in REQUIRED_STREAM_FILES:
+        if not (stream_dir / name).is_file():
+            result.add(Finding.MISSING_STREAM_STRUCTURE, f"{name} is absent", stream_id)
             ok = False
 
-        committed_paths: set[str] = set()
-        #: Chunks whose artifacts all hash correctly. Only these are worth
-        #: opening: reading a corrupt Arrow file would raise out of a function
-        #: whose contract is to REPORT failures, not raise them.
-        intact: set[int] = {commit.chunk_id for commit in commits}
-        for commit in commits:
-            artifacts = [commit.packets, commit.observations, commit.samples]
-            if commit.payloads is not None:
-                artifacts.append(commit.payloads)
-            if descriptor.expects_payload_artifact and commit.payloads is None:
-                result.add(
-                    Finding.MISSING_PAYLOAD_ARTIFACT,
-                    f"chunk {commit.chunk_id} has no payload artifact",
-                    stream_id,
-                )
-                ok = False
-            if not descriptor.expects_payload_artifact and commit.payloads is not None:
-                result.add(
-                    Finding.UNEXPECTED_PAYLOAD_ARTIFACT,
-                    f"chunk {commit.chunk_id} carries a payload artifact at "
-                    f"raw_capture_level={descriptor.acquisition.raw_capture_level.value}",
-                    stream_id,
-                )
-                ok = False
-            for artifact in artifacts:
-                committed_paths.add(artifact.path)
-                try:
-                    target = resolve_within(stream_dir, artifact.path)
-                except UnsafePathError as exc:
-                    result.add(Finding.UNSAFE_PATH, str(exc), f"{stream_id}/{artifact.path}")
-                    ok = False
-                    intact.discard(commit.chunk_id)
-                    continue
-                if not target.is_file():
-                    result.add(Finding.CHUNK_ARTIFACT_MISSING, artifact.path, stream_id)
-                    ok = False
-                    intact.discard(commit.chunk_id)
-                elif sha256_file(target) != artifact.sha256:
-                    result.add(Finding.CHUNK_ARTIFACT_HASH_MISMATCH, artifact.path, stream_id)
-                    ok = False
-                    intact.discard(commit.chunk_id)
+    # --- descriptor ---------------------------------------------------------
+    if not state.descriptor_present:
+        result.add(Finding.MISSING_DESCRIPTOR, "descriptor.json is absent", stream_id)
+        return False
+    if state.descriptor is None:
+        result.add(Finding.UNREADABLE_DESCRIPTOR, state.descriptor_error or "unreadable", stream_id)
+        return False
+    if state.descriptor.stream_id != stream_id:
+        result.add(
+            Finding.DESCRIPTOR_STREAM_ID_MISMATCH,
+            f"descriptor declares {state.descriptor.stream_id!r} in directory {stream_id!r}",
+            stream_id,
+        )
+        ok = False
+    if entry is not None and state.descriptor_sha256 != entry.descriptor_sha256:
+        result.add(
+            Finding.MANIFEST_DESCRIPTOR_HASH_MISMATCH,
+            "manifest descriptor_sha256 does not match the stored descriptor bytes",
+            stream_id,
+        )
+        ok = False
 
-        # Files present under raw/ that no commit record names are orphans.
-        # Recovery reports them; it never adopts them.
-        for kind in ("payloads", "packets", "observations", "samples"):
-            directory = stream_dir / kind
-            if not directory.is_dir():
+    # --- chunk chain --------------------------------------------------------
+    if state.chain_error is not None:
+        result.add(Finding.BROKEN_CHUNK_CHAIN, state.chain_error, stream_id)
+        ok = False
+
+    if entry is not None:
+        if entry.chunk_count != state.chunk_count:
+            result.add(
+                Finding.CHUNK_COUNT_MISMATCH,
+                f"manifest says {entry.chunk_count} chunks, the chain holds {state.chunk_count}",
+                stream_id,
+            )
+            ok = False
+        if entry.chunk_chain_head_sha256 != state.chain_head_sha256:
+            result.add(
+                Finding.CHAIN_HEAD_MISMATCH,
+                "manifest chunk_chain_head_sha256 is not the chain's final record hash",
+                stream_id,
+            )
+            ok = False
+        if (entry.first_packet_seq, entry.last_packet_seq) != (
+            state.first_packet_seq,
+            state.last_packet_seq,
+        ):
+            result.add(
+                Finding.PACKET_RANGE_MISMATCH,
+                f"manifest packet range ({entry.first_packet_seq}, {entry.last_packet_seq}) "
+                f"is not ({state.first_packet_seq}, {state.last_packet_seq})",
+                stream_id,
+            )
+            ok = False
+
+    # --- artifacts referenced by each commit --------------------------------
+    committed_paths: set[str] = set()
+    intact: set[int] = {commit.chunk_id for commit in state.commits}
+    for commit in state.commits:
+        if commit.descriptor_sha256 != state.descriptor_sha256:
+            result.add(
+                Finding.CHUNK_DESCRIPTOR_HASH_MISMATCH,
+                f"chunk {commit.chunk_id} was written under a different descriptor",
+                stream_id,
+            )
+            ok = False
+        artifacts = [commit.packets, commit.observations, commit.samples]
+        if commit.payloads is not None:
+            artifacts.append(commit.payloads)
+        if state.descriptor.expects_payload_artifact and commit.payloads is None:
+            result.add(
+                Finding.MISSING_PAYLOAD_ARTIFACT,
+                f"chunk {commit.chunk_id} has no payload artifact",
+                stream_id,
+            )
+            ok = False
+        if not state.descriptor.expects_payload_artifact and commit.payloads is not None:
+            result.add(
+                Finding.UNEXPECTED_PAYLOAD_ARTIFACT,
+                f"chunk {commit.chunk_id} carries a payload artifact at "
+                f"raw_capture_level={state.descriptor.acquisition.raw_capture_level.value}",
+                stream_id,
+            )
+            ok = False
+        for artifact in artifacts:
+            committed_paths.add(artifact.path)
+            try:
+                target = resolve_within(stream_dir, artifact.path)
+            except UnsafePathError as exc:
+                result.add(Finding.UNSAFE_PATH, str(exc), f"{stream_id}/{artifact.path}")
+                ok = False
+                intact.discard(commit.chunk_id)
                 continue
-            for path in sorted(directory.iterdir()):
-                rel = f"{kind}/{path.name}"
-                if path.is_file() and rel not in committed_paths:
-                    result.add(
-                        Finding.ORPHAN_FILE, "file has no commit record", f"{stream_id}/{rel}"
-                    )
-                    ok = False
+            if not target.is_file():
+                result.add(Finding.CHUNK_ARTIFACT_MISSING, artifact.path, stream_id)
+                ok = False
+                intact.discard(commit.chunk_id)
+            elif sha256_file(target) != artifact.sha256:
+                result.add(Finding.CHUNK_ARTIFACT_HASH_MISMATCH, artifact.path, stream_id)
+                ok = False
+                intact.discard(commit.chunk_id)
 
-        readable = [commit for commit in commits if commit.chunk_id in intact]
-        if not _verify_payload_refs(stream_dir, descriptor, readable, result, stream_id):
-            ok = False
+    # Files under raw/ that no commit record names are orphans. Recovery
+    # reports them; verification never adopts them.
+    for kind in ("payloads", "packets", "observations", "samples"):
+        directory = stream_dir / kind
+        if not directory.is_dir():
+            continue
+        for path in sorted(directory.iterdir()):
+            rel = f"{kind}/{path.name}"
+            if path.is_file() and rel not in committed_paths:
+                result.add(Finding.ORPHAN_FILE, "file has no commit record", f"{stream_id}/{rel}")
+                ok = False
+
+    readable = [commit for commit in state.commits if commit.chunk_id in intact]
+    if not _verify_payload_refs(stream_dir, state.descriptor, readable, result, stream_id):
+        ok = False
     return ok
 
 
