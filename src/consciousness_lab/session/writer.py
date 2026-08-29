@@ -6,15 +6,18 @@ What lives here is only enough to exercise Session Package v1 end to end:
 declare streams, commit chunks, record events, finalize.
 """
 
+import contextlib
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from consciousness_lab.session.lifecycle import LifecycleLog, now_reading
+from consciousness_lab.session.lifecycle import LifecycleError, LifecycleLog, now_reading
 from consciousness_lab.session.model import (
     ClockReading,
+    ClosureCondition,
     EventRecord,
     LifecycleState,
+    RecordingOutcome,
     Run,
     StreamCloseStatus,
     StreamDescriptor,
@@ -84,6 +87,10 @@ class SealedPackageError(RuntimeError):
     """A write was attempted against sealed or already-written package content."""
 
 
+class FatalWriteError(RuntimeError):
+    """A raw write failed fatally (ENOSPC, I/O error). The session was closed."""
+
+
 def _validate_payload(schema_id: str, payload: dict[str, Any]) -> None:
     """Check a payload against its declared schema before it is written.
 
@@ -122,6 +129,7 @@ class SessionWriter:
     streams: dict[str, OpenStream] = field(default_factory=dict)
     _event_seq: int = 0
     _used_schemas: set[str] = field(default_factory=set)
+    _failed: bool = False
 
     @classmethod
     def open(cls, paths: PackagePaths) -> "SessionWriter":
@@ -177,7 +185,50 @@ class SessionWriter:
     def commit_chunk(
         self, stream_id: str, pending: PendingChunk, *, fault: FaultHook | None = None
     ) -> None:
-        self.streams[stream_id].writer.commit(pending, fault=fault)
+        """Commit a chunk, closing the session honestly if the write fails fatally.
+
+        ``ENOSPC`` and I/O errors are *diagnosed* causes: the process is alive
+        and knows why it is dying, so the session closes
+        ``CLEAN / TECHNICAL_FAILURE`` with the error recorded, never
+        ``UNCLASSIFIED`` (spec 12.3, D16).
+        """
+        try:
+            self.streams[stream_id].writer.commit(pending, fault=fault)
+        except OSError as exc:
+            self.fail_technical(f"{type(exc).__name__}: {exc}", stream_id=stream_id)
+            raise FatalWriteError(
+                f"raw write failed for {stream_id}; session closed TECHNICAL_FAILURE"
+            ) from exc
+
+    def fail_technical(self, message: str, *, stream_id: str | None = None) -> None:
+        """Record a diagnosed fatal error and close the session.
+
+        Best-effort by necessity: the disk that just refused a chunk may also
+        refuse these much smaller writes. Anything that cannot be recorded is
+        left to the recovery scanner, which reports an unclean close rather than
+        inventing an outcome.
+        """
+        if self._failed:
+            return
+        self._failed = True
+        if stream_id is not None and stream_id in self.streams:
+            self.streams[stream_id].close_status = StreamCloseStatus.FAILED
+        with contextlib.suppress(OSError, ValueError, KeyError):
+            payload = {"message": message}
+            if stream_id:
+                payload["stream_id"] = stream_id
+            self.emit_event(
+                "TECHNICAL_ERROR", "technical_error.v1", origin="system", payload=payload
+            )
+        with contextlib.suppress(OSError, LifecycleError):
+            if self.lifecycle.state in (LifecycleState.ALLOCATED, LifecycleState.RECORDING):
+                self.lifecycle.append(LifecycleState.FINALIZING)
+            self.lifecycle.append(
+                LifecycleState.CLOSED,
+                closure_condition=ClosureCondition.CLEAN,
+                recording_outcome=RecordingOutcome.TECHNICAL_FAILURE,
+                outcome_reason=message,
+            )
 
     def close_stream(self, stream_id: str, status: StreamCloseStatus) -> None:
         """Record how a stream ended. A non-CLEAN required stream blocks completion."""

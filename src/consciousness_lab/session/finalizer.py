@@ -54,6 +54,7 @@ from consciousness_lab.storage.checksums import (
     sha256_file,
 )
 from consciousness_lab.storage.paths import DataRoot, PackagePaths
+from consciousness_lab.storage.safe_paths import find_symlinks
 
 #: Never inventoried: post-seal mutable objects (§14.1) and operational logs.
 #: Hashing these would invalidate manifest.sha256 on the first annotation.
@@ -102,7 +103,18 @@ def _assert_completable(
 
 
 def _inventory(paths: PackagePaths) -> list[FileEntry]:
-    """Every immutable in-scope file, with its size and hash."""
+    """Every immutable in-scope file, with its size and hash.
+
+    A symlink is refused rather than followed: inventorying a link would record
+    the hash of bytes that live outside the package, and the package would then
+    verify without actually containing its own raw data.
+    """
+    links = find_symlinks(paths.root)
+    if links:
+        raise FinalizationError(
+            f"package contains symlink(s) and cannot be sealed: "
+            f"{[p.relative_to(paths.root).as_posix() for p in links]}"
+        )
     entries: list[FileEntry] = []
     for path in sorted(paths.root.rglob("*")):
         if not path.is_file():

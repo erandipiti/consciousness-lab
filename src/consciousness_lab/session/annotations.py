@@ -18,7 +18,12 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 
-from consciousness_lab.session.model import AnnotationHead, AnnotationRecord, RecordingOutcome
+from consciousness_lab.session.model import (
+    AnnotationHead,
+    AnnotationRecord,
+    RecordingOutcome,
+    load_on_disk,
+)
 from consciousness_lab.storage import canonical_json
 from consciousness_lab.storage.checksums import append_line, atomic_write
 
@@ -105,7 +110,7 @@ def _parse_log(path: Path) -> _ParsedLog:
             parsed.detail = f"line {index}: record_sha256 does not verify"
             return parsed
         try:
-            record = AnnotationRecord.model_validate(obj)
+            record = load_on_disk(AnnotationRecord, obj)
         except ValueError as exc:
             parsed.chain_ok = False
             parsed.detail = f"line {index}: malformed annotation ({exc})"
@@ -123,7 +128,7 @@ def read_head(path: Path) -> AnnotationHead | None:
     if not path.exists():
         return None
     try:
-        return AnnotationHead.model_validate(canonical_json.loads(path.read_bytes()))
+        return load_on_disk(AnnotationHead, canonical_json.loads(path.read_bytes()))
     except (canonical_json.CanonicalizationError, ValueError):
         return None
 

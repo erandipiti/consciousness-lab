@@ -34,6 +34,17 @@ from consciousness_lab.storage import canonical_json
 from consciousness_lab.storage.checksums import find_incomplete, sha256_bytes, sha256_file
 from consciousness_lab.storage.paths import PackagePaths
 from consciousness_lab.storage.payload import PayloadFramingError, PayloadRef, read_at
+from consciousness_lab.storage.safe_paths import (
+    UnsafePathError,
+    find_symlinks,
+    resolve_within,
+)
+
+#: The only files a sealed package may hold outside the manifest inventory
+#: (spec 14.1). Everything else is either inventoried or unexpected.
+POST_SEAL_MUTABLE = frozenset(
+    {"manifest.json", "manifest.sha256", "annotations.jsonl", "annotations.head.json"}
+)
 
 
 class Finding(StrEnum):
@@ -65,6 +76,10 @@ class Finding(StrEnum):
     EFFECTIVE_OUTCOME_NOT_COMPLETED = "effective_outcome_not_completed"
     UNREADABLE_DESCRIPTOR = "unreadable_descriptor"
     UNREADABLE_RUN = "unreadable_run"
+    UNREADABLE_CHUNK_ARTIFACT = "unreadable_chunk_artifact"
+    UNEXPECTED_FILE = "unexpected_file"
+    SYMLINK_IN_PACKAGE = "symlink_in_package"
+    UNSAFE_PATH = "unsafe_path"
 
 
 @dataclass(frozen=True)
@@ -162,11 +177,31 @@ def verify_package(paths: PackagePaths) -> VerificationResult:
     result.manifest = manifest
     result.conditions[1] = manifest_ok
 
-    # --- Condition 2: every inventory file exists and hashes correctly -------
+    # --- Condition 2: the package holds EXACTLY the sealed files ------------
+    # Both directions. Every inventory entry must be present and hash correctly,
+    # AND nothing outside the inventory may exist except the objects 14.1 permits
+    # to change after sealing. Checking only the first direction would let extra
+    # immutable content be ADDED to a sealed package unnoticed.
     inventory_ok = manifest is not None
+
+    for link in find_symlinks(paths.root):
+        # A symlink lets an artifact be moved out of the package and faked back
+        # in: is_file(), stat() and sha256 all follow it and all succeed.
+        result.add(
+            Finding.SYMLINK_IN_PACKAGE,
+            "sealed package content may not contain a symlink",
+            link.relative_to(paths.root).as_posix(),
+        )
+        inventory_ok = False
+
     if manifest is not None:
         for entry in manifest.inventory:
-            target = paths.root / entry.path
+            try:
+                target = resolve_within(paths.root, entry.path)
+            except UnsafePathError as exc:
+                result.add(Finding.UNSAFE_PATH, str(exc), entry.path)
+                inventory_ok = False
+                continue
             if not target.is_file():
                 result.add(Finding.INVENTORY_FILE_MISSING, "inventory file is absent", entry.path)
                 inventory_ok = False
@@ -174,6 +209,20 @@ def verify_package(paths: PackagePaths) -> VerificationResult:
             if sha256_file(target) != entry.sha256:
                 result.add(Finding.INVENTORY_HASH_MISMATCH, "inventory hash mismatch", entry.path)
                 inventory_ok = False
+
+        listed = {entry.path for entry in manifest.inventory}
+        for path in sorted(paths.root.rglob("*")):
+            if not path.is_file() or path.is_symlink():
+                continue
+            rel = path.relative_to(paths.root).as_posix()
+            if rel in listed or rel in POST_SEAL_MUTABLE or rel.startswith("logs/"):
+                continue
+            result.add(
+                Finding.UNEXPECTED_FILE,
+                "present in a sealed package but absent from the manifest inventory",
+                rel,
+            )
+            inventory_ok = False
     result.conditions[2] = inventory_ok
 
     # --- Condition 3: the sealed lifecycle prefix hashes as recorded --------
@@ -311,6 +360,10 @@ def _verify_streams(
             ok = False
 
         committed_paths: set[str] = set()
+        #: Chunks whose artifacts all hash correctly. Only these are worth
+        #: opening: reading a corrupt Arrow file would raise out of a function
+        #: whose contract is to REPORT failures, not raise them.
+        intact: set[int] = {commit.chunk_id for commit in commits}
         for commit in commits:
             artifacts = [commit.packets, commit.observations, commit.samples]
             if commit.payloads is not None:
@@ -332,13 +385,21 @@ def _verify_streams(
                 ok = False
             for artifact in artifacts:
                 committed_paths.add(artifact.path)
-                target = stream_dir / artifact.path
+                try:
+                    target = resolve_within(stream_dir, artifact.path)
+                except UnsafePathError as exc:
+                    result.add(Finding.UNSAFE_PATH, str(exc), f"{stream_id}/{artifact.path}")
+                    ok = False
+                    intact.discard(commit.chunk_id)
+                    continue
                 if not target.is_file():
                     result.add(Finding.CHUNK_ARTIFACT_MISSING, artifact.path, stream_id)
                     ok = False
+                    intact.discard(commit.chunk_id)
                 elif sha256_file(target) != artifact.sha256:
                     result.add(Finding.CHUNK_ARTIFACT_HASH_MISMATCH, artifact.path, stream_id)
                     ok = False
+                    intact.discard(commit.chunk_id)
 
         # Files present under raw/ that no commit record names are orphans.
         # Recovery reports them; it never adopts them.
@@ -354,7 +415,8 @@ def _verify_streams(
                     )
                     ok = False
 
-        if not _verify_payload_refs(stream_dir, descriptor, commits, result, stream_id):
+        readable = [commit for commit in commits if commit.chunk_id in intact]
+        if not _verify_payload_refs(stream_dir, descriptor, readable, result, stream_id):
             ok = False
     return ok
 
@@ -373,9 +435,20 @@ def _verify_payload_refs(
         packets_file = root / commit.packets.path
         if not packets_file.is_file():
             continue
-        with packets_file.open("rb") as handle:
-            table = pa.ipc.open_stream(handle).read_all()
-        refs = table.column("payload_ref").to_pylist()
+        try:
+            with packets_file.open("rb") as handle:
+                table = pa.ipc.open_stream(handle).read_all()
+            refs = table.column("payload_ref").to_pylist()
+        except (pa.ArrowException, OSError, KeyError, TypeError, ValueError) as exc:
+            # A corrupt artifact is a finding, never an exception out of a
+            # function whose job is to report findings.
+            result.add(
+                Finding.UNREADABLE_CHUNK_ARTIFACT,
+                f"chunk {commit.chunk_id}: {exc}",
+                stream_id,
+            )
+            ok = False
+            continue
         if not expects:
             if any(ref is not None for ref in refs):
                 result.add(
@@ -404,6 +477,16 @@ def _verify_payload_refs(
             continue
         blob = payload_file.read_bytes()
         for ref in refs:
+            # The reference must name the chunk's own payload file. Otherwise a
+            # forged ref could point at another file entirely and still resolve.
+            if ref["file"] != commit.payloads.path:
+                result.add(
+                    Finding.PAYLOAD_REF_INVALID,
+                    f"payload_ref.file {ref['file']!r} is not {commit.payloads.path!r}",
+                    stream_id,
+                )
+                ok = False
+                break
             try:
                 read_at(blob, PayloadRef(ref["file"], int(ref["offset"]), int(ref["length"])))
             except PayloadFramingError as exc:

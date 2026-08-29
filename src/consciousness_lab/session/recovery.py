@@ -73,7 +73,10 @@ def scan(paths: PackagePaths) -> RecoveryReport:
     ]
 
     summary = summarize(read_records(paths.lifecycle))
-    manifest_pair = paths.manifest.is_file() and paths.manifest_sha256.is_file()
+    # Sealed means the manifest pair actually VERIFIES (condition 1), not that
+    # two files happen to exist. A mutated manifest with a stale hash is not a
+    # sealed package, and calling it one would hide the tampering.
+    manifest_pair = verification.conditions.get(1, False)
 
     if manifest_pair:
         state = StructuralState.SEALED
