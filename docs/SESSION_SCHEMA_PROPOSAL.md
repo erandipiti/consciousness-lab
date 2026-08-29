@@ -28,9 +28,11 @@ The design goal this document is written against:
 Everything else — including the registry — is a derived index that can be
 deleted and rebuilt.
 
-Inside the package, raw data is written as **immutable, hash-chained chunks**,
-and the exact transport bytes the device sent are kept as canonical raw
-alongside the decoded view. Timing is never collapsed: host arrival lives in the
+Inside the package, raw data is written as **immutable, hash-chained chunks**.
+Canonical raw is the lowest-level representation actually observed at our
+acquisition boundary: where the device's transport bytes reach our code they are
+preserved alongside the decoded view, and where an upstream library decoded them
+first that is recorded as such rather than fabricated. Timing is never collapsed: host arrival lives in the
 packet row, and every device-provided time or counter is a **row in an
 observations table**, not a fixed column, because we do not yet know how many
 such quantities each device exposes.
@@ -44,9 +46,10 @@ Ten bullets, in the order they matter:
 1. Directory per session; the package is the record, the registry is a cache.
 2. Raw chunks are Arrow IPC stream files — a truncated one still yields every
    complete batch. Parquet's footer makes a truncated chunk a total loss.
-3. Exact device transport bytes are canonical raw for every stream. No decoder
-   is written yet and no device is verified; a decode bug is recoverable with
-   payloads and permanent without them.
+3. Canonical raw is the lowest level our acquisition boundary actually saw.
+   Where transport bytes are exposed, preserving them is mandatory. Where an
+   upstream library decoded them first, the stream is honestly labelled
+   `library_decoded` and no bytes are fabricated.
 4. `packets` and `samples` are separate tables. Denormalising packet metadata
    onto every sample row costs ~44–59 MB per stream-hour at 256 Hz **and**
    falsely implies per-sample host timing precision.
@@ -56,8 +59,10 @@ Ten bullets, in the order they matter:
 6. `lifecycle_state`, `closure_condition` and `recording_outcome` are three
    separate fields. A crash produces `RECOVERED_UNCLEAN` + `UNCLASSIFIED`; it
    never guesses between an operator abort and a power failure.
-7. `COMPLETED` is establishable **only inside the sealed prefix**. Post-seal
-   annotations may downgrade an outcome, never upgrade it.
+7. `COMPLETED` is creatable **only inside the sealed prefix**, and readers
+   evaluate the **effective** outcome — the sealed outcome after applying every
+   valid post-seal downgrade. A corrupt annotation log fails closed rather than
+   falling back to the sealed value.
 8. Session IDs are opaque UUIDv4. Any timestamp inside an identifier is a second
    chronology that outlives every promise not to parse it.
 9. Derived artifacts live **outside** the sealed package, so a manifest written
@@ -106,13 +111,16 @@ data/
     run.json                              # sealed at RECORDING_START
     lifecycle.jsonl                       # append-only; SEALED at finalization
     annotations.jsonl                     # post-seal, hash-chained, downgrade-only
+    annotations.head.json                 # expected length/count/head hash of the above;
+                                          #   the only file legitimately mutable after sealing
     events/
       events.jsonl                        # sealed before the manifest
     schemas/
       <schema_id>.json                    # snapshot of every schema used
     raw/<stream_id>/
       descriptor.json                     # sealed at stream open
-      payloads/000000.bin                 # canonical raw transport bytes
+      payloads/000000.bin                 # transport bytes; ONLY when
+                                          #   raw_capture_level = transport_payload
       packets/000000.arrow
       samples/000000.arrow
       observations/000000.arrow           # device times + counters
@@ -212,15 +220,128 @@ file and is never consulted for truth.
 may reclassify later. That is a new hash-chained record in `annotations.jsonl`,
 carrying actor, timestamp and reason. The original record is never edited. But:
 
-> **A post-seal annotation may only DOWNGRADE an outcome.** It may move
-> `UNCLASSIFIED` to any of the three, and it may move `COMPLETED` to `ABORTED`
-> or `TECHNICAL_FAILURE`. It may **never** produce `COMPLETED`. `COMPLETED` is
-> establishable only inside the sealed lifecycle prefix, at a clean
-> finalization.
+> **A post-seal annotation may only DOWNGRADE an outcome.** The complete set of
+> permitted transitions is exactly four:
+>
+> | From | To | Permitted |
+> |---|---|---|
+> | `COMPLETED` | `ABORTED` | yes |
+> | `COMPLETED` | `TECHNICAL_FAILURE` | yes |
+> | `UNCLASSIFIED` | `ABORTED` | yes |
+> | `UNCLASSIFIED` | `TECHNICAL_FAILURE` | yes |
+> | *anything* | `COMPLETED` | **never** |
+>
+> `COMPLETED` may be **created** only inside the sealed lifecycle prefix, during
+> a clean finalization. No annotation may create it and no annotation may
+> restore it: once an outcome has been downgraded away from `COMPLETED`, the
+> session can never be `COMPLETED` again.
 
-Without that rule, appending one line to a text file turns an aborted session
-into a completed one without invalidating any hash. Codex constructed exactly
-that attack in Pass 2 (finding G1).
+Two things make this rule load-bearing rather than decorative.
+
+First, without the `never` row, appending one line to a text file would turn an
+aborted session into a completed one without invalidating any hash. Codex
+constructed exactly that attack in Pass 2 (finding G1).
+
+Second, the `UNCLASSIFIED` restriction matters as much as the `COMPLETED` one.
+Every crashed session closes `UNCLASSIFIED`; if an annotation could raise that
+to `COMPLETED`, the sealed-prefix rule would be bypassed by every crash. An
+earlier draft of this document said an annotation could move `UNCLASSIFIED` to
+"any of the three", which reopened precisely that hole.
+
+**Lateral reclassification — `ABORTED` <-> `TECHNICAL_FAILURE` — is not
+permitted by this rule set.** A human who classifies a session as an operator
+abort and later determines it was a device fault has no path to correct the
+record. That is a deliberate consequence of keeping the transition set minimal,
+not an oversight, but whether it is acceptable is a study-operations question. —
+**OPEN — HUMAN DECISION REQUIRED**
+
+### 5.1 Sealed outcome versus effective outcome
+
+These are two different quantities and conflating them is how a session reads
+`COMPLETED` after a human has already downgraded it.
+
+- **Sealed recording outcome** — the `recording_outcome` written during
+  finalization, inside the sealed prefix of `lifecycle.jsonl`. It is immutable
+  and hash-protected by `manifest.lifecycle_seal`.
+- **Effective recording outcome** — the sealed outcome after applying, in file
+  order, every **valid** post-seal downgrade annotation from
+  `annotations.jsonl`.
+
+**Every reader, tool, report and query must use the effective outcome.** The
+sealed outcome is an input to that computation and is never the answer on its
+own.
+
+Computing the effective outcome is deterministic:
+
+**`annotations.head.json` — the anti-deletion pointer.** A hash chain proves
+that the records present are intact; it cannot prove that no record was
+*removed*. Deleting `annotations.jsonl`, or truncating it on a record boundary,
+would leave a perfectly valid shorter chain — and under a naive
+`absent -> sealed` rule that silently restores a sealed `COMPLETED`, undoing a
+human's downgrade.
+
+So finalization writes `annotations.head.json` as part of sealing:
+
+```json
+{ "bytes": 0, "record_count": 0, "head_record_sha256": null }
+```
+
+and every annotation append updates it atomically (tmp -> fsync -> rename ->
+fsync(dir)) **after** the append lands. It is the one file in the package that
+is legitimately mutable after sealing, and it exists solely so that the
+*expected* length and head of the chain are recorded outside the chain itself.
+
+```text
+0. if annotations.head.json is absent:
+       package annotation status = INDETERMINATE; is_completed := false
+       (finalization always writes it, so its absence means tampering or loss)
+1. if head.record_count == 0:
+       annotations.jsonl must be absent or zero-length -> effective := sealed
+       anything else -> INDETERMINATE; is_completed := false
+2. if head.record_count > 0:
+       annotations.jsonl must exist, be exactly head.bytes long, and its last
+       record's record_sha256 must equal head.head_record_sha256
+       any mismatch -> INDETERMINATE; is_completed := false
+       otherwise:
+         verify the hash chain end to end
+         2a. chain fails  -> INDETERMINATE; effective is UNDEFINED
+                             is_completed := false
+                             (NEVER fall back to the sealed outcome)
+         2b. chain passes -> apply records in file order, maintaining a running
+                             effective outcome that starts at `sealed`:
+               - a record whose `from` does not equal the CURRENT running
+                 effective outcome is REJECTED
+               - a record whose target is COMPLETED is REJECTED
+               - a record whose (from -> to) is not one of the four permitted
+                 transitions is REJECTED
+               - a rejected record is never applied, and is reported
+             if any record was rejected -> is_completed := false
+             effective := the running outcome after every accepted record
+```
+
+Every annotation therefore carries **both** `from` and `to`, and `from` must
+match the outcome in force at that point in the file. Without that check two
+conforming implementations could legitimately disagree about a log containing
+two downgrades — one applying both, one applying the first and treating the
+second's premise as stale — and "conforming implementations disagree" is exactly
+what a canonical format exists to prevent.
+
+Step 2a is the fail-closed rule: a corrupt or truncated annotation log must
+never silently restore a sealed `COMPLETED`, because "the downgrade record is
+unreadable" and "there was no downgrade" are indistinguishable from the bytes
+and only one of them is safe to assume.
+
+**Residual limitation, stated plainly.** The head pointer defeats accidental
+loss, truncation, and tampering with either file alone. It does **not** defeat
+an actor with write access who removes or rewrites *both* files consistently.
+Defending against that needs append-only media or a signature, neither of which
+this single-workstation design has. — **OPEN — HUMAN DECISION REQUIRED**, and
+recorded here rather than left as an implied guarantee.
+
+The `is_completed := false` on any rejected record is deliberately
+conservative. A package containing a rejected upgrade attempt is not one a
+reader should silently bless, even if the surviving records happen to leave the
+outcome at `COMPLETED`.
 
 ---
 
@@ -388,6 +509,13 @@ outcome, which Codex correctly identified as a permanent conflicting truth
     "packet_counter_width_bits":{ "value": null, "status": "assumed", "source": null, "observed_at": null },
     "samples_per_packet":       { "value": null, "status": "assumed", "source": null, "observed_at": null }
   },
+  "acquisition": {
+    "backend": { "name": "brainflow", "version": "5.x.y", "adapter_version": "0.1.0" },
+    "raw_capture_level": "library_decoded",
+    "transport_payload_preserved": false,
+    "decode_boundary": "BrainFlow decoded the BLE notification payloads before our recorder received anything.",
+    "provenance": { "status": "assumed", "source": "not yet measured on hardware", "observed_at": null }
+  },
   "channel_layout_provenance": {
     "status": "assumed",
     "source": "vendor documentation, not measured on the device",
@@ -432,8 +560,71 @@ cannot contaminate the common contract.
 
 ### 9.1 Three artifacts per chunk, one commit
 
-**`payloads/NNNNNN.bin` — canonical raw.** Length-prefixed records of the exact
-bytes received from the device, each tagged with its `packet_seq`. **Always on.**
+### 9.0 What "canonical raw" means
+
+**PROPOSED.** Canonical raw is:
+
+> the **lowest-level representation actually observed at our acquisition
+> boundary**, preserved without scientific transformation by our code.
+
+That definition is deliberately relative to our boundary, because where the
+boundary sits is not the same for every device or every backend, and pretending
+otherwise would make the schema lie.
+
+Every raw stream therefore declares a **`raw_capture_level`**:
+
+| Level | Meaning | Canonical raw is |
+|---|---|---|
+| `transport_payload` | We received the device/transport bytes before any scientific decoding | The transport bytes |
+| `library_decoded` | An external acquisition library decoded or transformed the transport payload before our recorder saw anything | The library's decoded representation, **with reduced provenance** |
+| `synthetic` | We generated the stream; there is no device and no transport | The generated values, plus the generator seed |
+
+```text
+transport_payload:   BLE notification bytes -> [our boundary] -> payload log -> our decoder -> packets/samples
+library_decoded:     device -> BrainFlow decoder -> numeric board data -> [our boundary] -> packets/samples
+```
+
+**`library_decoded` is not equivalent to transport raw and this document never
+implies that it is.** In that mode a decoding step happened upstream, outside
+our control and outside our version pinning, and the bytes that entered it are
+gone. That is a real loss of provenance; it is recorded as one rather than
+papered over.
+
+This matters concretely today: Muse S Athena may initially be reached through
+BrainFlow, which may expose only decoded board data. Forcing the schema to claim
+transport bytes were captured in that case would be a fabrication, and
+fabricating them would be worse.
+
+### 9.0.1 Acquisition provenance, recorded per stream
+
+Every `raw/<stream_id>/descriptor.json` carries:
+
+```json
+"acquisition": {
+  "backend": { "name": "brainflow", "version": "5.x.y", "adapter_version": "0.1.0" },
+  "raw_capture_level": "library_decoded",
+  "transport_payload_preserved": false,
+  "decode_boundary": "BrainFlow decoded the BLE notification payloads before our recorder received anything; the notification bytes were never visible to us.",
+  "provenance": { "status": "assumed", "source": "not yet measured on hardware", "observed_at": null }
+}
+```
+
+This answers, for any session read years later: which backend produced the
+stream, at what version, what capture level was available, whether exact
+transport bytes were preserved, and — if not — exactly where the transformation
+boundary sat.
+
+The same four fields describe direct BLE (`transport_payload`, `true`), a Polar
+library adapter (either, depending on the library), QT Py serial
+(`transport_payload`, `true`), and synthetic sources (`synthetic`, `false`, with
+a seed). **The generic session format does not change when the backend
+changes** — only these values do.
+
+### 9.1 Three or four artifacts per chunk, one commit
+
+**`payloads/NNNNNN.bin` — the transport payload log**, present **only when
+`raw_capture_level = "transport_payload"`**. Length-prefixed records of the exact
+bytes received from the device, each tagged with its `packet_seq`.
 
 Exact framing, so that two implementations cannot disagree — **all integers
 little-endian, unsigned**:
@@ -456,14 +647,29 @@ reader seeking to `offset` must find `magic`; if it does not, the reference is
 broken and the reader fails closed rather than returning whatever bytes are
 there.
 
-This is the single most conservative decision in the design and it is
-justified by the repository's own state: no decoder is written, and
-`docs/HARDWARE.md` marks every device unverified. If our Athena parser
-mis-decodes and we stored only decoded samples, the error is permanent. With
-payloads it is fully recoverable by re-decoding. For BLE these packed bytes are
-typically *smaller* than the decoded `float32`/`float64` samples, so the cost is
-low. Turning payload capture off requires a named human decision recorded in
-`docs/DECISIONS.md`.
+**The capture rule, stated precisely:**
+
+> **If transport payloads are exposed to our acquisition code, preserving them
+> is mandatory**, unless a named human decision recorded in `docs/DECISIONS.md`
+> explicitly disables it.
+>
+> **If the upstream library never exposes them, we record
+> `transport_payload_preserved: false` and `raw_capture_level:
+> "library_decoded"`, and we never fabricate or reconstruct fake transport
+> bytes.**
+
+An earlier draft said payload capture was unconditionally mandatory. That was
+not implementable: it would force a BrainFlow-backed adapter either to fail, or
+to synthesize bytes it never saw — and a synthesized payload log is strictly
+worse than an honest absence, because it looks like ground truth.
+
+Where payloads *are* available, preserving them remains the most conservative
+decision in the design, and the repository's own state justifies it: no decoder
+is written, and `docs/HARDWARE.md` marks every device unverified. If our Athena
+parser mis-decodes and we stored only decoded samples, the error is permanent.
+With payloads it is fully recoverable by re-decoding. For BLE these packed bytes
+are typically *smaller* than the decoded `float32`/`float64` samples, so the
+cost is low.
 
 **`packets/NNNNNN.arrow` — one row per received packet.**
 
@@ -475,7 +681,7 @@ low. Turning payload capture off requires a named human decision recorded in
 | `host_arrival_monotonic_clock_id` | string | no | which OS clock produced the monotonic value |
 | `host_arrival_utc_clock_id` | string | no | which OS clock produced the UTC value |
 | `n_samples` | int32 | no | samples carried in this packet |
-| `payload_ref` | struct{file,offset,length} | no | exact bytes this row was decoded from |
+| `payload_ref` | struct{file,offset,length} | **yes** | exact bytes this row was decoded from. **Non-null iff `transport_payload_preserved = true`; otherwise null.** A fabricated pointer is never written |
 | `decode_status` | string | no | `ok` \| `partial` \| `failed` |
 
 Note there is **no device timestamp column and no counter column here** — see
@@ -736,7 +942,12 @@ append the same record to chunks.jsonl -> fsync                     # hash chain
 ```
 
 **`chunks.jsonl` is the authoritative commit log. A chunk is real if and only if
-its record appears there.** The `NNNNNN.commit.json` sidecar is a convenience
+its record appears there, and its record must name every file the stream
+actually produces** — four when `raw_capture_level = "transport_payload"`, three
+when it is `library_decoded` or `synthetic`, where the `payloads` entry is
+**omitted entirely** rather than written as a null or an empty path.
+`descriptor.acquisition.raw_capture_level` is what tells a reader which shape to
+expect, so a missing `payloads` entry can never be mistaken for a lost file. The `NNNNNN.commit.json` sidecar is a convenience
 copy for recovery tooling and for verifying a single chunk without reading the
 whole index; **a sidecar on its own is not a commit.** A crash after the sidecar
 is renamed but before the `chunks.jsonl` append lands leaves the chunk
@@ -751,27 +962,70 @@ which recovery reports and never adopts.
 `prev_record_sha256` chains the index, so a truncated or edited `chunks.jsonl` is
 detectable rather than silently shorter (finding F15).
 
-**Canonical serialization — required for every hashed JSON or JSONL record.**
-Two implementations must produce the same bytes for the same record, or every
-hash in this design is meaningless:
+**Canonical serialization — RFC 8785 (JSON Canonicalization Scheme, JCS).**
 
-- UTF-8, no BOM.
-- Object keys sorted by Unicode code point.
-- No insignificant whitespace: separators are `,` and `:` exactly.
-- Non-ASCII characters emitted literally, never `\uXXXX`-escaped.
-- Integers emitted without a decimal point or exponent; floats emitted with
-  `repr()`-equivalent shortest round-trip formatting.
-- In JSONL files, exactly one canonical record per line, terminated by `\n`.
-  The terminating newline is **not** part of the hashed bytes.
+Two implementations must produce identical bytes for the same logical record, or
+every hash in this design is meaningless. Rather than invent a project-local
+format, this design **adopts RFC 8785** for any JSON object whose canonical
+bytes are hashed. Conformance to the RFC is the requirement; a prose
+approximation of it is not.
 
-In Python this is
-`json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)`.
+An earlier draft specified
+`json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=False)` and
+asserted that independent implementations would necessarily agree. **That claim
+was too strong, and it is withdrawn.** Python's ordinary `json.dumps()` is not a
+conforming JCS implementation, on at least two counts that matter:
 
-**`record_sha256` is computed over the canonical serialization of the record with
-the `record_sha256` key absent**, then inserted. A verifier removes the key,
-re-serializes canonically, and compares. `prev_record_sha256` is the previous
-record's `record_sha256` value; the first record in a chain uses
-`"0" * 64`.
+- **Key ordering.** JCS sorts object keys by their **UTF-16 code units**;
+  `sort_keys=True` sorts by Unicode code point. The two orders differ once any
+  key contains a character above the BMP.
+- **Number formatting.** JCS mandates the ECMAScript `Number::toString`
+  algorithm. Python's float repr is shortest-round-trip but is not
+  byte-identical to it in every case, and Python has no notion of JCS's integer
+  range rules.
+
+CL-002B implements or vendors a small, tested JCS helper. **No new dependency is
+mandated**; whether to take one is an implementation-review call, not a schema
+decision.
+
+**Numeric rules for hashed records** — these are constraints on what may be
+written, not on canonicalization:
+
+- `NaN`, `Infinity` and `-Infinity` are **invalid** in any hashed record and
+  must be rejected at write time. Python's `json` emits them as bare
+  `NaN`/`Infinity`, which is not valid JSON at all, so writers must set
+  `allow_nan=False` and treat the resulting error as fatal.
+- JCS serializes `-0` as `0`. Negative zero therefore **cannot carry meaning**
+  in a hashed record and must not be used to.
+- Every timing quantity in this design is an integer (nanoseconds, counters,
+  byte offsets). Floating point appears only in `observations.value_f64`, which
+  is a raw device value and is never itself a hashed record field.
+
+**JSONL files** — `lifecycle.jsonl`, `annotations.jsonl`, `chunks.jsonl`,
+`events/events.jsonl` — carry exactly one canonical record per line, terminated
+by `\n`. **The terminating newline is not part of the hashed bytes.**
+
+**`record_sha256` procedure**, in this order, so that a verifier can run it
+inverted and deterministically:
+
+```text
+1. construct the logical record
+2. omit the record_sha256 key entirely   (omit, not null, not empty string)
+3. canonicalize per RFC 8785
+4. SHA-256 over those canonical bytes
+5. insert record_sha256 with the resulting lowercase hex digest
+6. write the final record, canonicalized per RFC 8785
+```
+
+Verification: parse the line, remove `record_sha256`, canonicalize, hash,
+compare. Because verification re-canonicalizes from the parsed object rather
+than trusting the bytes on disk, **whitespace or key-order tampering in an
+external representation cannot pass** — it either reproduces the same canonical
+bytes, in which case nothing changed, or it does not, in which case the hash
+fails.
+
+`prev_record_sha256` is the previous record's `record_sha256`; the first record
+in a chain uses `"0" * 64`.
 
 Arrow IPC **stream** format is chosen over Parquet for raw specifically because a
 truncated IPC stream still yields every complete record batch, while a truncated
@@ -822,13 +1076,24 @@ primary signal that a session was not cleanly closed.
   ],
   "inventory": [ { "path": "allocation.json", "bytes": 812, "sha256": "…" } ],
   "schemas": [ { "schema_id": "block_start.v1", "path": "schemas/block_start.v1.json", "sha256": "…" } ],
-  "scope_note": "logs/ and data/derived/ are OUTSIDE this manifest by design."
+  "scope_note": "logs/, annotations.jsonl, annotations.head.json and data/derived/ are OUTSIDE this manifest by design."
 }
 ```
 
+**`annotations.jsonl` and `annotations.head.json` are excluded from
+`manifest.inventory` and from every manifest byte hash.** They must be: both are
+written *after* the manifest is sealed, so including them would recreate exactly
+the ordering contradiction that finding F2 closed. Their integrity is therefore
+**not** established by the manifest — it is established only by the §5.1
+verification (hash chain plus head pointer), and they are authoritative only
+through that path. A reader that verifies the manifest has verified the sealed
+package; it has **not** verified the annotations, and must run §5.1 separately
+before reporting any outcome.
+
 **The manifest carries no `outcome` field.** Outcome is owned by the lifecycle
-log; the manifest owns bytes. The manifest pair is therefore a **finalization
-marker, not a completion marker** — a cleanly aborted session produces an
+log — the sealed prefix plus `annotations.jsonl`, resolved as in §5.1 — while
+the manifest owns bytes. The manifest pair is therefore a **finalization
+marker**, never a completion marker: a cleanly aborted session produces an
 identical, fully valid pair. The manifest binds to the outcome indirectly and
 tamper-evidently, through `lifecycle_seal.sealed_len` + `sealed_sha256`: the
 sealed prefix cannot be edited without detection, while legitimate post-seal
@@ -853,39 +1118,56 @@ contradiction Codex found in the first draft (finding F2), where
 5. snapshot every schema used into schemas/
 6. sha256 every in-scope file; verify every chunk chain end to end
 7. write manifest.json.tmp -> fsync -> rename -> fsync(dir)
-8. write manifest.sha256.tmp -> fsync -> rename -> fsync(dir)   <-- completion marker
+8. write manifest.sha256.tmp -> fsync -> rename -> fsync(dir)   <-- FINALIZATION marker
 9. registry upsert (derived)
 ```
 
 The **existence of a matching `manifest.json` + `manifest.sha256` pair** is the
-completion marker. Step 8 is the last durable act; a crash anywhere before it
-leaves a session that is, correctly, not complete.
+**finalization marker** — also called the sealed-package marker. It proves one
+thing and one thing only:
+
+> the package was cleanly finalized and sealed.
+
+It does **not** prove that the recording outcome was `COMPLETED`. A cleanly
+finalized `ABORTED` or `TECHNICAL_FAILURE` session produces an identical, fully
+valid pair. **This document never calls the manifest pair a completion marker.**
+
+Step 8 is the last durable act; a crash anywhere before it leaves a session
+that is, correctly, not finalized.
 
 ### The completion predicate
 
-> A reader may conclude `recording_outcome = COMPLETED` **only if all seven
-> hold**:
+There is exactly one predicate, with **eight conditions**. It evaluates the
+**effective** recording outcome (§5.1), not the sealed one.
+
+> `is_completed(package)` is true **if and only if all eight hold**:
 >
 > 1. `manifest.json` exists and `manifest.sha256` matches it;
 > 2. every file in `inventory` exists and hashes to its recorded value;
 > 3. the first `lifecycle_seal.sealed_len` bytes of `lifecycle.jsonl` hash to
 >    `lifecycle_seal.sealed_sha256`;
-> 4. within that sealed prefix the terminal state is `CLOSED` with
->    `closure_condition = CLEAN` and `recording_outcome = COMPLETED`;
-> 5. **every stream declared `required` in `run.json` has
->    `close_status = CLEAN`** in the manifest;
+> 4. within that sealed prefix the terminal state is `CLOSED`, with
+>    `closure_condition = CLEAN` and **sealed** `recording_outcome = COMPLETED`;
+> 5. every stream declared `required` in `run.json` has `close_status = CLEAN`
+>    in the manifest;
 > 6. no `.part`, `.tmp` or `.open` file exists anywhere in the package;
 > 7. every chunk file present under `raw/` appears in its `chunks.jsonl` hash
->    chain, and every chain verifies end to end.
->
-> **No post-seal annotation can satisfy condition 4.** Annotations may only
-> downgrade.
+>    chain, and every chain verifies end to end;
+> 8. the **effective** recording outcome computed by §5.1 is `COMPLETED` —
+>    which requires that `annotations.jsonl` is either absent, or present with a
+>    verifying hash chain, no rejected record, and no accepted downgrade.
 
-Conditions 4, 5 and the downgrade-only rule each close a false-complete state
-Codex actually constructed in Pass 2 — respectively: a post-seal
+Condition 4 tests the sealed outcome; condition 8 tests the effective one.
+Both are required, and neither implies the other: condition 4 alone would miss a
+valid downgrade, and condition 8 alone would accept an outcome that was never
+sealed. Any package where §5.1 returns `INDETERMINATE` fails condition 8.
+
+Each of conditions 4, 5, 8 and the four-transition rule closes a false-complete
+state that was actually constructed against an earlier draft: a post-seal
 `CLASSIFIED: COMPLETED` promoting an aborted session; a required device
-disconnecting while the package still satisfied every other condition; and an
-operator abort being reclassified upward.
+disconnecting while every other condition still held; an operator abort being
+reclassified upward; and a valid human downgrade being invisible to a predicate
+that read only the sealed prefix.
 
 ---
 
@@ -1053,7 +1335,7 @@ which is the intended design, not a gap (`docs/SAFETY.md`).
 | Q | Question (`docs/SESSION_FORMAT.md`) | Proposal | Label |
 |---|---|---|---|
 | Q1 | Container format | Directory per session | **PROPOSED** |
-| Q2 | Serialisation | Arrow IPC stream (raw chunks), length-prefixed binary (payloads), JSONL (events, lifecycle, chunk index), JSON (allocation/run/descriptor/manifest), SQLite (registry), Parquet (derived only) | **PROPOSED** |
+| Q2 | Serialisation | Arrow IPC stream (raw chunks), length-prefixed binary (transport payloads, when available), JSONL (events, lifecycle, annotations, chunk index), JSON canonicalized per RFC 8785 where hashed (allocation/run/descriptor/manifest), SQLite (registry), Parquet (derived only) | **PROPOSED** |
 | Q3 | Session identifier | UUIDv4, opaque, no embedded time; uniqueness via `os.mkdir` | **PROPOSED** |
 | Q4 | Metadata set | Split by when known: `allocation.json` / `run.json` / `descriptor.json`; one authority per question (§7.3) | **PROPOSED** |
 | Q5 | Event and marker representation | One `events/events.jsonl`; devices in `raw/`, meaning in events, joined by `raw_ref`; per-schema versioning; schemas snapshotted into the package | **PROPOSED** |
@@ -1080,7 +1362,8 @@ which is the intended design, not a gap (`docs/SAFETY.md`).
 | A single `timestamp` column | Destroys timing provenance — the exact failure `docs/TIMING.md` exists to prevent |
 | Fixed `device_timestamp` / `device_packet_counter` columns | Silently discards a second device-provided quantity if one exists. **This was in the first draft and was the sharpest finding of the review** |
 | Gap / duplicate / out-of-order flags computed at acquisition | A buggy acquisition build would freeze a wrong observation into immutable data |
-| Optional payload capture, off after "verification" | Assumes a decoder will never regress across firmware or library versions |
+| Optional payload capture of *available* transport bytes, off after "verification" | Assumes a decoder will never regress across firmware or library versions. Distinct from `library_decoded`, where the bytes never reached us at all |
+| Unconditionally mandatory payload capture | Not implementable against a backend that never exposes transport bytes; it would force an adapter to fabricate a payload log, which is worse than an honest absence |
 | `INDETERMINATE` as a fourth terminal outcome | Blurs operational closure with scientific meaning; replaced by `closure_condition` + `UNCLASSIFIED` |
 | Manifest as outcome authority | Creates a permanent second truth alongside the lifecycle log |
 | Derived artifacts inside the sealed package | A once-written manifest would go stale on the first analysis run |
@@ -1108,33 +1391,47 @@ which is the intended design, not a gap (`docs/SAFETY.md`).
    EEG counts as complete.
 5. **Whether `UNCLASSIFIED` sessions block analysis** or are simply excluded
    with a recorded reason.
-6. **Whether payload capture may ever be disabled** for a verified device, and
-   under what evidence.
+6. **Whether payload capture may ever be disabled** for a device whose transport
+   bytes *are* exposed, and under what evidence. (Where they are not exposed
+   there is nothing to disable — see §9.0.)
+7. **Whether lateral reclassification `ABORTED` <-> `TECHNICAL_FAILURE` should
+   be permitted.** The four-transition rule in §5 forbids it, which means a
+   mis-classified session cannot be corrected sideways. Allowing it would widen
+   the annotation surface; forbidding it loses a legitimate correction. A study
+   decision, not an engineering one.
 
 ### OPEN — HARDWARE VALIDATION REQUIRED
 
-7. **Which timing quantities each device actually exposes** — one device time or
+8. **Which timing quantities each device actually exposes** — one device time or
    several, per packet or per sample, and what each refers to.
-8. **Counter widths and wrap behaviour** for Muse and Polar.
-9. **What `applies_to` is true** for each device time (`sample_acquisition` vs
+9. **Counter widths and wrap behaviour** for Muse and Polar.
+10. **What `applies_to` is true** for each device time (`sample_acquisition` vs
    `packet_assembly` vs `transmission`). Every observation currently records
    `unknown`.
-10. **Whether BrainFlow's timestamp is device-provided or host-synthesized.**
+11. **Whether BrainFlow's timestamp is device-provided or host-synthesized.**
     This determines whether it is `device_provided` or `library_provided`, and
     the schema records both possibilities rather than assuming.
-11. **Actual sustained sample rates** under BLE with two peripherals connected.
-12. **QT Py serial round-trip latency and jitter**, which bounds how precisely a
+12. **Actual sustained sample rates** under BLE with two peripherals connected.
+13. **QT Py serial round-trip latency and jitter**, which bounds how precisely a
     marker can be placed on a common timeline.
+14. **The Muse S Athena acquisition backend and its available
+    `raw_capture_level`.** Whether BrainFlow exposes the BLE notification
+    payloads or only decoded board data; whether a direct-BLE or
+    OpenMuse-style route is viable; packet stability; and how much timing is
+    visible at each level. **This task deliberately does not select a backend**,
+    and introduces no new dependency. The schema supports
+    `transport_payload` and `library_decoded` equally, so the choice can be made
+    from measurements instead of from guesses.
 
 None of these has been converted into an assumed schema fact. The schema
 preserves the raw information needed to answer all of them later.
 
 ### DEFERRED SAFELY
 
-13. Compression codec for Arrow chunks (LZ4 vs ZSTD vs none) — a per-chunk
+15. Compression codec for Arrow chunks (LZ4 vs ZSTD vs none) — a per-chunk
     property, changeable without a schema change.
-14. Registry indexes and query surface — derived, rebuildable at will.
-15. Any CLI ergonomics.
+16. Registry indexes and query surface — derived, rebuildable at will.
+17. Any CLI ergonomics.
 
 ---
 
@@ -1152,9 +1449,16 @@ Implementation only of what this document specifies, once approved.
 3. `SessionAllocator` — the §12.1 ordering, including the `os.mkdir` uniqueness
    gate.
 4. `ChunkWriter` — the §12.2 atomic pattern, the hash chain, and the ENOSPC path.
-5. `LifecycleLog` and `AnnotationLog`, including the downgrade-only rule.
-6. `Finalizer` — the §14 sequence and the completion predicate as an executable
-   function.
+5. `LifecycleLog` and `AnnotationLog`, including the four-transition rule, the
+   `from`-must-match check, and the `annotations.head.json` pointer with its
+   atomic update.
+6. `Finalizer` — the §14 sequence and the eight-condition completion predicate
+   as an executable function, built on an `effective_outcome()` function
+   implementing §5.1 including its fail-closed path.
+6a. An RFC 8785 (JCS) canonicalization helper, implemented or vendored, tested
+   against the RFC's published vectors, plus the `record_sha256` procedure of
+   §12.2. Every hashed record in the system depends on it, so it lands before
+   anything that writes a hash.
 7. `RecoveryScanner` — reports orphans; adopts nothing.
 8. `Registry` — SQLite schema, `rebuild` by scanning packages, and nothing that
    treats the registry as truth.
@@ -1182,8 +1486,11 @@ Each maps to a specific claim above. Property-based tests use `hypothesis`.
 2. Truncate a committed chunk file by one byte → verification fails.
 3. Truncate `chunks.jsonl` mid-record → the hash chain reports the break.
 4. Leave an orphan `.part` → recovery reports it and does not adopt it.
-5. Simulate `ENOSPC` mid-chunk → no commit record is written, the session closes
-   unclean, and no truncated chunk is ever committed.
+5. Simulate `ENOSPC` mid-chunk → no commit record is written, no truncated chunk
+   is ever committed, and the session closes
+   `closure_condition = CLEAN, recording_outcome = TECHNICAL_FAILURE` with the
+   error in `outcome_reason` — **not** unclean and **not** `UNCLASSIFIED`,
+   because the cause is known (§12.3, §19).
 6. Kill between `packets` seal and `samples` seal → the chunk is uncommitted and
    the packet metadata is not visible as real.
 
@@ -1200,6 +1507,47 @@ Each maps to a specific claim above. Property-based tests use `hypothesis`.
 11b. A cleanly aborted session has a fully valid `manifest.json` +
     `manifest.sha256` pair → the pair verifies, and the predicate is still
     false. Finalization is not completion. (RC2)
+
+**Effective outcome (§5.1) — one test per row of the truth table**
+
+| Test | Sealed outcome | Annotations | Expected `effective_outcome` | Expected `is_completed` |
+|---|---|---|---|---|
+| **A** | `COMPLETED` | none | `COMPLETED` | **true** (given conditions 1–7 pass) |
+| **B** | `COMPLETED` | `ABORTED` | `ABORTED` | false |
+| **C** | `COMPLETED` | `TECHNICAL_FAILURE` | `TECHNICAL_FAILURE` | false |
+| **D** | `ABORTED` | attempts `COMPLETED` | `ABORTED`; annotation **rejected** and reported | false |
+| **E** | `COMPLETED` | log corrupt (broken hash chain) | **UNDEFINED / INDETERMINATE** | false — and it must **never** silently report `COMPLETED` |
+
+Test E is the one that matters most: it asserts the fail-closed path. A test
+that merely checks "corrupt log → not completed" would pass even on an
+implementation that fell back to the sealed outcome and happened to be aborted;
+it must assert that the package integrity status is reported as indeterminate.
+
+Additional:
+
+11c. `UNCLASSIFIED` → `ABORTED` and `UNCLASSIFIED` → `TECHNICAL_FAILURE` are
+    both accepted; `UNCLASSIFIED` → `COMPLETED` is rejected.
+11d. After `COMPLETED` → `ABORTED`, a second annotation attempting to restore
+    `COMPLETED` is rejected; the effective outcome stays `ABORTED`.
+11e. A lateral `ABORTED` → `TECHNICAL_FAILURE` annotation is rejected under the
+    current four-transition rule, and the rejection is reported rather than
+    silently ignored (see the open question in §5).
+11f. **Deleted downgrade.** Sealed `COMPLETED`, one valid `ABORTED` annotation,
+    then `annotations.jsonl` is deleted while `annotations.head.json` still
+    reports one record → **INDETERMINATE**, `is_completed = false`. Never
+    `COMPLETED`.
+11g. **Boundary truncation.** Two valid annotations, then the file is truncated
+    on the record boundary after the first → head mismatch → INDETERMINATE.
+11h. `annotations.head.json` missing entirely → INDETERMINATE (finalization
+    always writes it).
+11i. `head.record_count = 0` with a non-empty `annotations.jsonl` →
+    INDETERMINATE.
+11j. **Stale `from`.** Two records, the second declaring `from: COMPLETED` after
+    the first already downgraded to `ABORTED` → the second is rejected, the
+    effective outcome stays `ABORTED`, and `is_completed = false`.
+11k. `annotations.jsonl` and `annotations.head.json` appear in **neither**
+    `manifest.inventory` nor any manifest hash, and adding an annotation does
+    **not** invalidate `manifest.sha256`.
 
 **Timing provenance**
 
@@ -1224,10 +1572,22 @@ Each maps to a specific claim above. Property-based tests use `hypothesis`.
 **Immutability and schema**
 
 19. Any attempt to reopen a committed raw file for write raises.
-19a. Canonical serialization is byte-stable: re-serializing any hashed record
-    reproduces the exact bytes, and `record_sha256` verifies after removing the
-    key and re-serializing. Key order, whitespace and non-ASCII escaping are
-    each perturbed and each must fail verification. (RC6)
+19a. **RFC 8785 canonicalization** (all of these, each its own assertion):
+    (i) two dicts with different insertion order produce identical canonical
+    bytes and identical `record_sha256`;
+    (ii) non-ASCII and astral-plane strings survive a canonicalize → hash →
+    parse → re-canonicalize round trip byte-identically, including keys that
+    sort differently under UTF-16 code units than under code points;
+    (iii) `NaN`, `Infinity` and `-Infinity` are **rejected at write time**, not
+    serialized;
+    (iv) `-0.0` in a hashed field is rejected;
+    (v) changing any single value changes `record_sha256`;
+    (vi) reformatting a record's whitespace or key order on disk does **not**
+    defeat verification, because the verifier re-canonicalizes from the parsed
+    object;
+    (vii) canonical re-serialization of a verified record reproduces the
+    original bytes exactly;
+    (viii) the helper matches the RFC 8785 published test vectors.
 19b. Payload framing round-trips: `magic`, `packet_seq`, `payload_len`, payload
     bytes and `crc32c` survive a write/read cycle; a `payload_ref.offset` that
     does not land on `magic` fails closed instead of returning bytes. (RC7)
@@ -1235,6 +1595,25 @@ Each maps to a specific claim above. Property-based tests use `hypothesis`.
     record is reported as orphaned and is **not** treated as committed. (RC5)
 19d. An `ENOSPC` close records `TECHNICAL_FAILURE` with a reason, never
     `UNCLASSIFIED`. (RC9)
+
+**Raw capture level (§9.0)**
+
+23. A `transport_payload` stream writes a payload log, sets
+    `transport_payload_preserved: true`, and every `packets.payload_ref` is
+    non-null and resolves to a record whose `magic` matches.
+24. A `library_decoded` stream writes **no** payload log, sets
+    `transport_payload_preserved: false`, and every `packets.payload_ref` is
+    **null** — never a fabricated pointer, never a zero-length record.
+25. A `library_decoded` chunk commit record **omits** the `payloads` entry
+    entirely, and a reader driven by `raw_capture_level` does not report the
+    absent file as a lost file.
+26. A `synthetic` stream records `raw_capture_level: "synthetic"` and its
+    generator seed, and replaying it reproduces identical values.
+27. `acquisition.backend.name`, `.version` and `.adapter_version` survive a
+    write/read round trip and appear in the manifest inventory hash.
+28. Round trip on a session containing **both** a `transport_payload` stream and
+    a `library_decoded` stream — the generic format handles both without
+    branching outside the descriptor.
 20. A v1 package read by a reader declaring only v2 support fails closed with an
     explicit unsupported-version error.
 21. An unknown optional field in a v1.1 package is ignored by a v1.0 reader.
@@ -1264,8 +1643,8 @@ anchoring. It independently reached the same conclusion on: directory per
 session; Arrow IPC immutable chunks (rejecting Parquet for raw on the same
 truncation argument); SQLite for the registry; separate packet and sample tables;
 package-as-truth with registry-as-cache; separate operational state and
-scientific outcome; an atomic finalization marker as the only completion
-evidence; typed null plus provenance for missing timing; counters rather than
+scientific outcome; an atomic finalization marker as the only evidence a package
+was cleanly sealed; typed null plus provenance for missing timing; counters rather than
 timestamps for loss detection; namespaced device quirks; and no in-place
 migration.
 
@@ -1328,9 +1707,18 @@ duplication at 256 Hz).
 Codex was given only the repository contracts and the finished proposal, and
 asked for one verdict: is there any remaining reason CL-002B should not begin?
 
-**Verdict: `GO WITH REQUIRED CHANGES`** — nine required changes, RC1–RC9. **All
-nine were accepted and applied before this document was completed.** None was
-rejected or partially accepted.
+**Verdict: `GO WITH REQUIRED CHANGES`** — nine required changes, RC1–RC9. All
+nine were accepted; none was rejected or partially accepted.
+
+**Correction, recorded 2026-08-28 during CL-002A-R1:** six of the nine
+(RC3–RC9) landed in commit `eb89ed0`. **RC1 and RC2 did not.** An editing script
+aborted on a failed anchor match before writing, silently discarding those edits
+while the trace below still reported them as applied. §5 and §14 therefore
+shipped with the pre-RC1 wording — including the `UNCLASSIFIED` → `COMPLETED`
+path RC1 existed to close. Both were re-applied, and extended, in CL-002A-R1
+(§25.5). The lesson is recorded rather than quietly fixed: **a review trace that
+claims a change was applied is worth nothing unless the claim is verified
+against the file.**
 
 RC1 is the important one: it is a **fourth false-complete path**, and one this
 document had opened while closing the other three. §5 said a post-seal
@@ -1359,6 +1747,51 @@ Each of RC1, RC2, RC5, RC6, RC7 and RC9 also gained a regression test in §24
 
 **CL-002B is therefore unblocked**, subject to human approval of this proposal
 and to the §22 decisions that only a person can make.
+
+### 25.5 CL-002A-R1 — final correction pass
+
+**Reviewer:** OpenAI Codex CLI 0.133.0, `codex exec`, read-only sandbox, single
+pass. **Scope: the CL-002A-R1 corrections only** — no redesign, no reopening of
+settled architecture.
+
+Three issues were corrected before review:
+
+| Issue | Problem | Resolution | § |
+|---|---|---|---|
+| 1 | The manifest pair was called a "completion marker" in one place and a "finalization marker" in another; and the predicate read only the sealed outcome, so a valid post-seal downgrade could be invisible to it | Terminology unified on **finalization / sealed-package marker**. **Sealed** and **effective** recording outcome defined separately, with a deterministic fail-closed algorithm. One predicate, **eight conditions**, evaluating the effective outcome | §5, §5.1, §13, §14 |
+| 2 | "Transport bytes are always canonical raw" is not implementable against a backend that never exposes them — BrainFlow may hand us only decoded board data | `raw_capture_level` (`transport_payload` / `library_decoded` / `synthetic`), `transport_payload_preserved`, `acquisition.backend`, `decode_boundary`. Payload capture is mandatory **where payloads are exposed**; where they are not, that is recorded, never fabricated. `payload_ref` becomes nullable | §9.0, §9.0.1, §9.1, §12.2 |
+| 3 | Canonical JSON was specified as `json.dumps(sort_keys=True, …)` with a claim that independent implementations must agree — too strong | **RFC 8785 (JCS) adopted.** The `json.dumps` claim is explicitly withdrawn, with the two concrete divergences named (UTF-16 key ordering, ECMAScript number formatting). NaN / Infinity / `-0.0` rejected at write time | §12.2 |
+
+Also corrected: RC1 and RC2 from Pass 3, which the trace had claimed were
+applied and which were not (see §25.4).
+
+Acceptance tests added: **A–E** for the effective-outcome truth table plus 11c–e;
+19a rewritten as eight distinct canonicalization assertions including the RFC
+8785 test vectors; and 23–28 for raw capture level.
+
+**Unresolved after this pass:** one new open question — whether lateral
+reclassification `ABORTED` <-> `TECHNICAL_FAILURE` should be permitted (§22,
+human decision) — and one new hardware-validation item, the Athena acquisition
+backend and its available capture level (§22). Neither blocks CL-002B: the
+schema supports both outcomes of each.
+
+**Verdict: `GO WITH REQUIRED CHANGES`** — five required changes, RC-R1-1 to
+RC-R1-5. All five accepted and applied; none rejected.
+
+| RC | Finding | Resolution | § |
+|---|---|---|---|
+| RC-R1-1 | The executive summary and the directory listing still asserted unconditional transport-byte capture, contradicting the new §9.0 | Both rewritten to the acquisition-boundary definition; `payloads/` annotated as existing only at `raw_capture_level = transport_payload` | §1, §3 |
+| RC-R1-2 | `annotations.jsonl` had no declared manifest scope | Explicitly **excluded** from `manifest.inventory` and every manifest hash — they are written after sealing, so including them would recreate the F2 ordering contradiction. Authoritative only through §5.1 | §13 |
+| RC-R1-3 | **A hash chain proves the records present are intact; it cannot prove none was removed.** Deleting or boundary-truncating `annotations.jsonl` left a valid shorter chain, and `absent -> sealed` then restored a sealed `COMPLETED` | Added `annotations.head.json`, written at finalization and updated atomically after each append, recording expected `bytes`, `record_count` and `head_record_sha256`. Any mismatch is INDETERMINATE. Residual limitation (an actor rewriting both files) stated rather than implied | §5.1 |
+| RC-R1-4 | §5.1 never required an annotation's `from` to match the outcome in force, so two conforming implementations could disagree on a two-downgrade log | Every annotation carries `from` and `to`; `from` must equal the running effective outcome or the record is rejected | §5.1 |
+| RC-R1-5 | Acceptance test 5 said an `ENOSPC` session "closes unclean", contradicting §12.3 and §19 | Test corrected to `CLEAN` / `TECHNICAL_FAILURE` with `outcome_reason` | §24 |
+
+RC-R1-3 is the substantive one: it is a **fifth false-complete path**, and it
+was invisible to the three earlier passes because they all reasoned about
+corruption rather than deletion. Tests 11f–11k were added for it and for RC-R1-4.
+
+**No new source-of-truth conflict and no weakened crash consistency** were
+found in the corrections.
 
 ---
 

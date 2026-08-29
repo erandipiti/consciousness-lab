@@ -9,6 +9,56 @@ Versioning policy is unresolved — see `docs/OPERATIONS.md`.
 
 ## [Unreleased]
 
+### Changed — CL-002A-R1: final schema corrections (documentation only)
+
+Three corrections to `docs/SESSION_SCHEMA_PROPOSAL.md` before the design is put
+to human approval. No architecture was reopened.
+
+- **Completion vs finalization.** The `manifest.json` + `manifest.sha256` pair is
+  now consistently called a **finalization / sealed-package marker** and never a
+  completion marker; a cleanly aborted session produces an identical valid pair.
+  Added §5.1 defining **sealed** versus **effective** recording outcome, with a
+  deterministic algorithm that fails closed on a corrupt `annotations.jsonl`
+  rather than falling back to the sealed value. Replaced the inconsistent
+  seven/eight-condition predicate with one **eight-condition** predicate that
+  evaluates the effective outcome. The permitted annotation transitions are now
+  an explicit four-row table; nothing may ever create or restore `COMPLETED`.
+- **Raw capture level.** "Transport bytes are always canonical raw" was not
+  implementable against a backend that never exposes them. Added
+  `raw_capture_level` (`transport_payload` / `library_decoded` / `synthetic`),
+  `transport_payload_preserved`, `acquisition.backend` and `decode_boundary`.
+  Payload capture is mandatory where payloads are exposed; where they are not,
+  that is recorded and never fabricated. `packets.payload_ref` is now nullable.
+- **Canonical JSON.** Adopted **RFC 8785 (JCS)** for every hashed record. The
+  earlier claim that `json.dumps(sort_keys=True, …)` would make independent
+  implementations agree is withdrawn, with the two divergences named (UTF-16 key
+  ordering, ECMAScript number formatting). NaN / Infinity / `-0.0` are rejected
+  at write time.
+
+- **Annotation log anti-deletion pointer.** Added `annotations.head.json`,
+  written at finalization and updated atomically after each annotation, holding
+  the expected byte length, record count and head hash. A hash chain proves the
+  records present are intact but cannot prove none was removed; without this,
+  deleting `annotations.jsonl` silently restored a sealed `COMPLETED`. Every
+  annotation now also carries `from` and `to`, and `from` must match the outcome
+  in force. Both found by the CL-002A-R1 review.
+
+### Fixed
+
+- Pass-3 required changes **RC1 and RC2 were reported as applied in `eb89ed0`
+  but were not written to disk** — an editing script aborted before its write,
+  discarding them while the review trace still claimed success. §5 and §14
+  shipped with the pre-RC1 wording, leaving the `UNCLASSIFIED` → `COMPLETED`
+  path that RC1 existed to close. Both re-applied and extended here; the miss is
+  recorded in §25.4 rather than quietly patched.
+
+### Notes
+
+- **No code was written.** CL-002B is not started.
+- `docs/DECISIONS.md` remains unchanged; the proposal is still **PROPOSED**.
+- No scientific threshold was changed, and no hardware behaviour was promoted
+  from assumed to verified.
+
 ### Added — CL-002A: session schema design proposal (documentation only)
 
 - `docs/SESSION_SCHEMA_PROPOSAL.md` — Session Package v1 and Session Registry

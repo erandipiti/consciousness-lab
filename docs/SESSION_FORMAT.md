@@ -5,9 +5,14 @@ format must satisfy and what is still undecided. The schema itself is CL-002
 work. Nothing here should be read as a field list.
 
 > A design **proposal** answering R1–R7 and Q1–Q8 now exists at
-> [`SESSION_SCHEMA_PROPOSAL.md`](SESSION_SCHEMA_PROPOSAL.md) (CL-002A). It is a
-> proposal, not a decision: `DECISIONS.md` is unchanged and this document's
-> questions stay open until a human approves it.
+> [`SESSION_SCHEMA_PROPOSAL.md`](SESSION_SCHEMA_PROPOSAL.md) (CL-002A, corrected
+> in CL-002A-R1). It is a proposal, not a decision: `DECISIONS.md` is unchanged
+> and this document's questions stay open until a human approves it.
+>
+> Note for R3 in particular: the proposal distinguishes the **sealed** recording
+> outcome from the **effective** one, after post-seal downgrade annotations.
+> Preserving all three outcomes means preserving that distinction, not just the
+> three enum values.
 
 Writing a schema before these questions are answered would freeze guesses into
 the data contract, and the data contract is the one thing that cannot be
