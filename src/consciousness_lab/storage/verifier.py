@@ -99,6 +99,10 @@ class Finding(StrEnum):
     PACKET_RANGE_MISMATCH = "packet_range_mismatch"
     MISSING_STREAM_STRUCTURE = "missing_stream_structure"
     SIDECAR_MISMATCH = "sidecar_mismatch"
+    PACKET_SUMMARY_MISMATCH = "packet_summary_mismatch"
+    UNREADABLE_PACKETS_ARTIFACT = "unreadable_packets_artifact"
+    ARTIFACT_PATH_NOT_CANONICAL = "artifact_path_not_canonical"
+    ARTIFACT_PATH_REUSED = "artifact_path_reused"
     UNEXPECTED_FILE = "unexpected_file"
     SYMLINK_IN_PACKAGE = "symlink_in_package"
     UNSAFE_PATH = "unsafe_path"
@@ -552,12 +556,66 @@ def _verify_stream(
 
     # --- artifacts referenced by each commit --------------------------------
     committed_paths: set[str] = set()
-    intact: set[int] = {commit.chunk_id for commit in state.commits}
-    for commit in state.commits:
+    intact: set[int] = {chunk.record.chunk_id for chunk in state.chunks}
+    seen_artifact_paths: dict[str, int] = {}
+    for chunk in state.chunks:
+        commit = chunk.record.model
+        chunk_id = commit.chunk_id
+
+        # --- the summary must match the PHYSICAL packet rows (B2) -----------
+        if chunk.packet_error is not None:
+            result.add(
+                Finding.UNREADABLE_PACKETS_ARTIFACT,
+                f"chunk {chunk_id}: {chunk.packet_error}",
+                stream_id,
+            )
+            ok = False
+            intact.discard(chunk_id)
+        elif (commit.first_packet_seq, commit.last_packet_seq) != (
+            chunk.physical_first_packet_seq,
+            chunk.physical_last_packet_seq,
+        ):
+            # Checked for EVERY chunk, not only the stream endpoints, so a
+            # forged middle chunk cannot hide behind correct-looking ends.
+            result.add(
+                Finding.PACKET_SUMMARY_MISMATCH,
+                f"chunk {chunk_id} claims packets "
+                f"({commit.first_packet_seq}, {commit.last_packet_seq}) but the artifact "
+                f"holds ({chunk.physical_first_packet_seq}, {chunk.physical_last_packet_seq})",
+                stream_id,
+            )
+            ok = False
+
+        # --- artifact paths must be this chunk's own, and used once ---------
+        for kind, artifact in (
+            ("packets", commit.packets),
+            ("observations", commit.observations),
+            ("samples", commit.samples),
+        ):
+            expected_path = f"{kind}/{chunk_id:06d}.arrow"
+            if artifact.path != expected_path:
+                result.add(
+                    Finding.ARTIFACT_PATH_NOT_CANONICAL,
+                    f"chunk {chunk_id} {kind} artifact is {artifact.path!r}, "
+                    f"expected {expected_path!r}",
+                    stream_id,
+                )
+                ok = False
+        if commit.payloads is not None:
+            expected_payload = f"payloads/{chunk_id:06d}.bin"
+            if commit.payloads.path != expected_payload:
+                result.add(
+                    Finding.ARTIFACT_PATH_NOT_CANONICAL,
+                    f"chunk {chunk_id} payload artifact is {commit.payloads.path!r}, "
+                    f"expected {expected_payload!r}",
+                    stream_id,
+                )
+                ok = False
+
         if commit.descriptor_sha256 != state.descriptor_sha256:
             result.add(
                 Finding.CHUNK_DESCRIPTOR_HASH_MISMATCH,
-                f"chunk {commit.chunk_id} was written under a different descriptor",
+                f"chunk {chunk_id} was written under a different descriptor",
                 stream_id,
             )
             ok = False
@@ -567,35 +625,43 @@ def _verify_stream(
         if state.descriptor.expects_payload_artifact and commit.payloads is None:
             result.add(
                 Finding.MISSING_PAYLOAD_ARTIFACT,
-                f"chunk {commit.chunk_id} has no payload artifact",
+                f"chunk {chunk_id} has no payload artifact",
                 stream_id,
             )
             ok = False
         if not state.descriptor.expects_payload_artifact and commit.payloads is not None:
             result.add(
                 Finding.UNEXPECTED_PAYLOAD_ARTIFACT,
-                f"chunk {commit.chunk_id} carries a payload artifact at "
+                f"chunk {chunk_id} carries a payload artifact at "
                 f"raw_capture_level={state.descriptor.acquisition.raw_capture_level.value}",
                 stream_id,
             )
             ok = False
         for artifact in artifacts:
             committed_paths.add(artifact.path)
+            owner = seen_artifact_paths.setdefault(artifact.path, chunk_id)
+            if owner != chunk_id:
+                result.add(
+                    Finding.ARTIFACT_PATH_REUSED,
+                    f"{artifact.path} is claimed by chunks {owner} and {chunk_id}",
+                    stream_id,
+                )
+                ok = False
             try:
                 target = resolve_within(stream_dir, artifact.path)
             except UnsafePathError as exc:
                 result.add(Finding.UNSAFE_PATH, str(exc), f"{stream_id}/{artifact.path}")
                 ok = False
-                intact.discard(commit.chunk_id)
+                intact.discard(chunk_id)
                 continue
             if not target.is_file():
                 result.add(Finding.CHUNK_ARTIFACT_MISSING, artifact.path, stream_id)
                 ok = False
-                intact.discard(commit.chunk_id)
+                intact.discard(chunk_id)
             elif sha256_file(target) != artifact.sha256:
                 result.add(Finding.CHUNK_ARTIFACT_HASH_MISMATCH, artifact.path, stream_id)
                 ok = False
-                intact.discard(commit.chunk_id)
+                intact.discard(chunk_id)
 
     # --- sidecars must agree with the authoritative chain -------------------
     # chunks.jsonl is the commit log; a sidecar is a convenience copy. If the
@@ -604,23 +670,28 @@ def _verify_stream(
     for error in state.sidecar_errors:
         result.add(Finding.SIDECAR_MISMATCH, error, stream_id)
         ok = False
-    for commit in state.commits:
-        sidecar = state.sidecars.get(commit.chunk_id)
+    for chunk in state.chunks:
+        chunk_id = chunk.record.chunk_id
+        sidecar = state.sidecars.get(chunk_id)
         if sidecar is None:
             result.add(
                 Finding.SIDECAR_MISMATCH,
-                f"chunk {commit.chunk_id} has no {commit.chunk_id:06d}.commit.json sidecar",
+                f"chunk {chunk_id} has no {chunk_id:06d}.commit.json sidecar",
                 stream_id,
             )
             ok = False
-        elif sidecar != commit:
+        elif not sidecar.same_record_as(chunk.record):
+            # Canonical on-disk records, not parsed models. Two different
+            # documents can normalize to the same ChunkCommit — an ignored
+            # unknown field, or an explicit null where the contract requires the
+            # key omitted — so model equality would call them identical.
             result.add(
                 Finding.SIDECAR_MISMATCH,
-                f"chunk {commit.chunk_id} sidecar contradicts chunks.jsonl",
+                f"chunk {chunk_id} sidecar is not the same on-disk record as chunks.jsonl",
                 stream_id,
             )
             ok = False
-    chain_ids = {commit.chunk_id for commit in state.commits}
+    chain_ids = {chunk.record.chunk_id for chunk in state.chunks}
     for chunk_id in sorted(set(state.sidecars) - chain_ids):
         result.add(
             Finding.ORPHAN_FILE,
@@ -641,7 +712,7 @@ def _verify_stream(
                 result.add(Finding.ORPHAN_FILE, "file has no commit record", f"{stream_id}/{rel}")
                 ok = False
 
-    readable = [commit for commit in state.commits if commit.chunk_id in intact]
+    readable = [c.record.model for c in state.chunks if c.record.chunk_id in intact]
     if not _verify_payload_refs(stream_dir, state.descriptor, readable, result, stream_id):
         ok = False
     return ok

@@ -9,6 +9,61 @@ Versioning policy is unresolved — see `docs/OPERATIONS.md`.
 
 ## [Unreleased]
 
+### Fixed — CL-002B-R1-C2: canonical record and physical packet reconciliation
+
+Previous Codex verdict: **`GO WITH REQUIRED CHANGES`**, three BLOCKING findings.
+
+- **B1** — sidecar reconciliation compared parsed `ChunkCommit` models rather
+  than the same on-disk record. `chunks.jsonl` omits `payloads` as §12.2
+  requires; a sidecar carrying `"payloads": null`, re-sealed with a refreshed
+  inventory and manifest, parsed to an equal model and passed.
+- **B2** — a forged `chunks.jsonl` plus matching sidecars could lie about
+  artifact metadata: `first_packet_seq` / `last_packet_seq` were only ever
+  compared manifest ↔ chain, never against the packets artifact, and two
+  commits could claim the same artifact paths.
+- **B3** — the finalizer preflight checked which chunk ids were present but
+  never whether the records matched what the writer committed, so a chain and
+  sidecars rewritten under the same ids could seal an immutable `COMPLETED`.
+
+**Shared root cause.** Interpreted representations were compared where the
+actual bytes and the actual data were required: parsed models stood in for
+on-disk record identity, and summaries were checked against other summaries.
+
+**Canonical full-record comparison.** `ChunkRecordOnDisk` retains the parsed
+model *and* the canonical bytes of the complete parsed document, canonicalized
+from the JSON — never from `model_dump()`, which would discard exactly the
+fields the model ignores. Sidecar ↔ chain identity now compares those bytes, so
+an ignored unknown field or an omitted-versus-null key is detected even when the
+models are equal.
+
+**Physical packet-derived range.** Each committed chunk's `packets` artifact is
+opened and its real `packet_seq` column read. Every chunk's claimed
+`first_packet_seq` / `last_packet_seq` is checked against those rows — for every
+chunk, not just the stream endpoints, so a forged middle chunk cannot hide.
+`ManifestStream` packet range now derives from the physical rows. Artifact paths
+must be each chunk's own canonical names and may not be reused across chunks.
+`packet_seq` must be strictly increasing within a chunk, which spec §9.1 already
+states; consecutiveness is deliberately **not** required, as a gap is a device
+fact for a later ticket.
+
+**Finalizer.** The preflight compares writer-memory committed records to the
+disk chain by canonical bytes, rejects disk chunk ids the writer never
+committed, and applies the same physical packet check before sealing
+`COMPLETED`.
+
+**One source of truth.** All of it lives in `storage/stream_state.py`; the
+verifier and the finalizer consume it and neither re-derives packet ranges.
+
+**Tests.** 15 in `tests/test_canonical_and_physical.py` — the exact B1/B2/B3
+reproductions plus C2-1 through C2-10, including a positive control that rewrites
+the packets artifact *and* every dependent summary and asserts the package still
+verifies. Every negative test recomputes record hashes, chain links, sidecars,
+manifest summaries, inventory and `manifest.sha256`, so none passes because a
+hash was left stale. 275 total.
+
+No scientific completeness rule was added: a zero-chunk stream remains valid and
+no minimum packet, chunk, sample or duration criterion exists.
+
 ### Fixed — CL-002B-R1: manifest / raw referential integrity
 
 **A BLOCKING false-complete.** `manifest.streams` was built entirely from the

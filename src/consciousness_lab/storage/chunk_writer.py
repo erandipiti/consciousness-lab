@@ -135,6 +135,10 @@ class ChunkWriter:
         self._next_chunk_id = 0
         self._prev_hash = canonical_json.ZERO_HASH
         self._committed: list[ChunkCommit] = []
+        #: Canonical bytes of each record as written, so the finalizer can
+        #: compare what the writer committed against what is on disk by RECORD
+        #: IDENTITY rather than by parsed-model equality.
+        self._committed_canonical: dict[int, bytes] = {}
 
     @property
     def committed(self) -> list[ChunkCommit]:
@@ -143,6 +147,11 @@ class ChunkWriter:
     @property
     def chain_head(self) -> str | None:
         return self._committed[-1].record_sha256 if self._committed else None
+
+    @property
+    def committed_canonical(self) -> dict[int, bytes]:
+        """Canonical bytes of every record this writer committed, by chunk id."""
+        return dict(self._committed_canonical)
 
     def commit(self, pending: PendingChunk, *, fault: FaultHook | None = None) -> ChunkCommit:
         """Seal one chunk. Raises without committing if anything goes wrong.
@@ -233,6 +242,7 @@ class ChunkWriter:
         self._next_chunk_id += 1
         committed = record.model_copy(update={"record_sha256": digest})
         self._committed.append(committed)
+        self._committed_canonical[chunk_id] = canonical_json.canonicalize(sealed)
         return committed
 
     @staticmethod

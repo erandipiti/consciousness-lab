@@ -129,15 +129,30 @@ def _assert_streams_on_disk(writer: SessionWriter, run: Run) -> None:
 
         # Every chunk the writer believes it committed must still be in the
         # index, and its artifacts must still exist.
-        expected = {commit.chunk_id: commit for commit in open_stream.writer.committed}
-        actual = {commit.chunk_id: commit for commit in state.commits}
-        # Most specific diagnosis first: a commit the writer made that the
-        # index no longer holds is a different fault from a stray sidecar.
+        # Compare by RECORD IDENTITY, not by parsed model. Rewriting the chain
+        # and its sidecars with the same chunk ids used to slip past a check
+        # that only looked at which ids were present (B3).
+        expected = open_stream.writer.committed_canonical
+        actual = {chunk.record.chunk_id: chunk for chunk in state.chunks}
+
         missing = sorted(set(expected) - set(actual))
         if missing:
             raise FinalizationError(
                 f"stream {stream_id}: committed chunk(s) {missing} are absent from chunks.jsonl"
             )
+        extra = sorted(set(actual) - set(expected))
+        if extra:
+            raise FinalizationError(
+                f"stream {stream_id}: chunks.jsonl holds chunk(s) {extra} this writer never "
+                "committed"
+            )
+        for chunk_id, canonical in expected.items():
+            if actual[chunk_id].record.canonical_bytes != canonical:
+                raise FinalizationError(
+                    f"stream {stream_id}: chunk {chunk_id} on disk is not the record this "
+                    "writer committed"
+                )
+
         if state.sidecar_errors:
             raise FinalizationError(
                 f"stream {stream_id}: unreadable or misnamed sidecar(s): "
@@ -148,12 +163,30 @@ def _assert_streams_on_disk(writer: SessionWriter, run: Run) -> None:
             raise FinalizationError(
                 f"stream {stream_id}: sidecar(s) {orphan_sidecars} have no commit record"
             )
-        for chunk_id, commit in actual.items():
+
+        for chunk_id, chunk in actual.items():
             sidecar = state.sidecars.get(chunk_id)
-            if sidecar is None or sidecar != commit:
+            if sidecar is None or not sidecar.same_record_as(chunk.record):
                 raise FinalizationError(
-                    f"stream {stream_id}: chunk {chunk_id} sidecar is missing or "
-                    "contradicts chunks.jsonl"
+                    f"stream {stream_id}: chunk {chunk_id} sidecar is missing or is not the "
+                    "same on-disk record as chunks.jsonl"
+                )
+            # The summary must match the physical packet rows, per chunk.
+            if chunk.packet_error is not None:
+                raise FinalizationError(
+                    f"stream {stream_id}: chunk {chunk_id} packets artifact is unusable: "
+                    f"{chunk.packet_error}"
+                )
+            commit = chunk.record.model
+            if (commit.first_packet_seq, commit.last_packet_seq) != (
+                chunk.physical_first_packet_seq,
+                chunk.physical_last_packet_seq,
+            ):
+                raise FinalizationError(
+                    f"stream {stream_id}: chunk {chunk_id} claims packets "
+                    f"({commit.first_packet_seq}, {commit.last_packet_seq}) but the artifact "
+                    f"holds ({chunk.physical_first_packet_seq}, "
+                    f"{chunk.physical_last_packet_seq})"
                 )
             artifacts = [commit.packets, commit.observations, commit.samples]
             if commit.payloads is not None:
