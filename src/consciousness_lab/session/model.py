@@ -1,0 +1,477 @@
+"""Typed models for Session Package v1 (spec §7, §8, §9, §13; D8-D26).
+
+These models are the on-disk contract. They encode structure and provenance
+only: nothing here interprets a physiological signal, and no scientific
+threshold appears in this file.
+"""
+
+from enum import StrEnum
+from typing import Annotated, Any, Literal
+
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+
+from consciousness_lab.storage.integer_types import Int64Decimal, UInt64Decimal
+
+SCHEMA_NAME = "session_package"
+SCHEMA_VERSION = "1.0"
+SCHEMA_MAJOR = 1
+
+PSEUDONYM_PATTERN = r"^P[0-9]{3,6}$"
+
+
+class Strict(BaseModel):
+    """Base model: unknown fields are rejected on the way in.
+
+    Minor-version tolerance (spec §17) is handled by the reader, which decides
+    what to do with unknown optional fields; the models themselves stay strict
+    so a typo never becomes a silently-ignored field.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+
+class LifecycleState(StrEnum):
+    ALLOCATED = "ALLOCATED"
+    RECORDING = "RECORDING"
+    FINALIZING = "FINALIZING"
+    CLOSED = "CLOSED"
+
+
+class ClosureCondition(StrEnum):
+    CLEAN = "CLEAN"
+    RECOVERED_UNCLEAN = "RECOVERED_UNCLEAN"
+
+
+class RecordingOutcome(StrEnum):
+    COMPLETED = "COMPLETED"
+    ABORTED = "ABORTED"
+    TECHNICAL_FAILURE = "TECHNICAL_FAILURE"
+    #: Not a fourth scientific outcome. It means no human has classified this
+    #: session yet, and it is what recovery writes rather than guessing between
+    #: an operator abort and a power failure.
+    UNCLASSIFIED = "UNCLASSIFIED"
+
+
+class RawCaptureLevel(StrEnum):
+    TRANSPORT_PAYLOAD = "transport_payload"
+    LIBRARY_DECODED = "library_decoded"
+    SYNTHETIC = "synthetic"
+
+
+class SampleLayout(StrEnum):
+    DENSE_FIXED_LIST = "dense_fixed_list"
+    SPARSE_LONG = "sparse_long"
+
+
+class StreamCloseStatus(StrEnum):
+    CLEAN = "CLEAN"
+    DISCONNECTED = "DISCONNECTED"
+    RECONFIGURED = "RECONFIGURED"
+    FAILED = "FAILED"
+
+
+class ObservationKind(StrEnum):
+    TIME = "time"
+    COUNTER = "counter"
+
+
+class AppliesTo(StrEnum):
+    SAMPLE_ACQUISITION = "sample_acquisition"
+    PACKET_ASSEMBLY = "packet_assembly"
+    TRANSMISSION = "transmission"
+    HOST_RECEIPT = "host_receipt"
+    UNKNOWN = "unknown"
+
+
+class ObservationProvenance(StrEnum):
+    DEVICE_PROVIDED = "device_provided"
+    LIBRARY_PROVIDED = "library_provided"
+
+
+class ClaimStatus(StrEnum):
+    VERIFIED = "verified"
+    ASSUMED = "assumed"
+    UNKNOWN = "unknown"
+
+
+class HardwareClaim(Strict):
+    """A hardware-dependent claim with its provenance (spec §8, D14).
+
+    Every fact about a physical device is one of these. Today every ``status``
+    in this repository reads ``assumed``: no device has been connected.
+    """
+
+    value: Any = None
+    status: ClaimStatus = ClaimStatus.ASSUMED
+    source: str | None = None
+    observed_at: str | None = None
+
+
+class ClockReading(Strict):
+    """A paired monotonic/UTC reading, each naming the clock that produced it."""
+
+    utc_ns: Int64Decimal
+    monotonic_ns: Int64Decimal
+    utc_clock_id: str = "CLOCK_REALTIME"
+    monotonic_clock_id: str = "CLOCK_MONOTONIC"
+    utc_quality: str = "unknown"
+
+
+class Origin(Strict):
+    """How this package came to exist (spec §16).
+
+    ``replay`` and ``synthetic`` packages must say so, so that neither can ever
+    be mistaken for a live recording downstream.
+    """
+
+    kind: Literal["recording", "replay", "synthetic"] = "recording"
+    source_session_id: str | None = None
+    source_manifest_sha256: str | None = None
+    replay_tool_version: str | None = None
+    generator_seed: UInt64Decimal | None = None
+
+
+class Protocol(Strict):
+    """Protocol identity. ``UNSPECIFIED`` is honest: no Phase 0 protocol exists."""
+
+    id: str = "UNSPECIFIED"
+    version: str = "UNSPECIFIED"
+    sha256: str | None = None
+
+
+class HostInfo(Strict):
+    hostname_alias: str
+    os: str
+    arch: str
+
+
+class SoftwareInfo(Strict):
+    repo_commit: str | None = None
+    dirty: bool = False
+
+
+class EnvironmentInfo(Strict):
+    python_version: str
+    uv_lock_sha256: str | None = None
+
+
+class Allocation(Strict):
+    """``allocation.json`` — immutable after allocation (spec §7.1)."""
+
+    schema_name: Literal["session_package"] = "session_package"
+    schema_version: str = SCHEMA_VERSION
+    session_id: str
+    allocated_at: ClockReading
+    origin: Origin = Field(default_factory=Origin)
+    protocol: Protocol = Field(default_factory=Protocol)
+    participant_pseudonym: Annotated[str, Field(pattern=PSEUDONYM_PATTERN)]
+    host: HostInfo
+    software: SoftwareInfo
+    environment: EnvironmentInfo
+
+
+class WriterConfig(Strict):
+    """Writer configuration only. Not analysis epoching, not a scientific parameter.
+
+    These stay JSON Numbers: their declared domain is a bounded int32 (§12.2.1).
+    """
+
+    chunk_max_seconds: int = 30
+    chunk_max_rows: int = 100_000
+    clock_snapshot_interval_seconds: int = 60
+    note: str = "Writer configuration only. NOT analysis epoching and NOT a scientific parameter."
+
+
+class DeviceRecord(Strict):
+    """A device present in a run, identified by a study-local alias (D26).
+
+    Raw serial numbers are never written into a session package.
+    """
+
+    device_alias: str
+    device_kind: str
+    firmware: HardwareClaim = Field(default_factory=HardwareClaim)
+    library: HardwareClaim = Field(default_factory=HardwareClaim)
+
+
+class Run(Strict):
+    """``run.json`` — sealed at RECORDING_START (spec §7.2).
+
+    ``required_streams`` is configuration, deliberately not a global constant:
+    which real streams a protocol requires is a future protocol decision, and
+    the finalizer evaluates whatever set the run declares.
+    """
+
+    sealed_at: ClockReading
+    required_streams: list[str] = Field(default_factory=list)
+    optional_streams: list[str] = Field(default_factory=list)
+    devices: list[DeviceRecord] = Field(default_factory=list)
+    writer_config: WriterConfig = Field(default_factory=WriterConfig)
+
+    @model_validator(mode="after")
+    def _disjoint(self) -> "Run":
+        overlap = set(self.required_streams) & set(self.optional_streams)
+        if overlap:
+            raise ValueError(f"streams declared both required and optional: {sorted(overlap)}")
+        return self
+
+
+class Channel(Strict):
+    """One channel. Identity lives here, never in a column name (spec §8)."""
+
+    index: int
+    channel_id: str
+    unit: str | None = None
+    dtype: str = "float32"
+    physical_meaning: str | None = None
+    status: ClaimStatus | None = None
+
+
+class TimingCapabilities(Strict):
+    """What a device is believed to provide. Every field is an unverified claim."""
+
+    provides_device_time: HardwareClaim = Field(default_factory=HardwareClaim)
+    provides_packet_counter: HardwareClaim = Field(default_factory=HardwareClaim)
+    provides_sample_counter: HardwareClaim = Field(default_factory=HardwareClaim)
+    packet_counter_width_bits: HardwareClaim = Field(default_factory=HardwareClaim)
+    samples_per_packet: HardwareClaim = Field(default_factory=HardwareClaim)
+
+
+class AcquisitionBackend(Strict):
+    name: str
+    version: str | None = None
+    adapter_version: str | None = None
+
+
+class Acquisition(Strict):
+    """Acquisition provenance, and the v1 capture invariant (spec §9.0.1, §9.1; D13).
+
+    For schema v1:
+
+        transport_payload  <=>  transport_payload_preserved is True
+        library_decoded     =>  transport_payload_preserved is False
+        synthetic           =>  transport_payload_preserved is False
+
+    The two fields are locked together so that no reader has to choose which
+    one determines whether a payload artifact must exist.
+    """
+
+    backend: AcquisitionBackend
+    raw_capture_level: RawCaptureLevel
+    transport_payload_preserved: bool
+    decode_boundary: str | None = None
+    provenance: HardwareClaim = Field(default_factory=HardwareClaim)
+
+    @model_validator(mode="after")
+    def _capture_invariant(self) -> "Acquisition":
+        expected = self.raw_capture_level is RawCaptureLevel.TRANSPORT_PAYLOAD
+        if self.transport_payload_preserved is not expected:
+            raise ValueError(
+                f"raw_capture_level={self.raw_capture_level.value} requires "
+                f"transport_payload_preserved={expected}, got "
+                f"{self.transport_payload_preserved} (spec 9.1, DECISIONS D13)"
+            )
+        return self
+
+
+class StreamDescriptor(Strict):
+    """``raw/<stream_id>/descriptor.json`` — sealed at stream open (spec §8)."""
+
+    stream_id: str
+    descriptor_version: int = 1
+    device_alias: str
+    device_kind: str
+    modality: str
+    layout: SampleLayout
+    channels: list[Channel]
+    acquisition: Acquisition
+    nominal_sample_rate_hz: HardwareClaim = Field(default_factory=HardwareClaim)
+    actual_sample_rate_hz: None = None
+    device_preset: HardwareClaim = Field(default_factory=HardwareClaim)
+    timing_capabilities: TimingCapabilities = Field(default_factory=TimingCapabilities)
+    channel_layout_provenance: HardwareClaim = Field(default_factory=HardwareClaim)
+    hardware_verification: HardwareClaim = Field(default_factory=HardwareClaim)
+    extensions: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _channels_ordered(self) -> "StreamDescriptor":
+        if not self.channels:
+            raise ValueError("a stream descriptor must declare at least one channel")
+        expected = list(range(len(self.channels)))
+        if [c.index for c in self.channels] != expected:
+            raise ValueError("channel indices must be 0..n-1 in order")
+        ids = [c.channel_id for c in self.channels]
+        if len(set(ids)) != len(ids):
+            raise ValueError("channel ids must be unique within a stream")
+        return self
+
+    @property
+    def n_channels(self) -> int:
+        return len(self.channels)
+
+    @property
+    def expects_payload_artifact(self) -> bool:
+        """Whether committed chunks for this stream must carry a payload file."""
+        return self.acquisition.raw_capture_level is RawCaptureLevel.TRANSPORT_PAYLOAD
+
+
+class FileEntry(Strict):
+    """One file, its size and its hash. Sizes are uint64 (spec §12.2.1)."""
+
+    path: str
+    bytes: UInt64Decimal
+    sha256: str
+
+
+class ChunkArtifact(Strict):
+    path: str
+    sha256: str
+    bytes: UInt64Decimal
+
+
+class ChunkCommit(Strict):
+    """One chunk commit record (spec §12.2).
+
+    A chunk is real iff its record appears in ``chunks.jsonl``. The record names
+    every artifact the chunk produced: four at ``transport_payload``, three at
+    the other capture levels, where ``payloads`` is omitted entirely rather than
+    written as null or an empty path.
+    """
+
+    chunk_id: UInt64Decimal
+    prev_record_sha256: str
+    payloads: ChunkArtifact | None = None
+    packets: ChunkArtifact
+    observations: ChunkArtifact
+    samples: ChunkArtifact
+    first_packet_seq: Int64Decimal
+    last_packet_seq: Int64Decimal
+    descriptor_sha256: str
+    record_sha256: str | None = None
+
+    @model_validator(mode="after")
+    def _ordered(self) -> "ChunkCommit":
+        if self.last_packet_seq < self.first_packet_seq:
+            raise ValueError("last_packet_seq precedes first_packet_seq")
+        return self
+
+
+class LifecycleRecord(Strict):
+    """One appended lifecycle transition (spec §5)."""
+
+    seq: UInt64Decimal
+    state: LifecycleState
+    closure_condition: ClosureCondition | None = None
+    recording_outcome: RecordingOutcome | None = None
+    outcome_reason: str | None = None
+    actor: str = "system"
+    utc_ns: Int64Decimal
+    monotonic_ns: Int64Decimal
+    record_sha256: str | None = None
+
+
+class AnnotationRecord(Strict):
+    """One post-seal downgrade annotation (spec §5.1, D18, D19).
+
+    Carries both ``from`` and ``to``: ``from`` must equal the effective outcome
+    in force at that point in the file, or two conforming implementations could
+    disagree about a log holding more than one downgrade.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True, populate_by_name=True)
+
+    seq: UInt64Decimal
+    from_outcome: RecordingOutcome = Field(alias="from")
+    to_outcome: RecordingOutcome = Field(alias="to")
+    actor: str
+    reason: str
+    utc_ns: Int64Decimal
+    prev_record_sha256: str
+    record_sha256: str | None = None
+
+
+class AnnotationHead(Strict):
+    """``annotations.head.json`` — the anti-deletion pointer (spec §5.1).
+
+    A hash chain proves the records present are intact; it cannot prove that
+    none was removed. This records the expected length and head of the chain
+    outside the chain itself, so a deleted or boundary-truncated log is
+    detectable instead of silently restoring a sealed ``COMPLETED``.
+    """
+
+    bytes: UInt64Decimal
+    record_count: UInt64Decimal
+    head_record_sha256: str | None = None
+
+
+class EventRecord(Strict):
+    """One entry in the shared ``events/events.jsonl`` (spec §11)."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    event_seq: UInt64Decimal
+    event_name: str
+    payload_schema: str
+    origin: Literal["system", "protocol", "operator", "device_link"]
+    host_arrival_monotonic_ns: Int64Decimal
+    host_arrival_utc_ns: Int64Decimal
+    host_arrival_monotonic_clock_id: str = "CLOCK_MONOTONIC"
+    host_arrival_utc_clock_id: str = "CLOCK_REALTIME"
+    raw_ref: dict[str, Any] | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    record_sha256: str | None = None
+
+
+class SealPointer(Strict):
+    """A hashed prefix of an append-only file."""
+
+    path: str
+    sealed_len: UInt64Decimal
+    sealed_sha256: str
+
+
+class FileSeal(Strict):
+    path: str
+    bytes: UInt64Decimal
+    sha256: str
+
+
+class ManifestStream(Strict):
+    stream_id: str
+    required: bool
+    close_status: StreamCloseStatus
+    descriptor_sha256: str
+    chunk_count: UInt64Decimal
+    chunk_chain_head_sha256: str | None = None
+    first_packet_seq: Int64Decimal | None = None
+    last_packet_seq: Int64Decimal | None = None
+
+
+class SchemaSnapshot(Strict):
+    schema_id: str
+    path: str
+    sha256: str
+
+
+class Manifest(Strict):
+    """``manifest.json`` — written once at finalization (spec §13, D21).
+
+    The manifest owns bytes, not meaning. It carries **no outcome field**: the
+    outcome belongs to the lifecycle log plus annotations, resolved per §5.1.
+    A valid manifest pair is a FINALIZATION marker, never a completion marker —
+    a cleanly aborted session produces an identical, fully valid pair.
+    """
+
+    schema_name: Literal["session_package"] = "session_package"
+    schema_version: str = SCHEMA_VERSION
+    session_id: str
+    sealed_at: ClockReading
+    lifecycle_seal: SealPointer
+    events_seal: FileSeal
+    streams: list[ManifestStream] = Field(default_factory=list)
+    inventory: list[FileEntry] = Field(default_factory=list)
+    schemas: list[SchemaSnapshot] = Field(default_factory=list)
+    scope_note: str = (
+        "logs/, annotations.jsonl, annotations.head.json and data/derived/ are "
+        "OUTSIDE this manifest by design."
+    )
