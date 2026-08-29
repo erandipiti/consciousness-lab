@@ -172,7 +172,131 @@ exists and is empty, `chunk_count` is 0, and `chunk_chain_head_sha256`,
 scientifically usable is a future protocol decision and is deliberately not
 decided here.
 
-## 8. Deliberately NOT enforced
+## 8. Leaf-level decomposition (CL-002B-R1-C4)
+
+C3 decomposed *records* into fields but treated three things as atomic that are
+themselves multi-field representations: a **byte-framed artifact**, a **row
+set**, and a **list**. That was one level too shallow, and produced F1, F2 and
+F3. Every compound representation is decomposed here until the remaining leaves
+are physical bytes, scalars, set/list membership, ordering, cardinality or a
+foreign key.
+
+### 8.1 Artifact references — three leaves, not one
+
+`ChunkArtifact` carries `path`, `sha256` **and** `bytes`. All three are
+independently falsifiable and all three are checked:
+
+| Leaf | Authority |
+|---|---|
+| `path` | the canonical name for this `chunk_id` |
+| `sha256` | SHA-256 of the physical file bytes |
+| `bytes` | the physical file's `stat().st_size` |
+
+A matching SHA does **not** validate the record: `bytes` is a separate claim
+about the same file, and it was previously unchecked (F3a). This applies to
+`packets`, `observations`, `samples`, `payloads` and every `manifest.inventory`
+entry.
+
+### 8.2 Payload frame — F is not opaque bytes
+
+Each framed record decomposes into `magic`, `packet_seq`, `payload_len`,
+payload bytes, `crc32c`, frame offset and total extent.
+
+| Leaf | Authority | Relation |
+|---|---|---|
+| `magic` | physical bytes | present at `payload_ref.offset` |
+| `packet_seq` | physical frame bytes | **equals the referencing packet row's `packet_seq`** |
+| `payload_len` | physical frame bytes | equals `payload_ref.length` |
+| `crc32c` | physical frame bytes | matches the payload |
+| frame ↔ packet row | both | **bijection** |
+
+**A valid CRC proves the frame is internally intact. It does not prove the frame
+belongs to the packet that references it** — that was F1. §9.1 defines the log
+as records "each tagged with its `packet_seq`", one per received packet, so no
+frame may be shared between packet rows and none may be unreferenced.
+
+### 8.3 Samples — a row SET with layout-specific identity
+
+**`dense_fixed_list`.** For a packet declaring `n_samples = N`, the sample keys
+must be exactly `(packet_seq, 0) … (packet_seq, N-1)`, **each exactly once**.
+Comparison is by **multiset**, not set: a duplicated key would otherwise mask a
+missing one, which is precisely how a deleted sample survived (F2b). This
+detects missing rows, duplicate keys, extra rows, out-of-range indices and rows
+referencing an absent packet in one relation. `n_samples = 0` expects an empty
+key set. Storage integrity, **not** a minimum-sample threshold.
+
+**`sparse_long`.** Cardinality and uniqueness are **NOT enforced**. See §10.
+
+### 8.4 Observations — references only
+
+Observations are not a complete set by contract, and the schema names no
+observation primary key, so **no cardinality and no uniqueness rule is
+invented**. Only the structural references are checked: `packet_seq` must
+reference a packet in the same chunk, and a non-null `sample_index_in_packet`
+must be in range. A regression test pins that removing an observation row is
+still valid.
+
+### 8.5 Inventory — a bijection, not a set
+
+`manifest.inventory` is a list representing a bijection over in-scope immutable
+files. Duplicate paths are rejected **before** any set comparison; collapsing it
+with `{e.path for e in inventory}` is what let a duplicate entry disappear
+(F3b).
+
+## 9. Collection semantics
+
+Multiplicity and order are part of the type. Using a set where a bijection or a
+sequence is meant is a defect, not a shortcut.
+
+| Collection | Semantics |
+|---|---|
+| `chunks.jsonl` | append-only ordered chain, `chunk_id` strictly increasing |
+| sidecars | mapping `chunk_id` → canonical copy, bijection with the chain |
+| packets rows | ordered sequence, `packet_seq` strictly increasing |
+| samples rows (dense) | **multiset** of keys, identical to the expected key set |
+| samples rows (sparse) | unresolved — see §10 |
+| observations rows | collection with structural references, no cardinality rule |
+| payload frames | bijection with packet rows |
+| `Manifest.streams` | keyed collection, `stream_id` unique |
+| `Manifest.inventory` | **bijection** by path |
+| `Run.required_streams` / `optional_streams` | sets, disjoint |
+
+## 10. SPECIFICATION BLOCKER — `sparse_long` sample identity
+
+§9.1 states `(packet_seq, sample_index_in_packet)` is "the sample primary key",
+immediately after defining `sparse_long` rows as
+`packet_seq, sample_index_in_packet, channel_id, value`.
+
+Those two statements are **inconsistent for the sparse layout**: if that pair
+were the primary key, a sparse stream could hold only one row per sample
+position, which contradicts carrying a `channel_id` column at all. The key
+presumably includes `channel_id`, but the specification does not say so.
+
+**Consequently no cardinality or uniqueness rule is enforced for
+`sparse_long`,** and none is invented. What *is* enforced for sparse streams is
+only what is unambiguous: `packet_seq` references a packet in the same chunk,
+and a non-null `sample_index_in_packet` is within `n_samples`.
+
+Resolving this needs a human decision on the sparse-long identity contract. It
+does not affect dense streams, and no Study 001 stream is sparse today.
+
+## 11. Threat-model boundary
+
+This verifier establishes **internal structural integrity, referential integrity
+and cross-representation consistency**.
+
+It does **not** establish cryptographic authenticity. Without signatures,
+append-only media, an external transparency log or WORM storage, an actor who
+coherently rewrites *every* raw artifact and *all* metadata into a fully
+self-consistent alternative package cannot be distinguished from the original.
+That is not a Session Package v1 defect and is out of scope here.
+
+The standard this document holds itself to is narrower and testable:
+
+> If one or more representations contradict their physical or canonical
+> authority, recomputing ordinary hashes must not hide the contradiction.
+
+## 12. Deliberately NOT enforced
 
 - **`packet_seq` contiguity.** §9.1 requires strictly increasing, not
   consecutive. A gap is a device fact for a later ticket; requiring

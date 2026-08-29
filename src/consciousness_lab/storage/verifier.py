@@ -106,6 +106,8 @@ class Finding(StrEnum):
     CHAIN_ORDER_INVALID = "chain_order_invalid"
     PAYLOAD_KEY_PRESENCE_INVALID = "payload_key_presence_invalid"
     ROW_REFERENCE_INVALID = "row_reference_invalid"
+    DUPLICATE_INVENTORY_PATH = "duplicate_inventory_path"
+    INVENTORY_BYTES_MISMATCH = "inventory_bytes_mismatch"
     UNEXPECTED_FILE = "unexpected_file"
     SYMLINK_IN_PACKAGE = "symlink_in_package"
     UNSAFE_PATH = "unsafe_path"
@@ -248,6 +250,18 @@ def verify_package(paths: PackagePaths) -> VerificationResult:
         inventory_ok = False
 
     if manifest is not None:
+        # The inventory is a BIJECTION over in-scope files, not a set. Collapsing
+        # it with `{e.path for e in ...}` would let a duplicate entry disappear.
+        inventory_paths = [entry.path for entry in manifest.inventory]
+        duplicates = sorted({p for p in inventory_paths if inventory_paths.count(p) > 1})
+        for duplicate in duplicates:
+            result.add(
+                Finding.DUPLICATE_INVENTORY_PATH,
+                "path appears more than once in the manifest inventory",
+                duplicate,
+            )
+            inventory_ok = False
+
         for entry in manifest.inventory:
             try:
                 target = resolve_within(paths.root, entry.path)
@@ -262,8 +276,17 @@ def verify_package(paths: PackagePaths) -> VerificationResult:
             if sha256_file(target) != entry.sha256:
                 result.add(Finding.INVENTORY_HASH_MISMATCH, "inventory hash mismatch", entry.path)
                 inventory_ok = False
+            # bytes is an independent leaf; a matching SHA does not validate it.
+            actual_bytes = target.stat().st_size
+            if entry.bytes != actual_bytes:
+                result.add(
+                    Finding.INVENTORY_BYTES_MISMATCH,
+                    f"inventory declares {entry.bytes} bytes, file holds {actual_bytes}",
+                    entry.path,
+                )
+                inventory_ok = False
 
-        listed = {entry.path for entry in manifest.inventory}
+        listed = set(inventory_paths)
         for path in sorted(paths.root.rglob("*")):
             if not path.is_file() or path.is_symlink():
                 continue

@@ -168,8 +168,11 @@ def _assert_streams_on_disk(writer: SessionWriter, run: Run) -> None:
                     "violates the capture-level contract"
                 )
             if chunk.reference_errors:
+                # Same shared physical state the verifier uses: artifact byte
+                # lengths, payload frame identity, dense sample key identity and
+                # structural references all surface here.
                 raise FinalizationError(
-                    f"stream {stream_id}: chunk {chunk.chunk_id} row references are "
+                    f"stream {stream_id}: chunk {chunk.chunk_id} leaf integrity is "
                     f"invalid: {list(chunk.reference_errors)}"
                 )
         if state.sidecar_errors:

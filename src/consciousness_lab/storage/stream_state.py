@@ -13,13 +13,21 @@ descriptor hash from here, so there is exactly one definition of each.
 """
 
 import itertools
+from collections import Counter
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 import pyarrow as pa
 
-from consciousness_lab.session.model import ChunkCommit, StreamDescriptor, load_on_disk
+from consciousness_lab.session.model import (
+    ChunkCommit,
+    SampleLayout,
+    StreamDescriptor,
+    load_on_disk,
+)
 from consciousness_lab.storage import canonical_json
+from consciousness_lab.storage import payload as payload_mod
 from consciousness_lab.storage.checksums import sha256_bytes
 from consciousness_lab.storage.paths import PackagePaths
 
@@ -259,53 +267,216 @@ def _read_packet_facts(path: Path) -> tuple[dict[int, int] | None, str | None]:
     return {int(r["packet_seq"]): int(r["n_samples"]) for r in rows}, None
 
 
-def _check_references(
-    stream_root: Path, record: ChunkRecordOnDisk, packet_counts: dict[int, int]
-) -> tuple[str, ...]:
-    """Structural foreign keys from samples/observations to this chunk's packets.
+def _check_artifact_leaves(stream_root: Path, record: ChunkRecordOnDisk) -> tuple[str, ...]:
+    """Every artifact reference has three leaves: path, sha256 and bytes.
 
-    Matrix rows R20-R23. These follow from §9.1's own statements — that
-    ``(packet_seq, sample_index_in_packet)`` is the sample primary key and that
-    ``n_samples`` is "samples carried in this packet" — and are structural, not
-    scientific: no minimum count is implied or enforced.
+    A matching SHA does not validate the record — ``bytes`` is an independently
+    falsifiable leaf, and the authority for it is the physical file's size, not
+    the number the record happens to carry.
     """
     errors: list[str] = []
     commit = record.model
-    for label, artifact, index_required in (
-        ("samples", commit.samples, True),
-        ("observations", commit.observations, False),
-    ):
+    artifacts = [
+        ("packets", commit.packets),
+        ("observations", commit.observations),
+        ("samples", commit.samples),
+    ]
+    if commit.payloads is not None:
+        artifacts.append(("payloads", commit.payloads))
+    for label, artifact in artifacts:
         target = stream_root / artifact.path
         if not target.is_file():
-            continue
-        try:
-            with target.open("rb") as handle:
-                table = pa.ipc.open_stream(handle).read_all()
-            rows = table.select(["packet_seq", "sample_index_in_packet"]).to_pylist()
-        except (pa.ArrowException, OSError, KeyError, TypeError, ValueError) as exc:
-            errors.append(f"{label} artifact unreadable ({exc})")
-            continue
-        for position, row in enumerate(rows):
-            seq = int(row["packet_seq"])
-            if seq not in packet_counts:
-                errors.append(
-                    f"{label} row {position} references packet_seq {seq}, "
-                    "absent from this chunk's packets"
-                )
-                break
-            index = row["sample_index_in_packet"]
-            if index is None:
-                if index_required:
-                    errors.append(f"{label} row {position} has a null sample index")
-                    break
-                continue
-            if not 0 <= int(index) < packet_counts[seq]:
-                errors.append(
-                    f"{label} row {position} sample index {index} is outside "
-                    f"n_samples={packet_counts[seq]} for packet {seq}"
-                )
-                break
+            continue  # reported separately as a missing artifact
+        actual = target.stat().st_size
+        if artifact.bytes != actual:
+            errors.append(f"{label} artifact declares {artifact.bytes} bytes, file holds {actual}")
     return tuple(errors)
+
+
+def _check_payload_frames(
+    stream_root: Path, record: ChunkRecordOnDisk, packets: list[dict[str, Any]]
+) -> tuple[str, ...]:
+    """Reconcile the byte-framed payload log against the packet rows.
+
+    A valid CRC proves a frame is internally intact. It does NOT prove the frame
+    belongs to the packet that references it — the frame carries its own
+    ``packet_seq``, and that leaf must agree. §9.1 defines the log as records
+    "each tagged with its ``packet_seq``", one per received packet, so the
+    relation is a bijection.
+    """
+    commit = record.model
+    if commit.payloads is None:
+        return ()
+    blob_path = stream_root / commit.payloads.path
+    if not blob_path.is_file():
+        return ()
+    frames, walk_error = payload_mod.iter_frames(blob_path.read_bytes())
+    errors: list[str] = []
+    if walk_error is not None:
+        errors.append(f"payload log: {walk_error}")
+    by_offset = {frame.offset: frame for frame in frames}
+
+    referenced: list[int] = []
+    for row in packets:
+        ref = row.get("payload_ref")
+        seq = int(row["packet_seq"])
+        if not isinstance(ref, dict):
+            continue
+        offset = int(ref["offset"])
+        frame = by_offset.get(offset)
+        if frame is None:
+            errors.append(f"packet {seq}: payload_ref offset {offset} is not a frame boundary")
+            continue
+        referenced.append(offset)
+        if frame.packet_seq != seq:
+            errors.append(
+                f"packet {seq}: payload frame at offset {offset} is tagged "
+                f"packet_seq {frame.packet_seq}"
+            )
+        if frame.payload_len != int(ref["length"]):
+            errors.append(
+                f"packet {seq}: payload_ref length {ref['length']} disagrees with "
+                f"framed length {frame.payload_len}"
+            )
+        if ref["file"] != commit.payloads.path:
+            errors.append(
+                f"packet {seq}: payload_ref.file {ref['file']!r} is not {commit.payloads.path!r}"
+            )
+
+    # One frame per received packet (§9.1): no frame unreferenced, none shared.
+    if len(referenced) != len(set(referenced)):
+        errors.append("two packet rows reference the same payload frame")
+    unreferenced = sorted(set(by_offset) - set(referenced))
+    if unreferenced:
+        errors.append(f"payload log holds {len(unreferenced)} frame(s) no packet references")
+    return tuple(errors)
+
+
+def _check_references(
+    stream_root: Path,
+    record: ChunkRecordOnDisk,
+    packet_counts: dict[int, int],
+    descriptor: StreamDescriptor | None,
+) -> tuple[str, ...]:
+    """Structural relations from samples/observations to this chunk's packets.
+
+    Matrix rows R20-R23 and the dense sample-key identity rule. These follow
+    from §9.1's own statements - that ``(packet_seq, sample_index_in_packet)``
+    is the sample primary key and that ``n_samples`` is "samples carried in this
+    packet" - and are structural, not scientific. No minimum count is implied.
+    """
+    errors: list[str] = []
+    commit = record.model
+
+    samples_path = stream_root / commit.samples.path
+    layout = descriptor.layout if descriptor is not None else None
+    if samples_path.is_file():
+        rows, error = _read_rows(samples_path, ["packet_seq", "sample_index_in_packet"])
+        if error is not None:
+            errors.append(f"samples artifact unreadable ({error})")
+        elif layout is SampleLayout.DENSE_FIXED_LIST:
+            errors.extend(_check_dense_sample_keys(rows, packet_counts))
+        else:
+            # sparse_long: cardinality is NOT enforced. See CHUNK_EQUIVALENCE.md
+            # - the spec names one sample primary key while the sparse layout
+            # adds channel_id, so its identity contract is unresolved and must
+            # not be invented here. Only the structural references are checked.
+            errors.extend(_check_row_references(rows, packet_counts, "samples", strict=False))
+
+    observations_path = stream_root / commit.observations.path
+    if observations_path.is_file():
+        rows, error = _read_rows(observations_path, ["packet_seq", "sample_index_in_packet"])
+        if error is not None:
+            errors.append(f"observations artifact unreadable ({error})")
+        else:
+            # Observations are not a complete set by contract, so no cardinality
+            # rule and no uniqueness rule is invented for them.
+            errors.extend(_check_row_references(rows, packet_counts, "observations", strict=False))
+    return tuple(errors)
+
+
+def _read_rows(path: Path, columns: list[str]) -> tuple[list[dict[str, Any]], str | None]:
+    try:
+        with path.open("rb") as handle:
+            table = pa.ipc.open_stream(handle).read_all()
+        return list(table.select(columns).to_pylist()), None
+    except (pa.ArrowException, OSError, KeyError, TypeError, ValueError) as exc:
+        return [], str(exc)
+
+
+def _check_row_references(
+    rows: list[dict[str, Any]],
+    packet_counts: dict[int, int],
+    label: str,
+    *,
+    strict: bool,
+) -> list[str]:
+    """Foreign key to a packet in the same chunk, and index within n_samples."""
+    errors: list[str] = []
+    for position, row in enumerate(rows):
+        seq = int(row["packet_seq"])
+        if seq not in packet_counts:
+            errors.append(
+                f"{label} row {position} references packet_seq {seq}, "
+                "absent from this chunk's packets"
+            )
+            break
+        index = row["sample_index_in_packet"]
+        if index is None:
+            if strict:
+                errors.append(f"{label} row {position} has a null sample index")
+                break
+            continue
+        if not 0 <= int(index) < packet_counts[seq]:
+            errors.append(
+                f"{label} row {position} sample index {index} is outside "
+                f"n_samples={packet_counts[seq]} for packet {seq}"
+            )
+            break
+    return errors
+
+
+def _check_dense_sample_keys(
+    rows: list[dict[str, Any]], packet_counts: dict[int, int]
+) -> list[str]:
+    """Exact key-set identity for a dense stream.
+
+    For a packet declaring ``n_samples = N`` the sample keys must be exactly
+    ``(packet_seq, 0) .. (packet_seq, N-1)``, each once. A multiset comparison
+    is used deliberately: comparing sets alone would let a duplicated key hide a
+    missing one, which is exactly how a deleted sample survived before.
+
+    ``n_samples = 0`` expects an empty key set. This is storage integrity, not a
+    minimum-sample threshold.
+    """
+    expected: Counter[tuple[int, int]] = Counter(
+        (seq, index) for seq, count in packet_counts.items() for index in range(count)
+    )
+    actual: Counter[tuple[int, int]] = Counter()
+    for row in rows:
+        index = row["sample_index_in_packet"]
+        if index is None:
+            return ["samples row has a null sample index in a dense stream"]
+        actual[(int(row["packet_seq"]), int(index))] += 1
+
+    if actual == expected:
+        return []
+
+    errors: list[str] = []
+    if sum(actual.values()) != sum(expected.values()):
+        errors.append(
+            f"samples hold {sum(actual.values())} rows, packets declare {sum(expected.values())}"
+        )
+    duplicates = sorted(key for key, count in actual.items() if count > 1)
+    if duplicates:
+        errors.append(f"duplicate sample key(s) {duplicates[:3]}")
+    missing = sorted((expected - actual).elements())
+    if missing:
+        errors.append(f"missing sample key(s) {missing[:3]}")
+    extra = sorted((actual - expected).elements())
+    if extra:
+        errors.append(f"unexpected sample key(s) {extra[:3]}")
+    return errors
 
 
 def read_packet_range(path: Path) -> tuple[int | None, int | None, int, str | None]:
@@ -344,17 +515,31 @@ def read_packet_range(path: Path) -> tuple[int | None, int | None, int, str | No
     return sequences[0], sequences[-1], len(sequences), None
 
 
-def _reconcile_chunk(stream_root: Path, record: ChunkRecordOnDisk) -> PhysicalChunk:
-    """Reconcile a commit record against every physical artifact it names."""
+def _reconcile_chunk(
+    stream_root: Path, record: ChunkRecordOnDisk, descriptor: StreamDescriptor | None
+) -> PhysicalChunk:
+    """Reconcile a commit record against every physical leaf it names."""
+    # Artifact byte lengths are an independent leaf: a matching SHA does not
+    # validate the record's own size claim.
+    leaf_errors = list(_check_artifact_leaves(stream_root, record))
+
     packets_path = stream_root / record.model.packets.path
     if not packets_path.is_file():
-        return PhysicalChunk(record, None, None, 0, "packets artifact is absent", {}, ())
+        return PhysicalChunk(
+            record, None, None, 0, "packets artifact is absent", {}, tuple(leaf_errors)
+        )
     first, last, rows, error = read_packet_range(packets_path)
     counts, counts_error = _read_packet_facts(packets_path)
     if counts is None:
-        return PhysicalChunk(record, first, last, rows, error or counts_error, {}, ())
-    references = _check_references(stream_root, record, counts)
-    return PhysicalChunk(record, first, last, rows, error, counts, references)
+        return PhysicalChunk(
+            record, first, last, rows, error or counts_error, {}, tuple(leaf_errors)
+        )
+
+    leaf_errors.extend(_check_references(stream_root, record, counts, descriptor))
+    packet_rows, packet_read_error = _read_rows(packets_path, ["packet_seq", "payload_ref"])
+    if packet_read_error is None:
+        leaf_errors.extend(_check_payload_frames(stream_root, record, packet_rows))
+    return PhysicalChunk(record, first, last, rows, error, counts, tuple(leaf_errors))
 
 
 def read_physical_stream(paths: PackagePaths, stream_id: str) -> PhysicalStreamState:
@@ -383,7 +568,7 @@ def read_physical_stream(paths: PackagePaths, stream_id: str) -> PhysicalStreamS
         records, chain_error = read_chunk_chain(stream_paths.chunks_index)
     # Each committed chunk is reconciled against its physical packets artifact
     # here, once, so neither the verifier nor the finalizer re-derives it.
-    chunks = tuple(_reconcile_chunk(stream_paths.root, record) for record in records)
+    chunks = tuple(_reconcile_chunk(stream_paths.root, record, descriptor) for record in records)
 
     sidecars, sidecar_errors = read_sidecars(stream_paths.root)
 

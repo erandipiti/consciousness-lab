@@ -9,6 +9,65 @@ Versioning policy is unresolved — see `docs/OPERATIONS.md`.
 
 ## [Unreleased]
 
+### Fixed — CL-002B-R1-C4: leaf-level integrity closure
+
+Previous Codex verdict: **`NO-GO`**, three confirmed finding groups.
+
+| Finding | Attack | Root |
+|---|---|---|
+| **F1** | payload frame `packet_seq` disagrees with the packet row that references it | byte-framed artifact treated as opaque |
+| **F2a/F2b** | all sample rows deleted; duplicate sample key replacing another | row set treated as an artifact, `n_samples` used only as an upper bound |
+| **F3a/F3b** | artifact `bytes` lies while SHA is correct; duplicate inventory entry accepted | `bytes` unchecked; list collapsed to a set |
+
+**Common cause.** C3 decomposed *records* into fields but treated three things
+as atomic that are themselves multi-field representations — a byte-framed
+artifact, a row set, and a list. The enumeration was one level too shallow in
+exactly those places.
+
+**Leaf decomposition.** `docs/CHUNK_EQUIVALENCE.md` gains recursive decomposition
+of every compound representation, authority for each leaf, collection-type
+classification (multiplicity and order are part of the type), and an explicit
+threat-model boundary.
+
+**Newly enforced**
+
+- **Artifact `bytes`** alongside `sha256`, for `packets`, `observations`,
+  `samples`, `payloads` and every inventory entry. A matching SHA does not
+  validate a separate claim about the same file.
+- **Payload frame identity** — each frame's own `packet_seq` must equal the
+  referencing packet row's, `payload_len` must equal `payload_ref.length`, and
+  frames ↔ packet rows is a bijection: no shared frame, none unreferenced. A
+  valid CRC proves a frame is intact, not that it belongs to that packet.
+- **Dense sample key-set identity** — for `n_samples = N` the keys must be
+  exactly `(packet_seq, 0) … (packet_seq, N-1)`, each once, compared as a
+  **multiset** so a duplicate cannot mask a missing key. `n_samples = 0` expects
+  an empty set.
+- **Inventory bijection** — duplicate paths rejected before any set comparison.
+
+**Deliberately not invented:** no observation cardinality or uniqueness rule
+(the schema names no observation primary key), and no `sparse_long` cardinality
+rule — see the specification blocker below.
+
+**SPECIFICATION BLOCKER — `sparse_long` sample identity.** §9.1 calls
+`(packet_seq, sample_index_in_packet)` "the sample primary key" immediately after
+defining sparse rows as `packet_seq, sample_index_in_packet, channel_id, value`.
+Those are inconsistent for that layout: the pair cannot be the key if a row also
+carries `channel_id`. No cardinality or uniqueness rule is enforced for sparse
+streams and none was invented; only the unambiguous structural references are
+checked. Needs a human decision. No Study 001 stream is sparse today, and dense
+streams are unaffected.
+
+**Tests.** L1–L20 in `tests/test_leaf_integrity.py` plus payload-ref leaf and
+frame-bijection cases (29). The property sweep grew from 15 to **28 mutation
+dimensions**; an audit confirms 50 of 56 dimension × capture-level combinations
+apply and **all 50 are caught**, with 6 genuinely inapplicable. 340 total.
+
+**Threat-model boundary, stated explicitly.** This establishes structural,
+referential and cross-representation integrity — not cryptographic authenticity.
+An actor who coherently rewrites every artifact and all metadata cannot be
+distinguished from the original package without signatures or append-only media,
+and that is out of scope for Session Package v1.
+
 ### Added — CL-002B-R1-C3: chunk representation equivalence matrix
 
 **Why single-attack patching stopped.** Three review cycles produced the same

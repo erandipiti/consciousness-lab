@@ -18,7 +18,6 @@ so none passes merely because a hash was left stale.
 
 from typing import Any
 
-import pyarrow as pa
 import pytest
 from hypothesis import HealthCheck, given, settings
 from hypothesis import strategies as st
@@ -51,6 +50,12 @@ from tests.test_canonical_and_physical import (
     forge_chain,
     refresh_manifest,
     rewrite_sidecar,
+)
+from tests.test_leaf_integrity import (
+    reseal_artifacts as _reseal_artifacts,
+)
+from tests.test_leaf_integrity import (
+    rewrite_arrow as _rewrite_arrow,
 )
 
 EEG = SyntheticStreamSpec("synthetic.eeg", RawCaptureLevel.TRANSPORT_PAYLOAD)
@@ -388,34 +393,6 @@ def test_e25_raw_stream_omitted_from_manifest(data_root: DataRoot) -> None:
 # =============================================================================
 
 
-def _rewrite_arrow(path: Any, schema: pa.Schema, mutate: Any) -> None:
-    with path.open("rb") as handle:
-        rows = pa.ipc.open_stream(handle).read_all().to_pylist()
-    mutate(rows)
-    table = pa.Table.from_pylist(rows, schema=schema)
-    with path.open("wb") as sink, pa.ipc.new_stream(sink, schema) as writer:
-        writer.write_table(table)
-
-
-def _reseal_artifacts(paths: PackagePaths, stream_id: str) -> None:
-    """Recompute every artifact hash in the chain, then the manifest."""
-    root = paths.stream(stream_id).root
-
-    def refresh(chunk_id: int, record: dict[str, Any]) -> None:
-        for kind in ("packets", "observations", "samples", "payloads"):
-            if record.get(kind) is None:
-                continue
-            target = root / record[kind]["path"]
-            record[kind] = dict(
-                record[kind],
-                sha256=sha256_bytes(target.read_bytes()),
-                bytes=str(target.stat().st_size),
-            )
-
-    forge_chain(paths, stream_id, refresh)
-    refresh_manifest(paths, stream_id)
-
-
 def test_samples_referencing_a_packet_outside_the_chunk(data_root: DataRoot) -> None:
     """R20. A sample row pointing at a packet this chunk does not contain."""
     built = build_session(data_root, streams=[SYN], required=(SYN.stream_id,), chunks=1)
@@ -494,6 +471,20 @@ MUTATIONS = [
     "manifest_descriptor_hash",
     "sidecar_delete",
     "sidecar_duplicate",
+    # --- C4 leaf-level dimensions ---------------------------------------
+    "payload_frame_packet_seq",
+    "payload_ref_offset",
+    "payload_ref_length",
+    "payload_ref_file",
+    "artifact_bytes",
+    "artifact_sha",
+    "inventory_duplicate_path",
+    "inventory_bytes",
+    "sample_row_missing",
+    "sample_row_duplicate",
+    "sample_row_extra",
+    "sample_row_wrong_packet",
+    "sample_row_wrong_index",
 ]
 
 
@@ -567,6 +558,85 @@ def _apply_mutation(paths: PackagePaths, stream_id: str, kind: str, chunk_id: in
     elif kind == "sidecar_duplicate":
         source = root / f"{chunk_id:06d}.commit.json"
         (root / "000777.commit.json").write_bytes(source.read_bytes())
+    elif kind in {
+        "payload_frame_packet_seq",
+        "payload_ref_offset",
+        "payload_ref_length",
+        "payload_ref_file",
+    }:
+        blob = root / f"payloads/{chunk_id:06d}.bin"
+        if not blob.exists():
+            return False
+        if kind == "payload_frame_packet_seq":
+            import struct as _struct
+
+            from consciousness_lab.storage.payload import iter_frames
+
+            data = bytearray(blob.read_bytes())
+            frames, error = iter_frames(bytes(data))
+            if error is not None or not frames:
+                return False
+            _struct.pack_into("<Q", data, frames[0].offset + 4, 8888888)
+            blob.write_bytes(bytes(data))
+        else:
+            field = {
+                "payload_ref_offset": "offset",
+                "payload_ref_length": "length",
+                "payload_ref_file": "file",
+            }[kind]
+            value: Any = {"offset": 3, "length": 1, "file": "payloads/999999.bin"}[field]
+            _rewrite_arrow(
+                root / f"packets/{chunk_id:06d}.arrow",
+                PACKETS_SCHEMA,
+                lambda rows: rows[0].__setitem__(
+                    "payload_ref", dict(rows[0]["payload_ref"], **{field: value})
+                ),
+            )
+        _reseal_artifacts(paths, stream_id)
+        return True
+    elif kind in {"artifact_bytes", "artifact_sha"}:
+        field = "bytes" if kind == "artifact_bytes" else "sha256"
+        replacement = "424242" if field == "bytes" else "a" * 64
+        forge_chain(
+            paths,
+            stream_id,
+            lambda cid, r: (
+                r.__setitem__("packets", dict(r["packets"], **{field: replacement}))
+                if cid == chunk_id
+                else None
+            ),
+        )
+        refresh_manifest(paths, stream_id)
+        return True
+    elif kind in {"inventory_duplicate_path", "inventory_bytes"}:
+        obj = canonical_json.loads(paths.manifest.read_bytes())
+        if kind == "inventory_duplicate_path":
+            obj["inventory"].append(dict(obj["inventory"][0]))
+        else:
+            obj["inventory"][0]["bytes"] = "424242"
+        body = canonical_json.canonicalize(obj)
+        paths.manifest.write_bytes(body)
+        paths.manifest_sha256.write_text(sha256_bytes(body) + "\n", encoding="utf-8")
+        return True
+    elif kind.startswith("sample_row_"):
+        from consciousness_lab.storage.arrow_schema import samples_schema as _ss
+
+        target = root / f"samples/{chunk_id:06d}.arrow"
+        if not target.exists():
+            return False
+        spec_channels = 2
+        mutators: dict[str, Any] = {
+            "sample_row_missing": lambda rows: rows.pop(0),
+            "sample_row_duplicate": lambda rows: rows.__setitem__(1, dict(rows[0])),
+            "sample_row_extra": lambda rows: rows.append(dict(rows[0])),
+            "sample_row_wrong_packet": lambda rows: rows[0].__setitem__("packet_seq", 987654),
+            "sample_row_wrong_index": lambda rows: rows[0].__setitem__(
+                "sample_index_in_packet", 4242
+            ),
+        }
+        _rewrite_arrow(target, _ss(SampleLayout.DENSE_FIXED_LIST, spec_channels), mutators[kind])
+        _reseal_artifacts(paths, stream_id)
+        return True
     elif kind.startswith("manifest_"):
         obj = canonical_json.loads(paths.manifest.read_bytes())
         for entry in obj["streams"]:

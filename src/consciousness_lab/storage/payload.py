@@ -106,6 +106,59 @@ def read_at(data: bytes, ref: PayloadRef) -> tuple[int, bytes]:
     return packet_seq, payload
 
 
+@dataclass(frozen=True)
+class Frame:
+    """One framed payload record, decomposed into its leaves.
+
+    The frame is not an opaque blob: it carries its own ``packet_seq``, which
+    duplicates the packet row's. A valid CRC proves the frame is internally
+    intact; it does not prove the frame belongs to the packet that references
+    it. Both are checked separately.
+    """
+
+    offset: int
+    packet_seq: int
+    payload_len: int
+    total_len: int
+    payload: bytes
+
+
+def iter_frames(data: bytes) -> tuple[list[Frame], str | None]:
+    """Walk a payload file, returning every complete frame and any trailing error.
+
+    A torn trailing record — the shape a crash leaves — terminates the walk with
+    an error string rather than raising, so callers can report "N complete
+    frames then a torn tail".
+    """
+    frames: list[Frame] = []
+    offset = 0
+    while offset < len(data):
+        if offset + HEADER_SIZE > len(data):
+            return frames, f"truncated header at offset {offset}"
+        magic, packet_seq, payload_len = HEADER.unpack_from(data, offset)
+        if magic != MAGIC:
+            return frames, f"bad magic at offset {offset}"
+        start = offset + HEADER_SIZE
+        end = start + payload_len
+        if end + CRC_SIZE > len(data):
+            return frames, f"truncated payload at offset {offset}"
+        payload = data[start:end]
+        (stored_crc,) = CRC.unpack_from(data, end)
+        if stored_crc != crc32c(payload):
+            return frames, f"CRC mismatch at offset {offset}"
+        frames.append(
+            Frame(
+                offset=offset,
+                packet_seq=packet_seq,
+                payload_len=payload_len,
+                total_len=FRAME_OVERHEAD + payload_len,
+                payload=payload,
+            )
+        )
+        offset = end + CRC_SIZE
+    return frames, None
+
+
 def iter_records(data: bytes) -> list[tuple[int, bytes]]:
     """Walk a payload file from the start, stopping at the first bad record.
 
