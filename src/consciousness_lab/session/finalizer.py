@@ -131,12 +131,30 @@ def _assert_streams_on_disk(writer: SessionWriter, run: Run) -> None:
         # index, and its artifacts must still exist.
         expected = {commit.chunk_id: commit for commit in open_stream.writer.committed}
         actual = {commit.chunk_id: commit for commit in state.commits}
+        # Most specific diagnosis first: a commit the writer made that the
+        # index no longer holds is a different fault from a stray sidecar.
         missing = sorted(set(expected) - set(actual))
         if missing:
             raise FinalizationError(
                 f"stream {stream_id}: committed chunk(s) {missing} are absent from chunks.jsonl"
             )
+        if state.sidecar_errors:
+            raise FinalizationError(
+                f"stream {stream_id}: unreadable or misnamed sidecar(s): "
+                f"{list(state.sidecar_errors)}"
+            )
+        orphan_sidecars = sorted(set(state.sidecars) - set(actual))
+        if orphan_sidecars:
+            raise FinalizationError(
+                f"stream {stream_id}: sidecar(s) {orphan_sidecars} have no commit record"
+            )
         for chunk_id, commit in actual.items():
+            sidecar = state.sidecars.get(chunk_id)
+            if sidecar is None or sidecar != commit:
+                raise FinalizationError(
+                    f"stream {stream_id}: chunk {chunk_id} sidecar is missing or "
+                    "contradicts chunks.jsonl"
+                )
             artifacts = [commit.packets, commit.observations, commit.samples]
             if commit.payloads is not None:
                 artifacts.append(commit.payloads)

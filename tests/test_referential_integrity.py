@@ -471,3 +471,127 @@ def _rechain(paths: PackagePaths, stream_id: str, *, descriptor_sha256: str) -> 
 def _chain_head(paths: PackagePaths, stream_id: str) -> str:
     raw = paths.stream(stream_id).chunks_index.read_bytes().strip().split(b"\n")
     return str(canonical_json.loads(raw[-1])[canonical_json.RECORD_HASH_KEY])
+
+
+# --- sidecar <-> chunks.jsonl (found by the R1 Codex pass) --------------------
+
+
+def _legitimise_inventory(paths: PackagePaths) -> None:
+    """Rebuild the manifest inventory from disk and re-hash the manifest.
+
+    This is what makes the sidecar tests hard: after this, condition 1 and
+    condition 2 both pass, so only a real reconciliation of sidecars against
+    chunks.jsonl can catch the forgery.
+    """
+
+    def mutate(obj: dict[str, Any]) -> None:
+        listed = {entry["path"] for entry in obj["inventory"]}
+        for path in sorted(paths.root.rglob("*")):
+            if not path.is_file():
+                continue
+            rel = path.relative_to(paths.root).as_posix()
+            if rel in {
+                "manifest.json",
+                "manifest.sha256",
+                "annotations.jsonl",
+                "annotations.head.json",
+            } or rel.startswith("logs/"):
+                continue
+            entry = {
+                "path": rel,
+                "bytes": str(path.stat().st_size),
+                "sha256": sha256_bytes(path.read_bytes()),
+            }
+            if rel in listed:
+                for existing in obj["inventory"]:
+                    if existing["path"] == rel:
+                        existing.update(entry)
+            else:
+                obj["inventory"].append(entry)
+        obj["inventory"].sort(key=lambda e: str(e["path"]))
+
+    reseal_manifest(paths, mutate)
+
+
+def test_an_extra_sidecar_cannot_be_legitimised_by_the_inventory(
+    data_root: DataRoot,
+) -> None:
+    """A sidecar alone is not a commit, even with a perfectly valid manifest."""
+    built = build_session(data_root, streams=[EEG], required=(EEG.stream_id,), chunks=2)
+    stream = built.allocated.paths.raw / EEG.stream_id
+    (stream / "999999.commit.json").write_bytes((stream / "000000.commit.json").read_bytes())
+    _legitimise_inventory(built.allocated.paths)
+
+    result = verify_package(built.allocated.paths)
+    assert result.conditions[1] and result.conditions[2], "manifest and inventory are valid"
+    assert not result.is_completed
+    assert Finding.ORPHAN_FILE in result.findings() or (
+        Finding.SIDECAR_MISMATCH in result.findings()
+    )
+
+
+def test_a_sidecar_contradicting_the_chain_is_rejected(data_root: DataRoot) -> None:
+    """Two accounts of one chunk is exactly the defect class R1 closes."""
+    built = build_session(data_root, streams=[EEG], required=(EEG.stream_id,), chunks=2)
+    stream = built.allocated.paths.raw / EEG.stream_id
+    sidecar = stream / "000001.commit.json"
+    record = canonical_json.loads(sidecar.read_bytes())
+    record.pop(canonical_json.RECORD_HASH_KEY, None)
+    record["last_packet_seq"] = "999999"
+    sidecar.write_bytes(canonical_json.seal_record(record))
+    _legitimise_inventory(built.allocated.paths)
+
+    result = verify_package(built.allocated.paths)
+    assert result.conditions[1] and result.conditions[2]
+    assert not result.is_completed
+    assert Finding.SIDECAR_MISMATCH in result.findings()
+
+
+def test_a_deleted_sidecar_is_rejected(data_root: DataRoot) -> None:
+    built = build_session(data_root, streams=[EEG], required=(EEG.stream_id,), chunks=2)
+    (built.allocated.paths.raw / EEG.stream_id / "000001.commit.json").unlink()
+    _legitimise_inventory(built.allocated.paths)
+
+    result = verify_package(built.allocated.paths)
+    assert not result.is_completed
+    assert Finding.SIDECAR_MISMATCH in result.findings()
+
+
+def test_finalizer_refuses_when_a_sidecar_contradicts_the_chain(data_root: DataRoot) -> None:
+    """Defence in depth: the same check runs before COMPLETED is sealed."""
+    from consciousness_lab.session.allocator import allocate_session
+
+    allocated = allocate_session(data_root, participant_pseudonym="P001")
+    writer = SessionWriter.open(allocated.paths)
+    writer.start_recording(Run(sealed_at=now_reading(), required_streams=[EEG.stream_id]))
+    writer.open_stream(build_descriptor(EEG))
+    source = SyntheticSource(EEG, seed=5)
+    writer.commit_chunk(EEG.stream_id, source.next_chunk(2))
+
+    sidecar = allocated.paths.raw / EEG.stream_id / "000000.commit.json"
+    record = canonical_json.loads(sidecar.read_bytes())
+    record.pop(canonical_json.RECORD_HASH_KEY, None)
+    record["last_packet_seq"] = "424242"
+    sidecar.write_bytes(canonical_json.seal_record(record))
+
+    with pytest.raises(FinalizationError, match="sidecar"):
+        finalize(writer, outcome=RecordingOutcome.COMPLETED)
+
+
+def test_finalizer_refuses_an_orphan_sidecar(data_root: DataRoot) -> None:
+    from consciousness_lab.session.allocator import allocate_session
+
+    allocated = allocate_session(data_root, participant_pseudonym="P001")
+    writer = SessionWriter.open(allocated.paths)
+    writer.start_recording(Run(sealed_at=now_reading(), required_streams=[EEG.stream_id]))
+    writer.open_stream(build_descriptor(EEG))
+    source = SyntheticSource(EEG, seed=5)
+    writer.commit_chunk(EEG.stream_id, source.next_chunk(2))
+    stream = allocated.paths.raw / EEG.stream_id
+    # A copy under another name declares chunk 0 from a file called 000009,
+    # which is itself a mismatch; a correctly renumbered orphan is covered by
+    # the verifier test above.
+    (stream / "000009.commit.json").write_bytes((stream / "000000.commit.json").read_bytes())
+
+    with pytest.raises(FinalizationError, match="sidecar"):
+        finalize(writer, outcome=RecordingOutcome.COMPLETED)

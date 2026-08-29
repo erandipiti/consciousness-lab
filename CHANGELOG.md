@@ -9,6 +9,61 @@ Versioning policy is unresolved — see `docs/OPERATIONS.md`.
 
 ## [Unreleased]
 
+### Fixed — CL-002B-R1: manifest / raw referential integrity
+
+**A BLOCKING false-complete.** `manifest.streams` was built entirely from the
+writer's in-memory state, while verification iterated the raw directories that
+happened to exist. Neither view proved anything about the other, so deleting a
+required stream's whole raw directory before finalization produced a package
+where **all eight completion conditions returned true** while
+`raw/<stream_id>/` did not exist. Reproduced before the fix; 20 of the 23
+initial regression tests fail against `ab7ea9c`.
+
+**The fix is one source of truth, not a third view.**
+`storage/stream_state.py` derives chunk count, chain head, packet range,
+descriptor hash and sidecars from disk, and both the verifier and the finalizer
+preflight use it.
+
+*Verifier.* Condition 5 owns semantic required-stream closure — run declares it,
+the manifest agrees, the raw directory exists, and it closed `CLEAN` — plus the
+rule `manifest.required == (stream_id in run.required_streams)` for every
+stream. Condition 7 owns physical integrity: bidirectional manifest ↔ raw set
+reconciliation, duplicate ids, descriptor presence / `stream_id` / hash of the
+**stored bytes**, per-chunk `descriptor_sha256`, sidecar ↔ `chunks.jsonl`
+agreement, and `chunk_count` / chain head / packet range against the actual
+chain. No ninth condition was added; `is_completed()` is still all eight.
+
+*Finalizer.* Stream summaries are derived from physical state instead of writer
+memory, and sealing `COMPLETED` is refused when required streams, descriptors,
+committed chunks, their artifacts or their sidecars are not on disk.
+
+`chunks.jsonl` is now created empty at stream open, so a zero-chunk stream is
+structurally identical to any other and "index absent" never has to be
+interpreted.
+
+**New verifier findings:** `MANIFEST_STREAM_MISSING_RAW`,
+`RAW_STREAM_MISSING_MANIFEST`, `DUPLICATE_MANIFEST_STREAM`,
+`REQUIRED_FLAG_MISMATCH`, `MISSING_DESCRIPTOR`, `DESCRIPTOR_STREAM_ID_MISMATCH`,
+`MANIFEST_DESCRIPTOR_HASH_MISMATCH`, `CHUNK_DESCRIPTOR_HASH_MISMATCH`,
+`CHUNK_COUNT_MISMATCH`, `CHAIN_HEAD_MISMATCH`, `PACKET_RANGE_MISMATCH`,
+`MISSING_STREAM_STRUCTURE`, `SIDECAR_MISMATCH`.
+
+**Tests.** 28 in `tests/test_referential_integrity.py` (R1–R15 plus sibling
+cases). Every tamper test recomputes record, chain, inventory and manifest
+hashes, so a stale hash is never the only defence and each test asks whether an
+internally self-consistent but semantically false package can pass. 260 total.
+
+**Codex review: `NO-GO`**, one BLOCKING finding — sidecars were never
+reconciled against `chunks.jsonl`, so an added or contradicting
+`NNNNNN.commit.json` survived once the inventory was updated and the manifest
+re-hashed. Independently reproduced, then fixed in this ticket as a same-class
+relationship, with five regression tests. Codex was **not** re-run, to avoid a
+review loop; the recorded verdict remains NO-GO and the fix is unreviewed by it.
+
+**No scientific completeness rule was added.** A zero-chunk stream remains
+structurally valid; whether it is scientifically usable is a future protocol
+decision.
+
 ### Added — CL-002B: Session Package v1 implementation
 
 Implements the approved schema (`DECISIONS.md` D8–D26,

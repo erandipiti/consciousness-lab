@@ -98,6 +98,7 @@ class Finding(StrEnum):
     CHAIN_HEAD_MISMATCH = "chain_head_mismatch"
     PACKET_RANGE_MISMATCH = "packet_range_mismatch"
     MISSING_STREAM_STRUCTURE = "missing_stream_structure"
+    SIDECAR_MISMATCH = "sidecar_mismatch"
     UNEXPECTED_FILE = "unexpected_file"
     SYMLINK_IN_PACKAGE = "symlink_in_package"
     UNSAFE_PATH = "unsafe_path"
@@ -595,6 +596,38 @@ def _verify_stream(
                 result.add(Finding.CHUNK_ARTIFACT_HASH_MISMATCH, artifact.path, stream_id)
                 ok = False
                 intact.discard(commit.chunk_id)
+
+    # --- sidecars must agree with the authoritative chain -------------------
+    # chunks.jsonl is the commit log; a sidecar is a convenience copy. If the
+    # two can disagree, a package carries two contradictory accounts of the
+    # same chunk, which is the defect class this ticket exists to close.
+    for error in state.sidecar_errors:
+        result.add(Finding.SIDECAR_MISMATCH, error, stream_id)
+        ok = False
+    for commit in state.commits:
+        sidecar = state.sidecars.get(commit.chunk_id)
+        if sidecar is None:
+            result.add(
+                Finding.SIDECAR_MISMATCH,
+                f"chunk {commit.chunk_id} has no {commit.chunk_id:06d}.commit.json sidecar",
+                stream_id,
+            )
+            ok = False
+        elif sidecar != commit:
+            result.add(
+                Finding.SIDECAR_MISMATCH,
+                f"chunk {commit.chunk_id} sidecar contradicts chunks.jsonl",
+                stream_id,
+            )
+            ok = False
+    chain_ids = {commit.chunk_id for commit in state.commits}
+    for chunk_id in sorted(set(state.sidecars) - chain_ids):
+        result.add(
+            Finding.ORPHAN_FILE,
+            "sidecar has no commit record in chunks.jsonl",
+            f"{stream_id}/{chunk_id:06d}.commit.json",
+        )
+        ok = False
 
     # Files under raw/ that no commit record names are orphans. Recovery
     # reports them; verification never adopts them.

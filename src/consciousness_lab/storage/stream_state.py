@@ -39,6 +39,11 @@ class PhysicalStreamState:
     descriptor_error: str | None
     commits: tuple[ChunkCommit, ...]
     chain_error: str | None
+    #: Per-chunk ``NNNNNN.commit.json`` sidecars, keyed by chunk id. A sidecar
+    #: is a convenience copy for recovery tooling; ``chunks.jsonl`` remains the
+    #: authoritative commit log, so a sidecar must never contradict it.
+    sidecars: dict[int, ChunkCommit]
+    sidecar_errors: tuple[str, ...]
 
     @property
     def chunk_count(self) -> int:
@@ -106,6 +111,41 @@ def read_chunk_chain(index: Path) -> tuple[tuple[ChunkCommit, ...], str | None]:
     return tuple(commits), None
 
 
+SIDECAR_SUFFIX = ".commit.json"
+
+
+def read_sidecars(stream_root: Path) -> tuple[dict[int, ChunkCommit], tuple[str, ...]]:
+    """Read every ``NNNNNN.commit.json`` sidecar in a stream directory."""
+    sidecars: dict[int, ChunkCommit] = {}
+    errors: list[str] = []
+    if not stream_root.is_dir():
+        return sidecars, ()
+    for path in sorted(stream_root.glob(f"*{SIDECAR_SUFFIX}")):
+        if not path.is_file():
+            continue
+        try:
+            obj = canonical_json.loads(path.read_bytes())
+        except (OSError, canonical_json.CanonicalizationError, ValueError) as exc:
+            errors.append(f"{path.name}: not parseable ({exc})")
+            continue
+        if not isinstance(obj, dict) or not canonical_json.verify_record(obj):
+            errors.append(f"{path.name}: record_sha256 does not verify")
+            continue
+        try:
+            commit = load_on_disk(ChunkCommit, obj)
+        except ValueError as exc:
+            errors.append(f"{path.name}: malformed ({exc})")
+            continue
+        expected_name = f"{commit.chunk_id:06d}{SIDECAR_SUFFIX}"
+        if path.name != expected_name:
+            errors.append(
+                f"{path.name}: declares chunk {commit.chunk_id}, expected {expected_name}"
+            )
+            continue
+        sidecars[commit.chunk_id] = commit
+    return sidecars, tuple(errors)
+
+
 def read_physical_stream(paths: PackagePaths, stream_id: str) -> PhysicalStreamState:
     """Read one raw stream directory. Never raises on malformed content."""
     stream_paths = paths.stream(stream_id)
@@ -131,6 +171,8 @@ def read_physical_stream(paths: PackagePaths, stream_id: str) -> PhysicalStreamS
     if directory_exists:
         commits, chain_error = read_chunk_chain(stream_paths.chunks_index)
 
+    sidecars, sidecar_errors = read_sidecars(stream_paths.root)
+
     return PhysicalStreamState(
         stream_id=stream_id,
         directory_exists=directory_exists,
@@ -141,6 +183,8 @@ def read_physical_stream(paths: PackagePaths, stream_id: str) -> PhysicalStreamS
         descriptor_error=descriptor_error,
         commits=commits,
         chain_error=chain_error,
+        sidecars=sidecars,
+        sidecar_errors=sidecar_errors,
     )
 
 
