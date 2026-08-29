@@ -86,10 +86,14 @@ from consciousness_lab.session import registry
 from consciousness_lab.storage.paths import DataRoot
 from consciousness_lab.storage.reader import open_package
 from consciousness_lab.storage.verifier import verify_package
-from consciousness_lab.synthetic.source import SyntheticSource, SyntheticStreamSpec, build_descriptor
+from consciousness_lab.synthetic.source import (
+    SyntheticSource,
+    SyntheticStreamSpec,
+    build_descriptor,
+)
 
 root = DataRoot(Path("data"))
-allocated = allocate_session(root, participant_pseudonym="P001")   # durable before anything else
+allocated = allocate_session(root, participant_pseudonym="P001")  # durable before anything else
 writer = SessionWriter.open(allocated.paths)
 writer.start_recording(Run(sealed_at=reading, required_streams=["synthetic.eeg"]))
 
@@ -101,8 +105,8 @@ for _ in range(2):
 
 finalize(writer, outcome=RecordingOutcome.COMPLETED, data_root=root)
 assert verify_package(allocated.paths).is_completed
-registry.rebuild(root)                     # the index is derived; this recovers it entirely
-package = open_package(allocated.paths)    # verifies before handing out any raw data
+registry.rebuild(root)  # the index is derived; this recovers it entirely
+package = open_package(allocated.paths)  # verifies before handing out any raw data
 ```
 
 `verify_package()` returns structured findings, not a bare boolean. Use
