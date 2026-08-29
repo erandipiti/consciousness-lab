@@ -23,6 +23,7 @@ from consciousness_lab.session.model import (
     Manifest,
     Run,
     StreamDescriptor,
+    load_on_disk,
 )
 from consciousness_lab.storage import canonical_json
 from consciousness_lab.storage.paths import PackagePaths
@@ -94,21 +95,36 @@ class PackageReader:
         for line in self.paths.events.read_bytes().split(b"\n"):
             if not line.strip():
                 continue
-            records.append(EventRecord.model_validate(canonical_json.loads(line)))
+            records.append(load_on_disk(EventRecord, canonical_json.loads(line)))
         return records
 
     def stream(self, stream_id: str) -> StreamReader:
         return self.streams[stream_id]
 
 
-def open_package(paths: PackagePaths, *, supported_major: int = 1) -> PackageReader:
+class UnverifiedPackageError(RuntimeError):
+    """A package failed verification and was not opened for reading."""
+
+    def __init__(self, session_id: str, findings: list[str]) -> None:
+        super().__init__(f"{session_id} failed verification: {', '.join(findings)}")
+        self.findings = findings
+
+
+def open_package(
+    paths: PackagePaths, *, supported_major: int = 1, verify: bool = True
+) -> PackageReader:
     """Load a package, refusing an unsupported major schema version.
+
+    ``verify`` defaults to True and checks integrity before any raw data is
+    handed out, so a caller cannot consume corrupted bytes by forgetting to ask.
+    It is only turned off deliberately — by recovery and inspection tooling,
+    whose whole job is to look at packages that do not verify.
 
     Minor-version tolerance is deliberate: an unknown *optional* field in a
     v1.x package is ignored, while an unknown major fails closed. Nothing is
     migrated and nothing is mutated (spec §17).
     """
-    allocation = Allocation.model_validate(canonical_json.loads(paths.allocation.read_bytes()))
+    allocation = load_on_disk(Allocation, canonical_json.loads(paths.allocation.read_bytes()))
     major = int(allocation.schema_version.split(".")[0])
     if major != supported_major:
         raise UnsupportedSchemaVersionError(
@@ -118,14 +134,15 @@ def open_package(paths: PackagePaths, *, supported_major: int = 1) -> PackageRea
 
     run: Run | None = None
     if paths.run.is_file():
-        run = Run.model_validate(canonical_json.loads(paths.run.read_bytes()))
+        run = load_on_disk(Run, canonical_json.loads(paths.run.read_bytes()))
 
     streams: dict[str, StreamReader] = {}
     if paths.raw.is_dir():
         for stream_dir in sorted(p for p in paths.raw.iterdir() if p.is_dir()):
             stream_id = stream_dir.name
-            descriptor = StreamDescriptor.model_validate(
-                canonical_json.loads(paths.stream(stream_id).descriptor.read_bytes())
+            descriptor = load_on_disk(
+                StreamDescriptor,
+                canonical_json.loads(paths.stream(stream_id).descriptor.read_bytes()),
             )
             commits, error = read_chunk_index(paths, stream_id)
             if error is not None:
@@ -135,6 +152,19 @@ def open_package(paths: PackagePaths, *, supported_major: int = 1) -> PackageRea
                 stream_id=stream_id,
                 descriptor=descriptor,
                 commits=tuple(commits),
+            )
+
+    if verify:
+        from consciousness_lab.storage.verifier import verify_package
+
+        result = verify_package(paths)
+        # Integrity only: a correctly sealed ABORTED package is perfectly
+        # readable, so the outcome conditions (4 and 8) are not gates here.
+        integrity = [n for n in (1, 2, 3, 6, 7) if not result.conditions.get(n, False)]
+        if integrity:
+            raise UnverifiedPackageError(
+                paths.root.name,
+                sorted({issue.finding.value for issue in result.issues}),
             )
 
     return PackageReader(

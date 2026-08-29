@@ -21,6 +21,7 @@ from consciousness_lab.session.model import (
     Channel,
     ClaimStatus,
     HardwareClaim,
+    HardwareVerification,
     ObservationKind,
     ObservationProvenance,
     RawCaptureLevel,
@@ -89,9 +90,7 @@ def build_descriptor(spec: SyntheticStreamSpec) -> StreamDescriptor:
         channel_layout_provenance=HardwareClaim(
             value=None, status=ClaimStatus.ASSUMED, source="synthetic source"
         ),
-        hardware_verification=HardwareClaim(
-            value=None, status=ClaimStatus.UNKNOWN, source="docs/HARDWARE.md"
-        ),
+        hardware_verification=HardwareVerification(),
     )
 
 

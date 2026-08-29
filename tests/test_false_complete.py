@@ -265,8 +265,35 @@ def test_lateral_reclassification_is_forbidden(data_root: DataRoot) -> None:
         )
 
 
-def test_required_stream_unclean_blocks_completion(data_root: DataRoot) -> None:
-    """Condition 5: a required device disconnecting must not still read COMPLETED."""
+def test_finalizer_refuses_to_seal_completed_with_an_unclean_required_stream(
+    data_root: DataRoot,
+) -> None:
+    """Defence in depth: a sealed COMPLETED must be true when it is written.
+
+    The verifier would reject the package anyway, but a lifecycle log claiming
+    COMPLETED when a required device dropped is a lie recorded into immutable
+    data, so the finalizer refuses first (spec §5, §14; D18).
+    """
+    from consciousness_lab.session.finalizer import FinalizationError
+
+    with pytest.raises(FinalizationError, match="did not close CLEAN"):
+        build_session(
+            data_root,
+            streams=[
+                SyntheticStreamSpec("synthetic.eeg", RawCaptureLevel.TRANSPORT_PAYLOAD),
+                SyntheticStreamSpec("synthetic.ecg", RawCaptureLevel.LIBRARY_DECODED),
+            ],
+            required=("synthetic.eeg", "synthetic.ecg"),
+            close_statuses={"synthetic.ecg": StreamCloseStatus.DISCONNECTED},
+        )
+
+
+def test_condition_5_rejects_an_unclean_required_stream(data_root: DataRoot) -> None:
+    """Condition 5 in isolation: a required device dropped, so completion is off.
+
+    Sealed here as TECHNICAL_FAILURE, which is the honest outcome, and the
+    assertion is on condition 5 specifically rather than on the overall verdict.
+    """
     built = build_session(
         data_root,
         streams=[
@@ -275,10 +302,12 @@ def test_required_stream_unclean_blocks_completion(data_root: DataRoot) -> None:
         ],
         required=("synthetic.eeg", "synthetic.ecg"),
         close_statuses={"synthetic.ecg": StreamCloseStatus.DISCONNECTED},
+        finalize_outcome=RecordingOutcome.TECHNICAL_FAILURE,
     )
     result = verify_package(built.allocated.paths)
-    assert not result.is_completed
+    assert result.conditions[5] is False
     assert Finding.REQUIRED_STREAM_UNCLEAN in result.findings()
+    assert not result.is_completed
 
 
 def test_optional_stream_unclean_does_not_block_completion(data_root: DataRoot) -> None:

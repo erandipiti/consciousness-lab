@@ -25,6 +25,7 @@ from consciousness_lab.session.model import (
     Manifest,
     RecordingOutcome,
     Run,
+    load_on_disk,
 )
 from consciousness_lab.storage import canonical_json
 from consciousness_lab.storage.paths import DataRoot, PackagePaths
@@ -117,7 +118,7 @@ def _scan_package(paths: PackagePaths) -> ScannedPackage | None:
     if not paths.allocation.is_file():
         return None
     try:
-        allocation = Allocation.model_validate(canonical_json.loads(paths.allocation.read_bytes()))
+        allocation = load_on_disk(Allocation, canonical_json.loads(paths.allocation.read_bytes()))
     except (canonical_json.CanonicalizationError, ValueError):
         return None
 
@@ -133,7 +134,7 @@ def _scan_package(paths: PackagePaths) -> ScannedPackage | None:
     run: Run | None = None
     if paths.run.is_file():
         try:
-            run = Run.model_validate(canonical_json.loads(paths.run.read_bytes()))
+            run = load_on_disk(Run, canonical_json.loads(paths.run.read_bytes()))
         except (canonical_json.CanonicalizationError, ValueError):
             run = None
 
@@ -277,12 +278,30 @@ def _capture_level(paths: PackagePaths, stream_id: str) -> str | None:
 
 
 def read_sessions(data_root: DataRoot) -> list[dict[str, Any]]:
+    """Read the derived index AS-IS. **This may be stale.**
+
+    The registry is a cache (D15). A downgrade annotation appended after the
+    last refresh is not reflected here, so this must never be used to answer
+    "is this session completed?". Use :func:`query_sessions`, which resolves
+    against the packages first.
+    """
     if not data_root.registry.exists():
         return []
     with _connect(data_root.registry) as conn, closing(conn.cursor()) as cur:
         cur.executescript(SCHEMA)
         cur.execute("SELECT * FROM sessions ORDER BY session_id")
         return [dict(row) for row in cur.fetchall()]
+
+
+def query_sessions(data_root: DataRoot) -> list[dict[str, Any]]:
+    """Return session rows resolved against the packages.
+
+    Rebuilds the index first, so the answer reflects package state rather than
+    whatever the cache last recorded. The package is always the authority
+    (D8, D15).
+    """
+    rebuild(data_root)
+    return read_sessions(data_root)
 
 
 def reconcile(data_root: DataRoot) -> list[Discrepancy]:
@@ -326,6 +345,7 @@ def reconcile(data_root: DataRoot) -> list[Discrepancy]:
 __all__ = [
     "Discrepancy",
     "RecordingOutcome",
+    "query_sessions",
     "read_sessions",
     "rebuild",
     "reconcile",

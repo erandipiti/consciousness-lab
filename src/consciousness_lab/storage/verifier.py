@@ -17,7 +17,7 @@ import pyarrow as pa
 
 from consciousness_lab.session import annotations as annotations_mod
 from consciousness_lab.session.finalizer import read_manifest
-from consciousness_lab.session.lifecycle import read_records, summarize
+from consciousness_lab.session.lifecycle import parse_records, summarize
 from consciousness_lab.session.model import (
     SCHEMA_MAJOR,
     ChunkCommit,
@@ -28,6 +28,7 @@ from consciousness_lab.session.model import (
     Run,
     StreamCloseStatus,
     StreamDescriptor,
+    load_on_disk,
 )
 from consciousness_lab.storage import canonical_json
 from consciousness_lab.storage.checksums import find_incomplete, sha256_bytes, sha256_file
@@ -119,7 +120,7 @@ def read_chunk_index(paths: PackagePaths, stream_id: str) -> tuple[list[ChunkCom
         if not isinstance(obj, dict) or not canonical_json.verify_record(obj):
             return commits, f"line {number} record_sha256 does not verify"
         try:
-            commit = ChunkCommit.model_validate(obj)
+            commit = load_on_disk(ChunkCommit, obj)
         except ValueError as exc:
             return commits, f"line {number} is malformed ({exc})"
         if commit.prev_record_sha256 != prev:
@@ -198,13 +199,11 @@ def verify_package(paths: PackagePaths) -> VerificationResult:
     # --- Condition 4: sealed prefix says CLOSED / CLEAN / COMPLETED ---------
     sealed_ok = False
     if seal_ok and manifest is not None:
+        # Parsed in memory. Writing a temp file inside the package would put a
+        # post-seal file into a sealed unit, which §14.1 forbids — and a crash
+        # mid-verification would leave it there.
         prefix = paths.lifecycle.read_bytes()[: manifest.lifecycle_seal.sealed_len]
-        tmp = paths.lifecycle.with_name("lifecycle.sealed.view")
-        try:
-            tmp.write_bytes(prefix)
-            summary = summarize(read_records(tmp))
-        finally:
-            tmp.unlink(missing_ok=True)
+        summary = summarize(parse_records(prefix))
         result.sealed_outcome = summary.sealed_outcome
         if summary.terminal_state is not LifecycleState.CLOSED:
             result.add(Finding.NOT_CLEANLY_CLOSED, f"terminal state is {summary.terminal_state}")
@@ -225,7 +224,7 @@ def verify_package(paths: PackagePaths) -> VerificationResult:
     run = None
     if paths.run.exists():
         try:
-            run = Run.model_validate(canonical_json.loads(paths.run.read_bytes()))
+            run = load_on_disk(Run, canonical_json.loads(paths.run.read_bytes()))
         except (canonical_json.CanonicalizationError, ValueError) as exc:
             result.add(Finding.UNREADABLE_RUN, f"run.json could not be parsed ({exc})")
     result.run = run
@@ -298,8 +297,8 @@ def _verify_streams(
         stream_id = stream_dir.name
         stream_paths = paths.stream(stream_id)
         try:
-            descriptor = StreamDescriptor.model_validate(
-                canonical_json.loads(stream_paths.descriptor.read_bytes())
+            descriptor = load_on_disk(
+                StreamDescriptor, canonical_json.loads(stream_paths.descriptor.read_bytes())
             )
         except (OSError, canonical_json.CanonicalizationError, ValueError) as exc:
             result.add(Finding.UNREADABLE_DESCRIPTOR, f"{exc}", stream_id)

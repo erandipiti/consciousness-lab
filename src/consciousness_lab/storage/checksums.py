@@ -48,6 +48,41 @@ def atomic_write(path: Path, data: bytes) -> None:
     fsync_dir(path.parent)
 
 
+class ImmutableFileError(RuntimeError):
+    """An attempt was made to overwrite a file that is immutable once written."""
+
+
+def atomic_write_new(path: Path, data: bytes) -> None:
+    """Write ``path`` atomically, refusing to overwrite an existing file.
+
+    Immutability is enforced here rather than by convention: ``os.replace``
+    silently clobbers, so every write-once artifact goes through this instead
+    (AGENTS.md §5, D10, D23).
+    """
+    if path.exists():
+        raise ImmutableFileError(f"{path} already exists and is immutable once written")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + TMP_SUFFIX)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    # os.link + unlink gives a no-clobber rename; plain rename would overwrite.
+    try:
+        os.link(tmp, path)
+    except FileExistsError as exc:
+        tmp.unlink(missing_ok=True)
+        raise ImmutableFileError(f"{path} was created concurrently") from exc
+    finally:
+        tmp.unlink(missing_ok=True)
+    fsync_dir(path.parent)
+
+
 def append_line(path: Path, line: bytes) -> None:
     """Append one durable line to an append-only log."""
     path.parent.mkdir(parents=True, exist_ok=True)

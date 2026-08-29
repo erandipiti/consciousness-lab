@@ -5,6 +5,7 @@ from typing import Any
 
 from consciousness_lab.session import annotations as annotations_mod
 from consciousness_lab.session import registry
+from consciousness_lab.session.allocator import allocate_session
 from consciousness_lab.session.model import RawCaptureLevel, RecordingOutcome
 from consciousness_lab.storage.paths import DataRoot
 from consciousness_lab.synthetic.source import SyntheticStreamSpec
@@ -29,13 +30,48 @@ def test_deleting_the_registry_loses_nothing(data_root: DataRoot) -> None:
     assert strip(before) == strip(after)
 
 
-def test_allocation_is_durable_before_the_registry_exists(data_root: DataRoot) -> None:
-    """Ordering (spec §12.1): no state can exist only in the database."""
+def test_allocation_survives_a_registry_write_failure(data_root: DataRoot) -> None:
+    """Ordering (spec §12.1): the package is durable before the registry matters.
+
+    The registry path is made unusable so the derived write fails. Allocation
+    must still succeed and the package must still be complete on disk, because
+    no state may exist only in the database.
+    """
+    data_root.registry.parent.mkdir(parents=True, exist_ok=True)
+    data_root.registry.mkdir()  # a directory where sqlite expects a file
+
+    allocated = allocate_session(data_root, participant_pseudonym="P001")
+    assert allocated.paths.allocation.is_file()
+    assert allocated.paths.lifecycle.is_file()
+
+    data_root.registry.rmdir()
+    assert registry.rebuild(data_root) == 1, "a rescan recovers it entirely"
+
+
+def test_nothing_exists_only_in_the_registry(data_root: DataRoot) -> None:
+    """Deleting the database loses no session, because packages come first."""
     built = build_session(data_root, finalize_outcome=None)
-    assert built.allocated.paths.allocation.is_file()
-    assert built.allocated.paths.lifecycle.is_file()
-    assert not data_root.registry.exists(), "acquisition began without any registry row"
+    data_root.registry.unlink(missing_ok=True)
     assert registry.rebuild(data_root) == 1
+    assert registry.read_sessions(data_root)[0]["session_id"] == built.allocated.session_id
+
+
+def test_query_sessions_resolves_against_packages_not_the_cache(data_root: DataRoot) -> None:
+    """A stale cache must never answer "is this completed?" (D8, D15)."""
+    built = build_session(data_root)
+    registry.rebuild(data_root)
+    assert registry.read_sessions(data_root)[0]["is_completed"] == 1
+
+    annotations_mod.append_annotation(
+        annotations_path=built.allocated.paths.annotations,
+        head_path=built.allocated.paths.annotations_head,
+        sealed_outcome=RecordingOutcome.COMPLETED,
+        to_outcome=RecordingOutcome.ABORTED,
+        actor="researcher",
+        reason="downgraded after review",
+    )
+    assert registry.read_sessions(data_root)[0]["is_completed"] == 1, "the cache is stale"
+    assert registry.query_sessions(data_root)[0]["is_completed"] == 0, "the package wins"
 
 
 def test_rebuild_records_its_own_provenance(data_root: DataRoot) -> None:

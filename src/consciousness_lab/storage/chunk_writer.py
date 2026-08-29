@@ -40,6 +40,7 @@ from consciousness_lab.storage.checksums import (
     fsync_dir,
     sha256_file,
 )
+from consciousness_lab.storage.observations import validate_observations
 from consciousness_lab.storage.paths import StreamPaths
 
 #: Stages a fault-injection test can interrupt. Named so tests describe the
@@ -74,7 +75,9 @@ class PendingChunk:
 
 
 def _write_arrow(path: Path, schema: pa.Schema, rows: Sequence[dict[str, Any]]) -> None:
-    """Write one Arrow IPC stream file atomically."""
+    """Write one Arrow IPC stream file atomically, never over an existing one."""
+    if path.exists():
+        raise ChunkWriteError(f"{path} already exists; committed raw chunks are immutable")
     path.parent.mkdir(parents=True, exist_ok=True)
     part = path.with_name(path.name + PART_SUFFIX)
     table = pa.Table.from_pylist(list(rows), schema=schema)
@@ -88,6 +91,8 @@ def _write_arrow(path: Path, schema: pa.Schema, rows: Sequence[dict[str, Any]]) 
 
 
 def _write_payloads(path: Path, records: Sequence[tuple[int, bytes]]) -> None:
+    if path.exists():
+        raise ChunkWriteError(f"{path} already exists; committed raw chunks are immutable")
     path.parent.mkdir(parents=True, exist_ok=True)
     part = path.with_name(path.name + PART_SUFFIX)
     with part.open("wb") as handle:
@@ -115,6 +120,15 @@ class ChunkWriter:
         self.paths = paths
         self.descriptor = descriptor
         self.descriptor_sha256 = descriptor_sha256
+        # Refuse to reuse a stream directory that already holds chunks: a fresh
+        # writer would restart at chunk 0 and overwrite immutable raw files.
+        if paths.chunks_index.exists() or any(
+            (paths.root / kind).exists()
+            for kind in ("payloads", "packets", "observations", "samples")
+        ):
+            raise ChunkWriteError(
+                f"{paths.root} already holds raw artifacts; committed chunks are immutable"
+            )
         self._next_chunk_id = 0
         self._prev_hash = canonical_json.ZERO_HASH
         self._committed: list[ChunkCommit] = []
@@ -145,6 +159,10 @@ class ChunkWriter:
                 f"raw_capture_level={self.descriptor.acquisition.raw_capture_level.value} "
                 "must not produce a payload artifact (spec 9.1)"
             )
+
+        # Arrow types cannot express "exactly one value column matches
+        # value_type", so the rule is enforced before anything reaches disk.
+        validate_observations(pending.observations)
 
         chunk_id = self._next_chunk_id
 

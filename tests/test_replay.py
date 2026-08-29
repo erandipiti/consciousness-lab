@@ -129,5 +129,6 @@ def test_unknown_major_schema_version_fails_closed(data_root: DataRoot) -> None:
 def test_descriptor_records_the_generator_and_stays_unverified(data_root: DataRoot) -> None:
     built = build_session(data_root)
     descriptor = open_package(built.allocated.paths).stream("synthetic.eeg").descriptor
-    assert descriptor.hardware_verification.status.value in {"unknown", "assumed"}
+    assert descriptor.hardware_verification.status.value == "unverified"
+    assert descriptor.hardware_verification.ref == "docs/HARDWARE.md"
     assert descriptor.actual_sample_rate_hz is None, "actual rate is derived, never recorded here"

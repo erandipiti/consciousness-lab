@@ -20,7 +20,11 @@ from consciousness_lab.session.model import (
     StreamDescriptor,
 )
 from consciousness_lab.storage import canonical_json
-from consciousness_lab.storage.checksums import append_line, atomic_write, sha256_bytes
+from consciousness_lab.storage.checksums import (
+    append_line,
+    atomic_write_new,
+    sha256_bytes,
+)
 from consciousness_lab.storage.chunk_writer import ChunkWriter, FaultHook, PendingChunk
 from consciousness_lab.storage.paths import PackagePaths
 
@@ -76,6 +80,30 @@ EVENT_SCHEMAS: dict[str, dict[str, Any]] = {
 }
 
 
+class SealedPackageError(RuntimeError):
+    """A write was attempted against sealed or already-written package content."""
+
+
+def _validate_payload(schema_id: str, payload: dict[str, Any]) -> None:
+    """Check a payload against its declared schema before it is written.
+
+    A deliberately small subset of JSON Schema — required keys, and additional
+    properties when the schema forbids them. Enough to stop a typo becoming a
+    permanently unreadable event, without taking a validator dependency for the
+    five schemas CL-002B defines.
+    """
+    schema = EVENT_SCHEMAS[schema_id]
+    properties = schema.get("properties", {})
+    required = schema.get("required", [])
+    missing = [key for key in required if key not in payload]
+    if missing:
+        raise ValueError(f"{schema_id}: payload is missing required keys {missing}")
+    if schema.get("additionalProperties") is False:
+        extra = [key for key in payload if key not in properties]
+        if extra:
+            raise ValueError(f"{schema_id}: payload has undeclared keys {extra}")
+
+
 @dataclass
 class OpenStream:
     descriptor: StreamDescriptor
@@ -97,17 +125,31 @@ class SessionWriter:
 
     @classmethod
     def open(cls, paths: PackagePaths) -> "SessionWriter":
-        return cls(paths=paths, lifecycle=LifecycleLog(paths.lifecycle))
+        """Open an unsealed package for writing.
+
+        A sealed or closed package is refused outright. Without this guard a
+        second writer could overwrite ``run.json`` and the stream descriptors
+        before the lifecycle log got a chance to reject the transition, which
+        would mutate sealed data (AGENTS.md §5, D23).
+        """
+        if paths.manifest.exists() or paths.manifest_sha256.exists():
+            raise SealedPackageError(
+                f"{paths.root.name} is sealed; a sealed package is never reopened for writing"
+            )
+        log = LifecycleLog(paths.lifecycle)
+        if log.state is LifecycleState.CLOSED:
+            raise SealedPackageError(f"{paths.root.name} is CLOSED; CLOSED is terminal")
+        return cls(paths=paths, lifecycle=log)
 
     def start_recording(self, run: Run) -> None:
-        """Seal ``run.json`` and enter RECORDING."""
-        if self.run is not None:
-            raise RuntimeError("run.json is sealed once and cannot be rewritten")
-        self.run = run
-        atomic_write(
+        """Seal ``run.json`` and enter RECORDING. Sealed once, never rewritten."""
+        if self.run is not None or self.paths.run.exists():
+            raise SealedPackageError("run.json is sealed once and cannot be rewritten")
+        atomic_write_new(
             self.paths.run,
             canonical_json.canonicalize(run.model_dump(mode="json", exclude_none=True)),
         )
+        self.run = run
         self.lifecycle.append(LifecycleState.RECORDING)
         self.emit_event("RECORDING_START", "recording_start.v1", origin="system")
         self.emit_clock_snapshot()
@@ -115,11 +157,15 @@ class SessionWriter:
     def open_stream(self, descriptor: StreamDescriptor) -> OpenStream:
         """Seal a stream descriptor and open its chunk writer."""
         if descriptor.stream_id in self.streams:
-            raise RuntimeError(f"stream {descriptor.stream_id} is already open")
+            raise SealedPackageError(f"stream {descriptor.stream_id} is already open")
         stream_paths = self.paths.stream(descriptor.stream_id)
+        if stream_paths.descriptor.exists():
+            raise SealedPackageError(
+                f"stream {descriptor.stream_id} already has a sealed descriptor"
+            )
         stream_paths.root.mkdir(parents=True, exist_ok=True)
         body = canonical_json.canonicalize(descriptor.model_dump(mode="json", exclude_none=True))
-        atomic_write(stream_paths.descriptor, body)
+        atomic_write_new(stream_paths.descriptor, body)
         opened = OpenStream(
             descriptor=descriptor,
             descriptor_sha256=sha256_bytes(body),
@@ -148,6 +194,7 @@ class SessionWriter:
     ) -> EventRecord:
         if payload_schema not in EVENT_SCHEMAS:
             raise KeyError(f"unknown event payload schema {payload_schema}")
+        _validate_payload(payload_schema, payload or {})
         utc_ns, monotonic_ns = now_reading()
         record = EventRecord.model_validate(
             {
@@ -188,6 +235,7 @@ class SessionWriter:
         for schema_id in sorted(self._used_schemas):
             body = canonical_json.canonicalize(EVENT_SCHEMAS[schema_id])
             target = self.paths.schemas / f"{schema_id}.json"
-            atomic_write(target, body)
+            if not target.exists():
+                atomic_write_new(target, body)
             out.append((schema_id, target, body))
         return out

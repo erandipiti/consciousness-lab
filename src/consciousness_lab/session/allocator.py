@@ -13,13 +13,16 @@ only in the database. That is what makes the registry fully derived, and it is
 why a scan can rebuild it completely.
 """
 
+import contextlib
 import platform
+import sqlite3
 import subprocess
 import sys
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from consciousness_lab.session import registry
 from consciousness_lab.session.lifecycle import LifecycleLog, now_reading
 from consciousness_lab.session.model import (
     Allocation,
@@ -58,7 +61,7 @@ def _host_info() -> HostInfo:
 
 def _software_info(repo_root: Path | None) -> SoftwareInfo:
     if repo_root is None or not (repo_root / ".git").exists():
-        return SoftwareInfo(repo_commit=None, dirty=False)
+        return SoftwareInfo(repo_commit=None, dirty=None)
     try:
         commit = subprocess.run(
             ["git", "-C", str(repo_root), "rev-parse", "HEAD"],
@@ -75,8 +78,8 @@ def _software_info(repo_root: Path | None) -> SoftwareInfo:
             timeout=10,
         ).stdout.strip()
     except (subprocess.SubprocessError, OSError):
-        # Provenance we cannot read is recorded as absent, never as a guess.
-        return SoftwareInfo(repo_commit=None, dirty=False)
+        # Provenance we cannot read is recorded as unknown, never as clean.
+        return SoftwareInfo(repo_commit=None, dirty=None)
     return SoftwareInfo(repo_commit=commit, dirty=bool(status))
 
 
@@ -135,4 +138,11 @@ def allocate_session(
         canonical_json.canonicalize(allocation.model_dump(mode="json", exclude_none=True)),
     )
     LifecycleLog(package.lifecycle).append(LifecycleState.ALLOCATED)
+
+    # Step 4 (spec §12.1): refresh the derived index. This happens AFTER the
+    # package is durable, and a failure here is recoverable by a rescan, so it
+    # is deliberately not allowed to break allocation.
+    with contextlib.suppress(sqlite3.Error):
+        registry.upsert(data_root, package)
+
     return AllocatedSession(session_id=session_id, paths=package, allocation=allocation)

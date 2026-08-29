@@ -6,11 +6,17 @@ threshold appears in this file.
 """
 
 from enum import StrEnum
-from typing import Annotated, Any, Literal
+from typing import Annotated, Any, Literal, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from consciousness_lab.storage.integer_types import Int64Decimal, UInt64Decimal
+from consciousness_lab.storage.integer_types import (
+    ON_DISK_CONTEXT_KEY,
+    Int64Decimal,
+    UInt64Decimal,
+)
+
+_T = TypeVar("_T", bound=BaseModel)
 
 SCHEMA_NAME = "session_package"
 SCHEMA_VERSION = "1.0"
@@ -20,14 +26,26 @@ PSEUDONYM_PATTERN = r"^P[0-9]{3,6}$"
 
 
 class Strict(BaseModel):
-    """Base model: unknown fields are rejected on the way in.
+    """Base model for every on-disk record.
 
-    Minor-version tolerance (spec §17) is handled by the reader, which decides
-    what to do with unknown optional fields; the models themselves stay strict
-    so a typo never becomes a silently-ignored field.
+    ``extra="ignore"`` implements the minor-version tolerance of spec §17: a
+    v1.1 package carrying a new optional field must still be readable by a v1.0
+    reader. This does not weaken integrity — record hashes are computed over the
+    raw parsed document, not the model, so an added field still changes the hash
+    and is still detected. An unknown *major* version fails closed instead.
     """
 
-    model_config = ConfigDict(extra="forbid", frozen=True)
+    model_config = ConfigDict(extra="ignore", frozen=True)
+
+
+def load_on_disk(model: type[_T], data: object) -> _T:
+    """Validate a document read from disk.
+
+    The ``on_disk`` context makes int64/uint64 fields refuse JSON Numbers, so a
+    value that already lost precision in a JSON parser cannot enter the system
+    (spec §12.2.1, D25).
+    """
+    return model.model_validate(data, context={ON_DISK_CONTEXT_KEY: True})
 
 
 class LifecycleState(StrEnum):
@@ -107,6 +125,23 @@ class HardwareClaim(Strict):
     observed_at: str | None = None
 
 
+class VerificationStatus(StrEnum):
+    UNVERIFIED = "unverified"
+    VERIFIED = "verified"
+
+
+class HardwareVerification(Strict):
+    """Whether a device has been tested on real hardware (spec §8, D14).
+
+    Every device in this repository reads ``unverified``: none has ever been
+    connected. Promoting this to ``verified`` requires a dated entry in
+    ``docs/HARDWARE.md``, never a code change alone.
+    """
+
+    status: VerificationStatus = VerificationStatus.UNVERIFIED
+    ref: str = "docs/HARDWARE.md"
+
+
 class ClockReading(Strict):
     """A paired monotonic/UTC reading, each naming the clock that produced it."""
 
@@ -130,6 +165,23 @@ class Origin(Strict):
     replay_tool_version: str | None = None
     generator_seed: UInt64Decimal | None = None
 
+    @model_validator(mode="after")
+    def _origin_provenance(self) -> "Origin":
+        if self.kind == "replay":
+            missing = [
+                name
+                for name in ("source_session_id", "source_manifest_sha256", "replay_tool_version")
+                if getattr(self, name) is None
+            ]
+            if missing:
+                raise ValueError(
+                    f"a replay origin must record {missing} so it can never be "
+                    "mistaken for a recording (spec 16)"
+                )
+        if self.kind == "synthetic" and self.generator_seed is None:
+            raise ValueError("a synthetic origin must record its generator seed (spec 16)")
+        return self
+
 
 class Protocol(Strict):
     """Protocol identity. ``UNSPECIFIED`` is honest: no Phase 0 protocol exists."""
@@ -146,8 +198,14 @@ class HostInfo(Strict):
 
 
 class SoftwareInfo(Strict):
+    """Code provenance. ``dirty`` is ``None`` when it could not be read.
+
+    ``False`` would assert a clean tree we never observed; unknown provenance is
+    recorded as unknown.
+    """
+
     repo_commit: str | None = None
-    dirty: bool = False
+    dirty: bool | None = None
 
 
 class EnvironmentInfo(Strict):
@@ -290,7 +348,7 @@ class StreamDescriptor(Strict):
     device_preset: HardwareClaim = Field(default_factory=HardwareClaim)
     timing_capabilities: TimingCapabilities = Field(default_factory=TimingCapabilities)
     channel_layout_provenance: HardwareClaim = Field(default_factory=HardwareClaim)
-    hardware_verification: HardwareClaim = Field(default_factory=HardwareClaim)
+    hardware_verification: HardwareVerification = Field(default_factory=HardwareVerification)
     extensions: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")

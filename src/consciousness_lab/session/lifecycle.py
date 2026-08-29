@@ -20,6 +20,7 @@ from consciousness_lab.session.model import (
     LifecycleRecord,
     LifecycleState,
     RecordingOutcome,
+    load_on_disk,
 )
 from consciousness_lab.storage import canonical_json
 from consciousness_lab.storage.checksums import append_line
@@ -118,18 +119,23 @@ class LifecycleLog:
 
 
 def read_records(path: Path) -> Iterable[LifecycleRecord]:
-    """Parse a lifecycle log. A torn final line is dropped, not guessed at."""
+    """Parse a lifecycle log from disk."""
     if not path.exists():
         return []
+    return parse_records(path.read_bytes())
+
+
+def parse_records(raw: bytes) -> list[LifecycleRecord]:
+    """Parse lifecycle records from bytes. A torn final line is dropped, not guessed at."""
     records: list[LifecycleRecord] = []
-    for line in path.read_bytes().split(b"\n"):
+    for line in raw.split(b"\n"):
         if not line.strip():
             continue
         try:
             obj = canonical_json.loads(line)
         except (canonical_json.CanonicalizationError, ValueError):
             break
-        records.append(LifecycleRecord.model_validate(obj))
+        records.append(load_on_disk(LifecycleRecord, obj))
     return records
 
 

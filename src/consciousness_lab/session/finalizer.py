@@ -22,10 +22,13 @@ Step 9 is the last durable act. The manifest pair means FINALIZED / SEALED. It
 does not mean COMPLETED: a cleanly aborted session produces an identical pair.
 """
 
+import contextlib
+import sqlite3
 from dataclasses import dataclass
 from pathlib import Path
 
 from consciousness_lab.session import annotations as annotations_mod
+from consciousness_lab.session import registry
 from consciousness_lab.session.lifecycle import now_reading
 from consciousness_lab.session.model import (
     ClockReading,
@@ -36,13 +39,21 @@ from consciousness_lab.session.model import (
     Manifest,
     ManifestStream,
     RecordingOutcome,
+    Run,
     SchemaSnapshot,
     SealPointer,
+    StreamCloseStatus,
 )
 from consciousness_lab.session.writer import SessionWriter
 from consciousness_lab.storage import canonical_json
-from consciousness_lab.storage.checksums import atomic_write, sha256_bytes, sha256_file
-from consciousness_lab.storage.paths import PackagePaths
+from consciousness_lab.storage.checksums import (
+    atomic_write,
+    atomic_write_new,
+    find_incomplete,
+    sha256_bytes,
+    sha256_file,
+)
+from consciousness_lab.storage.paths import DataRoot, PackagePaths
 
 #: Never inventoried: post-seal mutable objects (§14.1) and operational logs.
 #: Hashing these would invalidate manifest.sha256 on the first annotation.
@@ -63,6 +74,31 @@ class FinalizationError(RuntimeError):
 class FinalizationResult:
     manifest: Manifest
     manifest_sha256: str
+
+
+def _assert_completable(
+    writer: SessionWriter, run: Run, closure_condition: ClosureCondition
+) -> None:
+    """Refuse to seal COMPLETED unless it is actually true (spec §5, §14; D18)."""
+    if closure_condition is not ClosureCondition.CLEAN:
+        raise FinalizationError(
+            f"cannot seal COMPLETED with closure_condition={closure_condition.value}"
+        )
+    missing = [s for s in run.required_streams if s not in writer.streams]
+    if missing:
+        raise FinalizationError(f"required streams were never opened: {sorted(missing)}")
+    unclean = [
+        stream_id
+        for stream_id in run.required_streams
+        if writer.streams[stream_id].close_status is not StreamCloseStatus.CLEAN
+    ]
+    if unclean:
+        raise FinalizationError(f"required streams did not close CLEAN: {sorted(unclean)}")
+    incomplete = find_incomplete(writer.paths.root)
+    if incomplete:
+        raise FinalizationError(
+            f"{len(incomplete)} incomplete write marker(s) present; the session is not complete"
+        )
 
 
 def _inventory(paths: PackagePaths) -> list[FileEntry]:
@@ -86,11 +122,18 @@ def finalize(
     outcome: RecordingOutcome,
     closure_condition: ClosureCondition = ClosureCondition.CLEAN,
     outcome_reason: str | None = None,
+    data_root: DataRoot | None = None,
 ) -> FinalizationResult:
     """Seal the package. ``outcome`` is the sealed recording outcome."""
     run = writer.run
     if run is None:
         raise FinalizationError("cannot finalize a session that never sealed run.json")
+
+    # A sealed COMPLETED must be true at the moment it is written. The verifier
+    # would reject the package later either way, but a lifecycle log that says
+    # COMPLETED when it was not is a lie recorded in immutable data.
+    if outcome is RecordingOutcome.COMPLETED:
+        _assert_completable(writer, run, closure_condition)
 
     # 2, 3 — lifecycle first, so the sealed prefix is complete before hashing.
     if writer.lifecycle.state is LifecycleState.ALLOCATED:
@@ -165,9 +208,16 @@ def finalize(
 
     # 8, 9 — the manifest pair. Step 9 is the finalization marker.
     manifest_bytes = canonical_json.canonicalize(manifest.model_dump(mode="json"))
-    atomic_write(writer.paths.manifest, manifest_bytes)
+    atomic_write_new(writer.paths.manifest, manifest_bytes)
     digest = sha256_bytes(manifest_bytes)
-    atomic_write(writer.paths.manifest_sha256, (digest + "\n").encode("utf-8"))
+    atomic_write_new(writer.paths.manifest_sha256, (digest + "\n").encode("utf-8"))
+
+    # Step 10 (spec §14): refresh the derived index. The package is already
+    # sealed, so a failure here costs nothing but a stale row.
+    if data_root is not None:
+        with contextlib.suppress(sqlite3.Error):
+            registry.upsert(data_root, writer.paths)
+
     return FinalizationResult(manifest=manifest, manifest_sha256=digest)
 
 
