@@ -1,18 +1,33 @@
 # SESSION_SCHEMA_PROPOSAL — Session Package v1 and Session Registry
 
-**Ticket:** CL-002A (design only). **Status of this document: a PROPOSAL.**
-Nothing here is a decision. `docs/DECISIONS.md` is deliberately untouched; it is
-updated only after a human approves this design.
+> ## Status: APPROVED FOR IMPLEMENTATION — Session Package v1
+>
+> **Approved baseline:** `c5e6a9e712cd4a214162bec57d99ea89c33b01e4`
+> **Human approval recorded in:** CL-002A-APPROVAL, 2026-08-28.
+> **Decision index:** [`DECISIONS.md`](DECISIONS.md) D8–D26.
+>
+> This document is the **authoritative specification** for Session Package v1.
+> **A future implementation discrepancy is a bug, unless a later decision record
+> in `DECISIONS.md` explicitly supersedes this specification.**
+>
+> The filename still says "proposal" and the historical review trace in §25 is
+> deliberately preserved — it records how five adversarial passes reached this
+> design, including four constructed false-complete states and two
+> information-loss findings that reshaped it. That history is evidence, not
+> clutter, and is not to be erased.
 
-Every major design point carries one of these labels:
+**Ticket:** CL-002A, corrected by CL-002A-R1 and CL-002A-R2, approved by
+CL-002A-APPROVAL.
+
+Every major design point carries one of these labels.
 
 | Label | Meaning |
 |---|---|
-| **PROPOSED** | Recommended here, awaiting human approval |
-| **ALREADY DECIDED** | Settled in `docs/DECISIONS.md` before this ticket; restated, not re-decided |
-| **OPEN — HUMAN DECISION REQUIRED** | A person must choose; no coding agent may |
-| **OPEN — HARDWARE VALIDATION REQUIRED** | Depends on device behaviour never physically measured |
-| **DEFERRED SAFELY** | Not decided now, and deferring costs nothing later |
+| **APPROVED** | Approved as written on 2026-08-28; binding on CL-002B. See `DECISIONS.md` D8–D26 |
+| **ALREADY DECIDED** | Settled in `docs/DECISIONS.md` before CL-002A; restated, not re-decided |
+| **OPEN — HUMAN DECISION REQUIRED** | Still open. A person must choose; no coding agent may |
+| **OPEN — HARDWARE VALIDATION REQUIRED** | Still open. Depends on device behaviour never physically measured |
+| **DEFERRED SAFELY** | Not decided, and deferring still costs nothing |
 
 The design goal this document is written against:
 
@@ -24,7 +39,7 @@ The design goal this document is written against:
 
 ## 1. Executive recommendation
 
-**PROPOSED.** A session is a **directory** on disk. It is the only authority.
+**APPROVED.** A session is a **directory** on disk. It is the only authority.
 Everything else — including the registry — is a derived index that can be
 deleted and rebuilt.
 
@@ -88,21 +103,21 @@ These are restatements of existing repository decisions, not new ones.
 
 And four that this design adds:
 
-7. **One authority per question.** PROPOSED. If two files can answer the same
+7. **One authority per question.** APPROVED. If two files can answer the same
    question, one of them is wrong eventually.
-8. **Null means "not provided".** PROPOSED. Never zero, never a default, never
+8. **Null means "not provided".** APPROVED. Never zero, never a default, never
    an interpolation, never the host clock standing in for a device clock.
-9. **Acquisition is dumb on purpose.** PROPOSED. No dedup, no reordering, no
+9. **Acquisition is dumb on purpose.** APPROVED. No dedup, no reordering, no
    repair, no gap flags. A flag computed by a buggy acquisition build would
    freeze a wrong observation into immutable data.
-10. **Recovery reports; it does not repair.** PROPOSED. Orphan files are
+10. **Recovery reports; it does not repair.** APPROVED. Orphan files are
     surfaced, never silently adopted.
 
 ---
 
 ## 3. Session package directory structure
 
-**PROPOSED.** Q1 answer: directory per session.
+**APPROVED.** Q1 answer: directory per session.
 
 ```text
 data/
@@ -150,7 +165,7 @@ make the inventory incomplete. They are operational, never authoritative.
 
 ## 4. Session ID strategy
 
-**PROPOSED.** Q3 answer: **UUIDv4**, canonical lowercase, as the directory name.
+**APPROVED.** Q3 answer: **UUIDv4**, canonical lowercase, as the directory name.
 
 ```text
 data/sessions/9f2c1e40-6b3a-4d51-8e77-0a1b2c3d4e5f/
@@ -180,7 +195,7 @@ because the filesystem is where the data lives and the database is disposable.
 
 ## 5. Session lifecycle
 
-**PROPOSED.** Three orthogonal fields. Collapsing them is how false-complete
+**APPROVED.** Three orthogonal fields. Collapsing them is how false-complete
 states get built.
 
 ```text
@@ -251,9 +266,11 @@ earlier draft of this document said an annotation could move `UNCLASSIFIED` to
 **Lateral reclassification — `ABORTED` <-> `TECHNICAL_FAILURE` — is not
 permitted by this rule set.** A human who classifies a session as an operator
 abort and later determines it was a device fault has no path to correct the
-record. That is a deliberate consequence of keeping the transition set minimal,
-not an oversight, but whether it is acceptable is a study-operations question. —
-**OPEN — HUMAN DECISION REQUIRED**
+record. That is a deliberate consequence of keeping the transition set minimal.
+— **DECIDED, CL-002A-APPROVAL (`DECISIONS.md` D19):** forbidden in v1.
+Minimising mutable scientific and operational state is preferred for Study 001,
+and the flexibility is not required to begin. Revisit in a future schema
+revision if experience shows it is genuinely necessary.
 
 ### 5.1 Sealed outcome versus effective outcome
 
@@ -352,7 +369,7 @@ outcome at `COMPLETED`.
 
 ## 6. Registry design
 
-**PROPOSED.** SQLite (`sqlite3`, Python standard library — **no new
+**APPROVED.** SQLite (`sqlite3`, Python standard library — **no new
 dependency**), WAL mode, at `data/registry.sqlite`. **Fully derived.**
 
 Rejected: DuckDB — an analytical engine, not an operational state store, and it
@@ -416,7 +433,7 @@ registry.
 
 ## 7. Metadata contract
 
-**PROPOSED.** Q4 answer. Facts are split by **when they become known**, which is
+**APPROVED.** Q4 answer. Facts are split by **when they become known**, which is
 what makes "immutable after allocation" achievable without placeholders.
 
 ### 7.1 `allocation.json` — immutable after allocation
@@ -490,7 +507,7 @@ outcome, which Codex correctly identified as a permanent conflicting truth
 
 ## 8. Stream descriptor
 
-**PROPOSED.** Sealed at stream open, hashed, and referenced by every chunk.
+**APPROVED.** Sealed at stream open, hashed, and referenced by every chunk.
 
 ```json
 {
@@ -555,19 +572,19 @@ cannot contaminate the common contract.
 
 **A mid-session configuration change opens a NEW stream**
 (`polar.ecg#2`) with its own descriptor; the previous stream closes with
-`close_status = RECONFIGURED`. Streams are never blended. — PROPOSED
+`close_status = RECONFIGURED`. Streams are never blended. — APPROVED
 
 ---
 
 ## 9. Raw sample/packet model
 
-**PROPOSED.** Q2 and the packet-vs-sample question.
+**APPROVED.** Q2 and the packet-vs-sample question.
 
 ### 9.1 Three artifacts per chunk, one commit
 
 ### 9.0 What "canonical raw" means
 
-**PROPOSED.** Canonical raw is:
+**APPROVED.** Canonical raw is:
 
 > the **lowest-level representation actually observed at our acquisition
 > boundary**, preserved without scientific transformation by our code.
@@ -760,7 +777,7 @@ acquisition truth.
 
 ### 9.3 `observations/NNNNNN.arrow` — device times and counters
 
-**PROPOSED, and this is the single most important correction in this document.**
+**APPROVED, and this is the single most important correction in this document.**
 
 The first draft had fixed columns: one `device_timestamp`, one
 `device_packet_counter`, one `device_sample_counter`. Codex classified that
@@ -816,7 +833,7 @@ regardless of what the device counters do.
 
 ## 10. Timing representation
 
-**PROPOSED.** No threshold is proposed. `docs/TIMING.md` freezes none, and this
+**APPROVED.** No threshold is proposed. `docs/TIMING.md` freezes none, and this
 document freezes none either.
 
 ### 10.1 Where each quantity lives
@@ -886,7 +903,7 @@ host-observed order. If no counter exists, loss detection is reported as
 
 ## 11. Event model
 
-**PROPOSED.** Q5 answer.
+**APPROVED.** Q5 answer.
 
 **The boundary:** `raw/` records what the **devices** sent. `events/` records
 what the **system and the operator** did.
@@ -947,7 +964,7 @@ repository (Codex finding F12).
 
 ## 12. Crash-safe writing
 
-**PROPOSED.** One workstation. No distributed durability.
+**APPROVED.** One workstation. No distributed durability.
 
 ### 12.1 Allocation order — why no orphan can exist
 
@@ -1067,7 +1084,7 @@ decision.
 
 ### 12.2.1 Integer representation in JSON — `int64_decimal` and `uint64_decimal`
 
-**PROPOSED, and it is a correctness requirement, not a style preference.**
+**APPROVED, and it is a correctness requirement, not a style preference.**
 
 RFC 8785 constrains JSON Numbers to values exactly representable as IEEE-754
 doubles. Integers are therefore interoperably exact only within
@@ -1214,7 +1231,7 @@ in-flight data a crash can cost, and nothing else. Recorded in
 
 `ENOSPC` on any raw write must: abort the in-flight chunk, refuse to write a
 commit record, append a `TECHNICAL_ERROR` event and a `FINALIZING` transition,
-and close. It must never produce a truncated-but-committed chunk. — PROPOSED,
+and close. It must never produce a truncated-but-committed chunk. — APPROVED,
 and an explicit CL-002B acceptance test (§24).
 
 **A known fatal writer error closes as `TECHNICAL_FAILURE`, not
@@ -1231,7 +1248,7 @@ away a fact the system actually had.
 
 ## 13. Manifest contract
 
-**PROPOSED.** Written exactly once, at finalization, via tmp + fsync + rename +
+**APPROVED.** Written exactly once, at finalization, via tmp + fsync + rename +
 fsync(dir). Before finalization it **does not exist**, and its absence is the
 primary signal that a session was not cleanly closed.
 
@@ -1280,7 +1297,7 @@ contradiction Codex found in the first draft (finding F2), where
 
 ## 14. Checksums and finalization
 
-**PROPOSED.**
+**APPROVED.**
 
 ```text
 1. seal every open chunk, or leave it .part and record the fact
@@ -1357,7 +1374,7 @@ that read only the sealed prefix.
 
 ### 14.1 What may change after sealing — the complete list
 
-**PROPOSED.** This is the authoritative list. Any other statement in this
+**APPROVED.** This is the authoritative list. Any other statement in this
 document that appears to permit post-seal mutation is wrong and defers to this
 one.
 
@@ -1406,7 +1423,7 @@ mutability is the normal state of a cache.
 
 ## 15. Raw versus derived contract
 
-**PROPOSED.**
+**APPROVED.**
 
 - `data/sessions/<id>/raw/**` — immutable. Written once, never reopened.
 - `data/derived/<session_id>/<artifact_id>/` — **outside the sealed package**.
@@ -1442,7 +1459,7 @@ closed (finding G6).
 
 ## 16. Replay contract
 
-**PROPOSED.**
+**APPROVED.**
 
 Replay is exposed at the **storage/analysis boundary**, not by impersonating a
 device adapter. Impersonation is what makes a replay indistinguishable from a
@@ -1473,7 +1490,7 @@ and re-creatable.
 
 ## 17. Schema versioning and evolution
 
-**PROPOSED.**
+**APPROVED.**
 
 - `schema_version: "MAJOR.MINOR"` in `allocation.json` — written at allocation,
   so even a crashed, unfinalized package declares its version — and repeated in
@@ -1496,7 +1513,7 @@ and re-creatable.
 
 ## 18. Participant pseudonym strategy
 
-**PROPOSED.** Q7 answer.
+**APPROVED.** Q7 answer.
 
 - `participant_pseudonym` is **generated**, and validated against
   `^P[0-9]{3,6}$` at allocation. A free-form string is refused. An opaque-string
@@ -1521,7 +1538,7 @@ and re-creatable.
 
 ## 19. Recovery scenarios
 
-**PROPOSED.** Every row was simulated by an independent reviewer in Pass 2.
+**APPROVED.** Every row was simulated by an independent reviewer in Pass 2.
 
 | # | Scenario | On disk | Trustworthy | Never infer | Recovery |
 |---|---|---|---|---|---|
@@ -1567,14 +1584,14 @@ which is the intended design, not a gap (`docs/SAFETY.md`).
 
 | Q | Question (`docs/SESSION_FORMAT.md`) | Proposal | Label |
 |---|---|---|---|
-| Q1 | Container format | Directory per session | **PROPOSED** |
-| Q2 | Serialisation | Arrow IPC stream (raw chunks), length-prefixed binary (transport payloads, when available), JSONL (events, lifecycle, annotations, chunk index), JSON canonicalized per RFC 8785 where hashed (allocation/run/descriptor/manifest), SQLite (registry), Parquet (derived only) | **PROPOSED** |
-| Q3 | Session identifier | UUIDv4, opaque, no embedded time; uniqueness via `os.mkdir` | **PROPOSED** |
-| Q4 | Metadata set | Split by when known: `allocation.json` / `run.json` / `descriptor.json`; one authority per question (§7.3) | **PROPOSED** |
-| Q5 | Event and marker representation | One `events/events.jsonl`; devices in `raw/`, meaning in events, joined by `raw_ref`; per-schema versioning; schemas snapshotted into the package | **PROPOSED** |
-| Q6 | Partial and failed sessions | Same structural shape plus `closure_condition` + `recording_outcome`; absence of a manifest pair is the signal; recovery never guesses | **PROPOSED** |
-| Q7 | Participant linkage | Generated `^P[0-9]{3,6}$` pseudonym; mapping outside `data/`; device aliases, never serials | **PROPOSED** |
-| Q8 | Storage and retention | Canonical unit = the `sessions/<id>/` directory; backup moves packages (registry is rebuildable); derived is regenerable. **Retention period, offsite location and backup cadence remain undecided.** | **PROPOSED** / **OPEN — HUMAN DECISION REQUIRED** |
+| Q1 | Container format | Directory per session | **APPROVED** |
+| Q2 | Serialisation | Arrow IPC stream (raw chunks), length-prefixed binary (transport payloads, when available), JSONL (events, lifecycle, annotations, chunk index), JSON canonicalized per RFC 8785 where hashed (allocation/run/descriptor/manifest), SQLite (registry), Parquet (derived only) | **APPROVED** |
+| Q3 | Session identifier | UUIDv4, opaque, no embedded time; uniqueness via `os.mkdir` | **APPROVED** |
+| Q4 | Metadata set | Split by when known: `allocation.json` / `run.json` / `descriptor.json`; one authority per question (§7.3) | **APPROVED** |
+| Q5 | Event and marker representation | One `events/events.jsonl`; devices in `raw/`, meaning in events, joined by `raw_ref`; per-schema versioning; schemas snapshotted into the package | **APPROVED** |
+| Q6 | Partial and failed sessions | Same structural shape plus `closure_condition` + `recording_outcome`; absence of a manifest pair is the signal; recovery never guesses | **APPROVED** |
+| Q7 | Participant linkage | Generated `^P[0-9]{3,6}$` pseudonym; mapping outside `data/`; device aliases, never serials | **APPROVED** |
+| Q8 | Storage and retention | Canonical unit = the `sessions/<id>/` directory; backup moves packages (registry is rebuildable); derived is regenerable. **Retention period, offsite location and backup cadence remain undecided.** | **APPROVED** / **OPEN — HUMAN DECISION REQUIRED** |
 
 ---
 
@@ -1624,36 +1641,41 @@ which is the intended design, not a gap (`docs/SAFETY.md`).
    EEG counts as complete.
 5. **Whether `UNCLASSIFIED` sessions block analysis** or are simply excluded
    with a recorded reason.
-6. **Whether lateral reclassification `ABORTED` <-> `TECHNICAL_FAILURE` should
-   be permitted.** The four-transition rule in §5 forbids it, which means a
-   mis-classified session cannot be corrected sideways. Allowing it would widen
-   the annotation surface; forbidding it loses a legitimate correction. A study
-   decision, not an engineering one.
-7. **The annotation tampering threat model.** `annotations.head.json` defeats
+6. **The annotation tampering threat model.** `annotations.head.json` defeats
    accidental loss, truncation and single-file tampering, but not an actor who
    rewrites both files consistently. Whether that matters here — and whether it
    justifies append-only media or signatures — is a study-operations call.
 
-> **Removed as an open question in CL-002A-R2:** *"whether transport payload
-> capture may be disabled when the bytes are available."* For Session Package v1
-> the answer is **no**, fixed by the §9.1 invariant. A future schema revision may
-> revisit it; it is not an open question today.
+> **Closed in CL-002A-R2:** *"whether transport payload capture may be disabled
+> when the bytes are available."* For Session Package v1 the answer is **no**,
+> fixed by the §9.1 invariant.
+>
+> **Closed in CL-002A-APPROVAL (`DECISIONS.md` D19):** *"whether lateral
+> reclassification `ABORTED` <-> `TECHNICAL_FAILURE` should be permitted."* For
+> Session Package v1 the answer is **no** — the annotation model stays
+> downgrade-only with exactly the four transitions in §5. A mis-classified
+> session therefore cannot be corrected sideways, and that cost is accepted
+> knowingly in favour of minimising mutable scientific state. A future schema
+> revision may revisit it.
+>
+> Both are recorded here rather than deleted, so a reader can see that the
+> question was asked and answered rather than overlooked.
 
 ### OPEN — HARDWARE VALIDATION REQUIRED
 
-8. **Which timing quantities each device actually exposes** — one device time or
+7. **Which timing quantities each device actually exposes** — one device time or
    several, per packet or per sample, and what each refers to.
-9. **Counter widths and wrap behaviour** for Muse and Polar.
-10. **What `applies_to` is true** for each device time (`sample_acquisition` vs
+8. **Counter widths and wrap behaviour** for Muse and Polar.
+9. **What `applies_to` is true** for each device time (`sample_acquisition` vs
    `packet_assembly` vs `transmission`). Every observation currently records
    `unknown`.
-11. **Whether BrainFlow's timestamp is device-provided or host-synthesized.**
+10. **Whether BrainFlow's timestamp is device-provided or host-synthesized.**
     This determines whether it is `device_provided` or `library_provided`, and
     the schema records both possibilities rather than assuming.
-12. **Actual sustained sample rates** under BLE with two peripherals connected.
-13. **QT Py serial round-trip latency and jitter**, which bounds how precisely a
+11. **Actual sustained sample rates** under BLE with two peripherals connected.
+12. **QT Py serial round-trip latency and jitter**, which bounds how precisely a
     marker can be placed on a common timeline.
-14. **The Muse S Athena acquisition backend and its available
+13. **The Muse S Athena acquisition backend and its available
     `raw_capture_level`.** Whether BrainFlow exposes the BLE notification
     payloads or only decoded board data; whether a direct-BLE or
     OpenMuse-style route is viable; packet stability; and how much timing is
@@ -1667,10 +1689,10 @@ preserves the raw information needed to answer all of them later.
 
 ### DEFERRED SAFELY
 
-15. Compression codec for Arrow chunks (LZ4 vs ZSTD vs none) — a per-chunk
+14. Compression codec for Arrow chunks (LZ4 vs ZSTD vs none) — a per-chunk
     property, changeable without a schema change.
-16. Registry indexes and query surface — derived, rebuildable at will.
-17. Any CLI ergonomics.
+15. Registry indexes and query surface — derived, rebuildable at will.
+16. Any CLI ergonomics.
 
 ---
 

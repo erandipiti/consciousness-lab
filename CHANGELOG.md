@@ -9,6 +9,50 @@ Versioning policy is unresolved — see `docs/OPERATIONS.md`.
 
 ## [Unreleased]
 
+### Approved — CL-002A-APPROVAL: Session Package v1 frozen (documentation only)
+
+**Session Package v1 received human approval.** The design from CL-002A,
+corrected by CL-002A-R1 and CL-002A-R2, is now authoritative for Study 001.
+
+**Approved design baseline:** `c5e6a9e712cd4a214162bec57d99ea89c33b01e4`
+
+- `docs/DECISIONS.md` now contains the **authoritative decision index**, D8–D26:
+  package-as-authority, UUIDv4 identity, Arrow IPC immutable chunks,
+  packet/sample/observation separation, timing provenance, raw capture levels
+  and the v1 preservation invariant, acquisition provenance, the derived SQLite
+  registry, the three-field lifecycle, sealed versus effective outcome, the
+  `COMPLETED` creation rule, annotation integrity, the finalization marker, the
+  eight-condition predicate (bound by reference, not duplicated), post-seal
+  mutability, RFC 8785, exact integer semantics, and the participant / device /
+  derived / replay / event records. D4 ("No schema at CL-001") is marked
+  **superseded**, not deleted.
+- `docs/SESSION_FORMAT.md` no longer presents Q1–Q8 as unresolved. It now
+  summarises the approved answers and points to the authoritative
+  specification, and keeps R1–R7 with a note that R3 gained the sealed/effective
+  distinction.
+- `docs/SESSION_SCHEMA_PROPOSAL.md` is marked **APPROVED FOR IMPLEMENTATION**,
+  with the explicit rule that a future implementation discrepancy is a bug
+  unless a later decision record supersedes it. The §25 review trace is
+  preserved deliberately.
+- **Lateral `ABORTED` <-> `TECHNICAL_FAILURE` reclassification is explicitly
+  rejected for schema v1** (D19). The annotation model stays downgrade-only with
+  exactly four permitted transitions. A mis-classified session cannot be
+  corrected sideways; that cost is accepted in favour of minimising mutable
+  scientific state, and may be revisited in a future schema revision.
+- **CL-002B is now unblocked.**
+
+### Notes
+
+- **No production code was written.** No model, writer, registry, adapter,
+  canonicalization helper or test was created; those are CL-002B.
+- No scientific threshold, band definition, duration or state definition was
+  changed or introduced. No timing threshold was frozen.
+- No hardware assumption was promoted from assumed to verified. Every device
+  claim still reads `assumed` / `unverified`.
+- Protocol and hardware-validation questions remain explicitly open, listed in
+  `DECISIONS.md` ("Awaiting a named human") and `SESSION_FORMAT.md`
+  ("Still open").
+
 ### Changed — CL-002A-R2: numeric exactness and final schema invariants (documentation only)
 
 Three narrow corrections to `docs/SESSION_SCHEMA_PROPOSAL.md`. No architecture
