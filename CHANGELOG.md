@@ -9,6 +9,65 @@ Versioning policy is unresolved — see `docs/OPERATIONS.md`.
 
 ## [Unreleased]
 
+### Changed — CL-002A-R2: numeric exactness and final schema invariants (documentation only)
+
+Three narrow corrections to `docs/SESSION_SCHEMA_PROPOSAL.md`. No architecture
+reopened, no code.
+
+- **Integer exactness in JSON.** RFC 8785 constrains JSON Numbers to IEEE-754
+  doubles, so integers are interoperably exact only within ±(2^53 − 1). Our UTC
+  nanosecond timestamps sit near 1.8e18 — about 200x beyond that — and a
+  conforming parser silently rounds `1787923530123456789` to
+  `…456768`. New §12.2.1 defines the logical types **`int64_decimal`** and
+  **`uint64_decimal`**: any field whose *declared domain* is int64/uint64 is a
+  canonical decimal **string** in JSON, with exact grammars (no leading `+`, no
+  leading zeros, no `-0`, no decimal point, no exponent, no whitespace) and a
+  ban on transiting a float. Applies to every JSON/JSONL document in the
+  package, not only hashed ones. Deliberately-bounded fields (channel index,
+  schema versions, writer config) stay JSON Numbers, and the rule is symmetric.
+  **Arrow is unaffected** — raw tables keep native int64/uint64.
+  All 13 affected JSON examples in the document were converted.
+- **Raw capture invariant.** `raw_capture_level = "transport_payload"` now holds
+  **iff** `transport_payload_preserved = true`; `library_decoded` and
+  `synthetic` both imply `false`. The "unless a human decision disables it"
+  escape is removed for v1: if transport bytes cross our acquisition boundary
+  they MUST be preserved. That escape had permitted
+  `transport_payload` + `false`, a state in which two reasonable implementers
+  would disagree about whether a payload artifact must exist. Chunk shape is now
+  a per-level table with exactly one valid shape each.
+- **Post-seal mutability.** New §14.1 is the single authoritative list. Inside
+  the sealed package exactly three objects may change: `annotations.jsonl`
+  (append-only), `annotations.head.json` (atomic replace) and `logs/`.
+  Everything else is immutable, listed explicitly. `registry.sqlite` and
+  `data/derived/` are mutable but live *outside* the package, and the document
+  now distinguishes those two senses of "mutable".
+
+### Fixed
+
+- **Finalization now writes `annotations.head.json`** (step 6 of §14),
+  initialised to zero records and excluded from manifest inventory. R1 made a
+  missing head file mean INDETERMINATE but never specified writing one, so as
+  written **every cleanly finalized session would have failed the completion
+  predicate**. Found by the R2 review; regression tests M3 and M4.
+- The chunk write sequence no longer writes `payloads/*.part` unconditionally —
+  it is now explicitly conditional on `raw_capture_level = "transport_payload"`,
+  matching the R2-2 invariant.
+- §5.1 no longer calls `annotations.head.json` "the one file in the package"
+  mutable after sealing, which contradicted the §14.1 list of three.
+
+### Removed
+
+- The open question *"whether transport payload capture may be disabled when
+  bytes are available"*. For Session Package v1 the answer is **no**, fixed by
+  the §9.1 invariant. Revisiting it needs a future major schema version.
+
+### Notes
+
+- **No code was written.** CL-002B is not started.
+- `docs/DECISIONS.md` remains unchanged; the proposal is still **PROPOSED**.
+- No scientific threshold was changed; no hardware assumption was promoted to
+  verified.
+
 ### Changed — CL-002A-R1: final schema corrections (documentation only)
 
 Three corrections to `docs/SESSION_SCHEMA_PROPOSAL.md` before the design is put

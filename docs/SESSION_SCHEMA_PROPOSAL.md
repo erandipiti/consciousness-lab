@@ -112,7 +112,7 @@ data/
     lifecycle.jsonl                       # append-only; SEALED at finalization
     annotations.jsonl                     # post-seal, hash-chained, downgrade-only
     annotations.head.json                 # expected length/count/head hash of the above;
-                                          #   the only file legitimately mutable after sealing
+                                          #   mutable after sealing (see 14.1)
     events/
       events.jsonl                        # sealed before the manifest
     schemas/
@@ -283,13 +283,18 @@ human's downgrade.
 So finalization writes `annotations.head.json` as part of sealing:
 
 ```json
-{ "bytes": 0, "record_count": 0, "head_record_sha256": null }
+{ "bytes": "0", "record_count": "0", "head_record_sha256": null }
 ```
 
 and every annotation append updates it atomically (tmp -> fsync -> rename ->
-fsync(dir)) **after** the append lands. It is the one file in the package that
-is legitimately mutable after sealing, and it exists solely so that the
-*expected* length and head of the chain are recorded outside the chain itself.
+fsync(dir)) **after** the append lands. It is **one of the three objects §14.1
+permits to change after sealing**, and the only one replaced atomically as a
+whole file rather than appended to. It exists solely so that the *expected*
+length and head of the chain are recorded outside the chain itself.
+
+**Finalization always writes it**, initialised to zero records, whether or not
+an annotation is ever added — see step 6 of §14. A finalized package that lacks
+it has been tampered with or damaged.
 
 ```text
 0. if annotations.head.json is absent:
@@ -422,8 +427,8 @@ what makes "immutable after allocation" achievable without placeholders.
   "schema_version": "1.0",
   "session_id": "9f2c1e40-6b3a-4d51-8e77-0a1b2c3d4e5f",
   "allocated_at": {
-    "utc_ns": 1787923530123456789,
-    "monotonic_ns": 884413221000,
+    "utc_ns": "1787923530123456789",
+    "monotonic_ns": "884413221000",
     "host_clock_id": "CLOCK_REALTIME",
     "monotonic_clock_id": "CLOCK_MONOTONIC",
     "utc_quality": "unknown"
@@ -449,7 +454,7 @@ adapter and SDK versions, host BLE adapter identity, the declared
 
 ```json
 {
-  "sealed_at": { "utc_ns": …, "monotonic_ns": … },
+  "sealed_at": { "utc_ns": "…", "monotonic_ns": "…" },
   "required_streams": ["muse.eeg", "polar.ecg"],
   "optional_streams": ["muse.imu", "qtpy.marker"],
   "devices": [
@@ -460,7 +465,7 @@ adapter and SDK versions, host BLE adapter identity, the declared
   "writer_config": {
     "chunk_max_seconds": 30, "chunk_max_rows": 100000,
     "clock_snapshot_interval_seconds": 60,
-    "note": "Writer configuration only. NOT analysis epoching and NOT a scientific parameter."
+    "note": "Writer configuration only. NOT analysis epoching and NOT a scientific parameter. These stay JSON Numbers: declared domain is bounded int32 (see 12.2.1)."
   }
 }
 ```
@@ -575,7 +580,7 @@ Every raw stream therefore declares a **`raw_capture_level`**:
 
 | Level | Meaning | Canonical raw is |
 |---|---|---|
-| `transport_payload` | We received the device/transport bytes before any scientific decoding | The transport bytes |
+| `transport_payload` | We received the device/transport bytes before any scientific decoding | The transport bytes — and in v1 they **must** be preserved (§9.1) |
 | `library_decoded` | An external acquisition library decoded or transformed the transport payload before our recorder saw anything | The library's decoded representation, **with reduced provenance** |
 | `synthetic` | We generated the stream; there is no device and no transport | The generated values, plus the generator seed |
 
@@ -647,21 +652,59 @@ reader seeking to `offset` must find `magic`; if it does not, the reference is
 broken and the reader fails closed rather than returning whatever bytes are
 there.
 
-**The capture rule, stated precisely:**
+**The capture rule for Session Package v1, stated as an invariant:**
 
-> **If transport payloads are exposed to our acquisition code, preserving them
-> is mandatory**, unless a named human decision recorded in `docs/DECISIONS.md`
-> explicitly disables it.
+> **If transport payload bytes cross our acquisition boundary, they MUST be
+> preserved.** There is no human-disable exception in v1.
 >
 > **If the upstream library never exposes them, we record
 > `transport_payload_preserved: false` and `raw_capture_level:
 > "library_decoded"`, and we never fabricate or reconstruct fake transport
 > bytes.**
 
-An earlier draft said payload capture was unconditionally mandatory. That was
-not implementable: it would force a BrainFlow-backed adapter either to fail, or
-to synthesize bytes it never saw — and a synthesized payload log is strictly
-worse than an honest absence, because it looks like ground truth.
+#### The v1 invariant table
+
+| `raw_capture_level` | `transport_payload_preserved` | `payloads/` artifact | `packets.payload_ref` |
+|---|---|---|---|
+| `transport_payload` | **must be `true`** | **must exist** for every committed chunk | **non-null** for every packet decoded from transport bytes |
+| `library_decoded` | **must be `false`** | must **not** exist | **must be null** |
+| `synthetic` | **must be `false`** | must **not** exist | **must be null** |
+
+Formally, for schema version 1:
+
+```text
+raw_capture_level == "transport_payload"  IFF  transport_payload_preserved == true
+raw_capture_level == "library_decoded"     =>  transport_payload_preserved == false
+raw_capture_level == "synthetic"           =>  transport_payload_preserved == false
+```
+
+**`transport_payload` with `transport_payload_preserved: false` is not a valid
+state and must fail model validation.** An earlier draft permitted it via a
+"unless a human disables it" escape, which left two reasonable CL-002B
+implementers free to disagree about whether a payload artifact must exist for
+that stream — one treating `raw_capture_level` as the contract, the other
+treating `transport_payload_preserved`. The descriptor must determine the chunk
+shape unambiguously, so the two fields are locked together and the exception is
+removed.
+
+`transport_payload_preserved` is consequently **redundant with**
+`raw_capture_level` in v1. It is kept anyway, as an explicit, greppable
+assertion that a reader can check without knowing the enum's semantics — and
+because a future schema version that reintroduces the distinction would need the
+field to exist. Any disagreement between the two is a validation failure, not a
+degree of freedom.
+
+If the invariant later proves operationally unacceptable, relaxing it requires
+an explicit future schema decision and a **major** version bump. That
+hypothetical is not solved today.
+
+An earlier draft went the other way and said payload capture was
+*unconditionally* mandatory at all capture levels. That was not implementable:
+it would force a BrainFlow-backed adapter either to fail, or to synthesize bytes
+it never saw — and a synthesized payload log is strictly worse than an honest
+absence, because it looks like ground truth. The invariant above keeps the
+mandate exactly where it is implementable: at the boundary the bytes actually
+cross.
 
 Where payloads *are* available, preserving them remains the most conservative
 decision in the design, and the repository's own state justifies it: no decoder
@@ -681,7 +724,7 @@ cost is low.
 | `host_arrival_monotonic_clock_id` | string | no | which OS clock produced the monotonic value |
 | `host_arrival_utc_clock_id` | string | no | which OS clock produced the UTC value |
 | `n_samples` | int32 | no | samples carried in this packet |
-| `payload_ref` | struct{file,offset,length} | **yes** | exact bytes this row was decoded from. **Non-null iff `transport_payload_preserved = true`; otherwise null.** A fabricated pointer is never written |
+| `payload_ref` | struct{file,offset,length} | **yes** | exact bytes this row was decoded from. **Non-null iff `raw_capture_level = "transport_payload"`** (equivalently, iff `transport_payload_preserved = true` — §9.1 locks the two together); null otherwise. A fabricated pointer is never written. `offset` and `length` are `uint64` in Arrow, and `uint64_decimal` wherever this struct appears in JSON |
 | `decode_status` | string | no | `ok` \| `partial` \| `failed` |
 
 Note there is **no device timestamp column and no counter column here** — see
@@ -809,7 +852,7 @@ whatsoever; chunk boundaries must never be readable as epoch boundaries.
 
 ```json
 { "event_name": "CLOCK_SNAPSHOT", "payload_schema": "clock_snapshot.v1",
-  "payload": { "monotonic_ns": …, "utc_ns": …,
+  "payload": { "monotonic_ns": "…", "utc_ns": "…",
                "monotonic_clock_id": "CLOCK_MONOTONIC", "utc_clock_id": "CLOCK_REALTIME",
                "sync_source": "unknown", "sync_status": "unknown", "utc_quality": "unknown" } }
 ```
@@ -865,16 +908,19 @@ writer gives total host-observed order for free; per-stream event logs would mak
 cross-stream ordering a reconstruction problem.
 
 ```json
-{ "event_seq": 42,
+{ "event_seq": "42",
   "event_name": "BLOCK_START",
   "payload_schema": "block_start.v1",
   "origin": "protocol",
-  "host_arrival_monotonic_ns": 884413221000,
-  "host_arrival_utc_ns": 1787923530123456789,
+  "host_arrival_monotonic_ns": "884413221000",
+  "host_arrival_utc_ns": "1787923530123456789",
   "host_arrival_monotonic_clock_id": "CLOCK_MONOTONIC",
   "host_arrival_utc_clock_id": "CLOCK_REALTIME",
-  "raw_ref": { "stream_id": "qtpy.marker", "packet_seq": 9912, "sample_index_in_packet": 3 },
+  "raw_ref": { "stream_id": "qtpy.marker", "packet_seq": "9912", "sample_index_in_packet": 3 },
   "payload": { "block_index": 2 } }
+
+`packet_seq` is `int64_decimal`; `sample_index_in_packet` and `block_index` are
+bounded Numbers (§12.2.1).
 ```
 
 | Decision | Answer |
@@ -923,7 +969,10 @@ package. If step 1 or 2 fails, nothing exists and no acquisition can start.
 Per chunk, in this order:
 
 ```text
+# ONLY when raw_capture_level == "transport_payload":
 payloads/NNNNNN.bin.part      -> flush -> fsync(fd) -> close -> rename -> fsync(dir)
+
+# always:
 packets/NNNNNN.arrow.part     -> flush -> fsync(fd) -> close -> rename -> fsync(dir)
 observations/NNNNNN.arrow.part-> flush -> fsync(fd) -> close -> rename -> fsync(dir)
 samples/NNNNNN.arrow.part     -> flush -> fsync(fd) -> close -> rename -> fsync(dir)
@@ -931,23 +980,39 @@ NNNNNN.commit.json.tmp        -> fsync -> rename -> fsync(dir)      # sidecar
 append the same record to chunks.jsonl -> fsync                     # hash chain
 ```
 
+The payload step is **conditional on the capture level and on nothing else**. At
+`library_decoded` and `synthetic` no `payloads/` file is created at all — not an
+empty one, not a placeholder — and the commit record omits the `payloads` entry
+(§9.1). A writer that emits a payload artifact at those levels has violated the
+§9.1 invariant; test P4 exists to catch it.
+
 ```json
-{ "chunk_id": 123, "prev_record_sha256": "…",
-  "payloads":     { "path": "payloads/000123.bin",      "sha256": "…", "bytes": 918273 },
-  "packets":      { "path": "packets/000123.arrow",     "sha256": "…", "bytes": 40112 },
-  "observations": { "path": "observations/000123.arrow","sha256": "…", "bytes": 8104 },
-  "samples":      { "path": "samples/000123.arrow",     "sha256": "…", "bytes": 1508992 },
-  "first_packet_seq": 30000, "last_packet_seq": 30749,
+{ "chunk_id": "123", "prev_record_sha256": "…",
+  "payloads":     { "path": "payloads/000123.bin",      "sha256": "…", "bytes": "918273" },
+  "packets":      { "path": "packets/000123.arrow",     "sha256": "…", "bytes": "40112" },
+  "observations": { "path": "observations/000123.arrow","sha256": "…", "bytes": "8104" },
+  "samples":      { "path": "samples/000123.arrow",     "sha256": "…", "bytes": "1508992" },
+  "first_packet_seq": "30000", "last_packet_seq": "30749",
   "descriptor_sha256": "…", "record_sha256": "…" }
 ```
 
 **`chunks.jsonl` is the authoritative commit log. A chunk is real if and only if
 its record appears there, and its record must name every file the stream
-actually produces** — four when `raw_capture_level = "transport_payload"`, three
-when it is `library_decoded` or `synthetic`, where the `payloads` entry is
-**omitted entirely** rather than written as a null or an empty path.
-`descriptor.acquisition.raw_capture_level` is what tells a reader which shape to
-expect, so a missing `payloads` entry can never be mistaken for a lost file. The `NNNNNN.commit.json` sidecar is a convenience
+actually produces.** The descriptor's `raw_capture_level` determines the
+required shape, and **only one shape is valid for each level**:
+
+| `raw_capture_level` | Required commit-record entries | `payloads` entry |
+|---|---|---|
+| `transport_payload` | `payloads`, `packets`, `observations`, `samples` | **required** |
+| `library_decoded` | `packets`, `observations`, `samples` | **must be absent** |
+| `synthetic` | `packets`, `observations`, `samples` | **must be absent** |
+
+The `payloads` entry is **omitted entirely** at the latter two levels — never
+written as `null`, never as an empty path. Because
+`descriptor.acquisition.raw_capture_level` fixes the expected shape before a
+reader looks at the chunk, an absent `payloads` entry can never be mistaken for
+a lost file, and a *present* one at `library_decoded` is a validation failure
+rather than a curiosity. The `NNNNNN.commit.json` sidecar is a convenience
 copy for recovery tooling and for verifying a single chunk without reading the
 whole index; **a sidecar on its own is not a commit.** A crash after the sidecar
 is renamed but before the `chunks.jsonl` append lands leaves the chunk
@@ -988,18 +1053,126 @@ CL-002B implements or vendors a small, tested JCS helper. **No new dependency is
 mandated**; whether to take one is an implementation-review call, not a schema
 decision.
 
-**Numeric rules for hashed records** — these are constraints on what may be
-written, not on canonicalization:
+**Numeric rules** — constraints on what may be written, not on canonicalization:
 
-- `NaN`, `Infinity` and `-Infinity` are **invalid** in any hashed record and
-  must be rejected at write time. Python's `json` emits them as bare
+- `NaN`, `Infinity` and `-Infinity` are **invalid** in any JSON record and must
+  be rejected at write time. Python's `json` emits them as bare
   `NaN`/`Infinity`, which is not valid JSON at all, so writers must set
   `allow_nan=False` and treat the resulting error as fatal.
 - JCS serializes `-0` as `0`. Negative zero therefore **cannot carry meaning**
-  in a hashed record and must not be used to.
-- Every timing quantity in this design is an integer (nanoseconds, counters,
-  byte offsets). Floating point appears only in `observations.value_f64`, which
-  is a raw device value and is never itself a hashed record field.
+  and must not be used to.
+- Floating point appears in JSON **nowhere in this design**. Every timing
+  quantity is an integer; the only floats in the whole package are Arrow
+  columns (`observations.value_f64`, sample values), which are never JSON.
+
+### 12.2.1 Integer representation in JSON — `int64_decimal` and `uint64_decimal`
+
+**PROPOSED, and it is a correctness requirement, not a style preference.**
+
+RFC 8785 constrains JSON Numbers to values exactly representable as IEEE-754
+doubles. Integers are therefore interoperably exact only within
+
+```text
+-9007199254740991  ..  9007199254740991      (±2^53 − 1)
+```
+
+Our UTC nanosecond timestamps sit around `1.8e18` — roughly **200 times** beyond
+that range. Written as a JSON Number, `1787923530123456789` is not
+representable; a conforming implementation rounds it to `1787923530123456768`,
+and the value is silently wrong by 21 nanoseconds. These numbers participate in
+provenance and in hashes, so losing a single bit is unacceptable.
+
+> **Rule.** Any field whose *declared semantic domain* is `int64` or `uint64`
+> MUST be represented in JSON as a **canonical decimal string**, never as a JSON
+> Number.
+
+```json
+{
+  "utc_ns":        "1787923530123456789",
+  "monotonic_ns":  "884413221000",
+  "byte_offset":   "918273",
+  "record_count":  "42"
+}
+```
+
+**The rule is driven by the declared domain, not by the current value.** A
+counter that happens to read `42` today is still written `"42"` if its domain is
+`uint64`, so that a field's representation never changes merely because a value
+later crosses `2^53`. A representation that shifts under load is a
+representation that breaks readers under load.
+
+**Scope: every JSON and JSONL document in the package**, not only the
+hash-chained ones. The rounding happens in any conforming parser, hashed or not
+— a browser-based or JavaScript reader inspecting `manifest.json` would silently
+corrupt `sealed_len` just as readily.
+
+#### Logical types
+
+The schema declares two logical types, so that an implementation knows from the
+schema alone that a JSON string carries integer semantics:
+
+| Logical type | JSON | Domain |
+|---|---|---|
+| `int64_decimal` | string | −2^63 .. 2^63 − 1 |
+| `uint64_decimal` | string | 0 .. 2^64 − 1 |
+
+**`uint64_decimal` grammar** — ASCII digits only; no leading `+`; no leading
+zeros except the single value `0`; no decimal point; no exponent; no whitespace;
+negative values forbidden.
+
+```text
+valid:    0    1    42    18446744073709551615
+invalid:  01   +1   -1    1.0    1e3    " 1"    "1 "    ""
+```
+
+**`int64_decimal` grammar** — as above, plus an optional leading `-`. `-0` is
+forbidden (it is not a distinct value and would give one integer two spellings,
+which would give one record two hashes).
+
+```text
+valid:    0    1    -1    9223372036854775807    -9223372036854775808
+invalid:  01   -01  +1    -0     1.0    1e3    " 1"    "1 "    ""
+```
+
+Every string is parsed as an exact arbitrary-precision integer and then
+range-checked against its declared domain. **A conforming parser must never
+route an `int64_decimal` or `uint64_decimal` value through a floating-point
+type**, not even transiently.
+
+#### What stays a JSON Number
+
+Fields whose declared domain is deliberately small and bounded stay Numbers,
+because they cannot approach `2^53` by construction:
+
+| Field | Declared domain |
+|---|---|
+| `schema_version` major/minor | already a string (`"1.0"`) |
+| `descriptor_version`, `artifact_schema_version` | bounded `uint16` |
+| `channels[].index` | bounded `int32`, ≤ channel count |
+| `sample_index_in_packet` (in `raw_ref`) | bounded `int32`, ≤ samples per packet |
+| `packet_counter_width_bits`, `samples_per_packet` | bounded `uint16` |
+| `nominal_sample_rate_hz.value` | bounded numeric |
+| `writer_config.*` (`chunk_max_seconds`, `chunk_max_rows`, `clock_snapshot_interval_seconds`) | bounded `int32` |
+| protocol payload fields such as `block_index` | bounded by the protocol |
+
+The declared bound is part of the schema. A field cannot be quietly widened to
+`int64` later while keeping its JSON Number representation; widening the domain
+changes the representation and is therefore a **major** schema version bump
+(§17).
+
+#### Arrow is unaffected
+
+**This rule governs JSON serialization only.** Arrow has exact native 64-bit
+integer types, so raw tables keep them:
+
+```text
+Arrow  :  host_arrival_monotonic_ns   int64          (native, exact)
+JSON   :  "host_arrival_monotonic_ns": "884413221000" (int64_decimal)
+```
+
+Same semantic value, different serialization. `observations.value_i64`,
+`value_u64` and `value_f64` are Arrow columns and stay native — R2 does not
+touch them, and turning them into strings would be a real loss for no gain.
 
 **JSONL files** — `lifecycle.jsonl`, `annotations.jsonl`, `chunks.jsonl`,
 `events/events.jsonl` — carry exactly one canonical record per line, terminated
@@ -1066,15 +1239,15 @@ primary signal that a session was not cleanly closed.
 {
   "schema_name": "session_package", "schema_version": "1.0",
   "session_id": "9f2c1e40-…",
-  "sealed_at": { "utc_ns": …, "monotonic_ns": … },
-  "lifecycle_seal": { "path": "lifecycle.jsonl", "sealed_len": 8421, "sealed_sha256": "…" },
-  "events_seal":    { "path": "events/events.jsonl", "bytes": 20144, "sha256": "…" },
+  "sealed_at": { "utc_ns": "…", "monotonic_ns": "…" },
+  "lifecycle_seal": { "path": "lifecycle.jsonl", "sealed_len": "8421", "sealed_sha256": "…" },
+  "events_seal":    { "path": "events/events.jsonl", "bytes": "20144", "sha256": "…" },
   "streams": [
     { "stream_id": "muse.eeg", "required": true, "close_status": "CLEAN",
-      "descriptor_sha256": "…", "chunk_count": 118,
-      "chunk_chain_head_sha256": "…", "first_packet_seq": 0, "last_packet_seq": 88412 }
+      "descriptor_sha256": "…", "chunk_count": "118",
+      "chunk_chain_head_sha256": "…", "first_packet_seq": "0", "last_packet_seq": "88412" }
   ],
-  "inventory": [ { "path": "allocation.json", "bytes": 812, "sha256": "…" } ],
+  "inventory": [ { "path": "allocation.json", "bytes": "812", "sha256": "…" } ],
   "schemas": [ { "schema_id": "block_start.v1", "path": "schemas/block_start.v1.json", "sha256": "…" } ],
   "scope_note": "logs/, annotations.jsonl, annotations.head.json and data/derived/ are OUTSIDE this manifest by design."
 }
@@ -1116,10 +1289,14 @@ contradiction Codex found in the first draft (finding F2), where
                                                                -> fsync
 4. seal events/events.jsonl (no further writes)                -> fsync
 5. snapshot every schema used into schemas/
-6. sha256 every in-scope file; verify every chunk chain end to end
-7. write manifest.json.tmp -> fsync -> rename -> fsync(dir)
-8. write manifest.sha256.tmp -> fsync -> rename -> fsync(dir)   <-- FINALIZATION marker
-9. registry upsert (derived)
+6. write annotations.head.json.tmp -> fsync -> rename -> fsync(dir)
+      { "bytes": "0", "record_count": "0", "head_record_sha256": null }
+   NOTE: written here, but deliberately NOT in manifest.inventory and NOT
+   hashed into the manifest (13) - it is mutable by design.
+7. sha256 every in-scope file; verify every chunk chain end to end
+8. write manifest.json.tmp -> fsync -> rename -> fsync(dir)
+9. write manifest.sha256.tmp -> fsync -> rename -> fsync(dir)   <-- FINALIZATION marker
+10. registry upsert (derived)
 ```
 
 The **existence of a matching `manifest.json` + `manifest.sha256` pair** is the
@@ -1132,8 +1309,17 @@ It does **not** prove that the recording outcome was `COMPLETED`. A cleanly
 finalized `ABORTED` or `TECHNICAL_FAILURE` session produces an identical, fully
 valid pair. **This document never calls the manifest pair a completion marker.**
 
-Step 8 is the last durable act; a crash anywhere before it leaves a session
-that is, correctly, not finalized.
+Step 9 is the last durable act; a crash anywhere before it leaves a session that
+is, correctly, not finalized.
+
+**Step 6 exists because §5.1 treats a missing `annotations.head.json` as
+tampering.** Every cleanly finalized session must therefore ship one, initialised
+to zero records, whether or not an annotation is ever written; without it every
+clean session would evaluate `INDETERMINATE` and the completion predicate would
+be false for all of them. It is written *before* the manifest is built so a
+finalized package is never missing it, and it is excluded from the inventory
+because it is one of the three objects §14.1 permits to change afterwards —
+hashing it would invalidate `manifest.sha256` on the first annotation.
 
 ### The completion predicate
 
@@ -1169,6 +1355,53 @@ disconnecting while every other condition still held; an operator abort being
 reclassified upward; and a valid human downgrade being invisible to a predicate
 that read only the sealed prefix.
 
+### 14.1 What may change after sealing — the complete list
+
+**PROPOSED.** This is the authoritative list. Any other statement in this
+document that appears to permit post-seal mutation is wrong and defers to this
+one.
+
+**Inside the sealed acquisition package**, exactly three objects may change
+after `manifest.sha256` lands:
+
+| Object | How it changes | Constraint |
+|---|---|---|
+| `annotations.jsonl` | **append only** | Hash-chained; downgrade-only; never rewritten, never truncated |
+| `annotations.head.json` | **atomic whole-file replace** | tmp → fsync → rename → fsync(dir), *after* the append it describes lands |
+| `logs/` | freely | Operational only; **never authoritative**; outside manifest scope |
+
+Neither annotations file is in `manifest.inventory` or any manifest hash (§13),
+which is exactly why appending an annotation does not invalidate
+`manifest.sha256`. `annotations.head.json` is the one file in the package
+written by whole-file replacement rather than append; that is deliberate, and
+§5.1 is what verifies it.
+
+**Immutable after sealing — no exceptions:**
+
+`allocation.json`, `run.json`, every `raw/<stream>/descriptor.json`, the sealed
+prefix of `lifecycle.jsonl`, `events/events.jsonl`, everything under `raw/`
+(payload logs, packet / sample / observation chunks, `chunks.jsonl`, every
+`*.commit.json`), every file under `schemas/`, `manifest.json` and
+`manifest.sha256`.
+
+`lifecycle.jsonl` deserves an explicit note: **the sealed prefix is immutable
+and hash-protected**, and after sealing nothing appends to it at all —
+post-seal classification goes to `annotations.jsonl` instead. That is what
+removed the F2 ordering contradiction, and it is why `lifecycle.jsonl` does not
+appear in the mutable table above.
+
+**Outside the package**, and therefore not package content at all:
+
+| Object | Status |
+|---|---|
+| `data/registry.sqlite` | Fully derived, freely mutable, rebuildable by scanning packages |
+| `data/derived/<session_id>/…` | Regenerable artifacts, added and removed at will |
+
+The distinction matters because "mutable" means two different things on the two
+sides of that line. Inside the package, mutability is a narrowly-scoped,
+verifiable exception carved out of an otherwise sealed unit. Outside it,
+mutability is the normal state of a cache.
+
 ---
 
 ## 15. Raw versus derived contract
@@ -1195,7 +1428,7 @@ verifiable unit; derived output is regenerable.
   "code": { "repo_commit": "…", "dirty": false },
   "environment": { "uv_lock_sha256": "…", "python_version": "3.11.15" },
   "config": { },
-  "generated_at_utc_ns": …,
+  "generated_at_utc_ns": "…",
   "outputs": [ { "path": "psd.parquet", "sha256": "…" } ]
 }
 ```
@@ -1391,14 +1624,20 @@ which is the intended design, not a gap (`docs/SAFETY.md`).
    EEG counts as complete.
 5. **Whether `UNCLASSIFIED` sessions block analysis** or are simply excluded
    with a recorded reason.
-6. **Whether payload capture may ever be disabled** for a device whose transport
-   bytes *are* exposed, and under what evidence. (Where they are not exposed
-   there is nothing to disable — see §9.0.)
-7. **Whether lateral reclassification `ABORTED` <-> `TECHNICAL_FAILURE` should
+6. **Whether lateral reclassification `ABORTED` <-> `TECHNICAL_FAILURE` should
    be permitted.** The four-transition rule in §5 forbids it, which means a
    mis-classified session cannot be corrected sideways. Allowing it would widen
    the annotation surface; forbidding it loses a legitimate correction. A study
    decision, not an engineering one.
+7. **The annotation tampering threat model.** `annotations.head.json` defeats
+   accidental loss, truncation and single-file tampering, but not an actor who
+   rewrites both files consistently. Whether that matters here — and whether it
+   justifies append-only media or signatures — is a study-operations call.
+
+> **Removed as an open question in CL-002A-R2:** *"whether transport payload
+> capture may be disabled when the bytes are available."* For Session Package v1
+> the answer is **no**, fixed by the §9.1 invariant. A future schema revision may
+> revisit it; it is not an open question today.
 
 ### OPEN — HARDWARE VALIDATION REQUIRED
 
@@ -1459,6 +1698,10 @@ Implementation only of what this document specifies, once approved.
    against the RFC's published vectors, plus the `record_sha256` procedure of
    §12.2. Every hashed record in the system depends on it, so it lands before
    anything that writes a hash.
+6b. `int64_decimal` / `uint64_decimal` logical types (§12.2.1): a strict parser
+   and serializer with the exact grammars, domain range checks, and a guarantee
+   that no value transits a floating-point type. Every model field depends on
+   them, so they land before 6a.
 7. `RecoveryScanner` — reports orphans; adopts nothing.
 8. `Registry` — SQLite schema, `rebuild` by scanning packages, and nothing that
    treats the registry as truth.
@@ -1614,6 +1857,61 @@ Additional:
 28. Round trip on a session containing **both** a `transport_payload` stream and
     a `library_decoded` stream — the generic format handles both without
     branching outside the descriptor.
+
+**Integer exactness in JSON (§12.2.1)**
+
+- **J1 — UTC nanoseconds.** `1787923530123456789` survives
+  `int64 -> int64_decimal -> JCS -> parse -> int64` with **exact** equality. The
+  test asserts equality against the integer, not against a float, and fails if
+  the value round-trips as `1787923530123456768`.
+- **J2 — int64 limits.** `-9223372036854775808` and `9223372036854775807`
+  round-trip exactly.
+- **J3 — uint64 maximum.** `18446744073709551615` round-trips exactly.
+- **J4 — invalid representations rejected** where an integer-decimal logical
+  type is expected: `"01"`, `"+1"`, `"-0"`, `"1.0"`, `"1e3"`, `" 1"`, `"1 "`,
+  `""`. Also `"-01"`, a value outside the declared domain, and a bare JSON
+  Number where a decimal string is required.
+- **J5 — hash stability.** Two independent logical constructions of the same
+  int64-valued record (different key insertion order, different code paths)
+  produce **identical JCS bytes and identical SHA-256**.
+- **J6 — no numeric coercion.** Parsing a canonical document never routes an
+  `int64_decimal` / `uint64_decimal` field through IEEE-754. Asserted with a
+  value whose float round trip is detectably lossy, so a hidden float hop
+  cannot pass.
+- **J7 — bounded Numbers stay Numbers.** `channels[].index`,
+  `descriptor_version` and `writer_config.*` remain JSON Numbers, and a decimal
+  string in those positions is rejected. The rule is symmetric: a field's
+  representation is fixed by its declared domain in both directions.
+
+**Raw capture invariant (§9.1)**
+
+- **P1** — `raw_capture_level: "transport_payload"` with
+  `transport_payload_preserved: false` **fails model validation**.
+- **P2** — `transport_payload` + `true` validates.
+- **P3** — a committed `transport_payload` chunk whose payload artifact is
+  missing fails verification.
+- **P4** — a `library_decoded` chunk carrying a payload artifact is invalid: a
+  fabricated transport payload must be caught, not tolerated.
+- **P5** — a `library_decoded` packet with a non-null `payload_ref` is invalid.
+- **P6** — a mixed session validates end to end with
+  `muse.eeg = library_decoded`, `polar.ecg = transport_payload` and
+  `synthetic.x = synthetic`, each stream independently satisfying its own
+  invariant.
+- **P7** — `synthetic` with `transport_payload_preserved: true` is invalid.
+
+**Post-seal mutability (§14.1)**
+
+- **M1** — appending an annotation and updating `annotations.head.json` leaves
+  `manifest.sha256` valid and every inventory hash unchanged.
+- **M2** — modifying any file in the §14.1 immutable list is detected by
+  manifest verification. Parameterised over the whole list, so a file added to
+  the package later cannot quietly escape the check.
+- **M3** — a cleanly finalized session with **zero** annotations still ships
+  `annotations.head.json` with `record_count: "0"`, and `is_completed` is
+  **true**. This is the regression test for RC-R2-3: without step 6 of §14,
+  every clean session would evaluate `INDETERMINATE`.
+- **M4** — `annotations.head.json` is absent from `manifest.inventory`, yet
+  present on disk in every finalized package.
 20. A v1 package read by a reader declaring only v2 support fails closed with an
     explicit unsupported-version error.
 21. An unknown optional field in a v1.1 package is ignored by a v1.0 reader.
@@ -1793,6 +2091,37 @@ corruption rather than deletion. Tests 11f–11k were added for it and for RC-R1
 **No new source-of-truth conflict and no weakened crash consistency** were
 found in the corrections.
 
+### 25.6 CL-002A-R2 — numeric exactness and final invariants
+
+**Reviewer:** OpenAI Codex CLI 0.133.0, `codex exec`, read-only, single pass.
+**Scope: the CL-002A-R2 changes only** — integer representation, the raw-capture
+invariant, and the post-seal mutability list. No architecture reopened.
+
+Three corrections were applied before review:
+
+| # | Problem | Resolution | § |
+|---|---|---|---|
+| R2-1 | JSON examples carried `"utc_ns": 1787923530123456789` as a JSON Number. Under RFC 8785 that is not representable — a conforming parser rounds it to `…456768`, silently wrong by 21 ns, in values that feed provenance and hashes | `int64_decimal` / `uint64_decimal` logical types: declared-int64/uint64 domains are canonical decimal **strings** in JSON, with exact grammars and a ban on transiting a float. Bounded fields stay Numbers. Arrow untouched. 13 examples converted | §12.2.1 |
+| R2-2 | `transport_payload` + `transport_payload_preserved: false` was a reachable state, leaving two implementers free to disagree about whether a payload artifact must exist | v1 invariant: the two fields are locked (`IFF`), the human-disable escape is removed, and chunk shape is a per-level table with exactly one valid shape each | §9.1, §12.2 |
+| R2-3 | The post-seal mutability list predated `annotations.head.json` and was inconsistent with §5.1 | §14.1 is now the single authoritative list: three mutable objects inside the package, everything else immutable and enumerated, with `registry.sqlite` and `data/derived/` explicitly *outside* | §14.1 |
+
+**Verdict: `GO WITH REQUIRED CHANGES`** — three required changes, all applied,
+none rejected.
+
+| RC | Finding | Resolution |
+|---|---|---|
+| RC-R2-1 | §5.1 still called `annotations.head.json` "the one file in the package" mutable after sealing, contradicting §14.1's three | Reworded to "one of the three objects §14.1 permits to change", noting it is the only one replaced atomically rather than appended |
+| RC-R2-2 | The §12.2 chunk write sequence wrote `payloads/*.part` unconditionally, contradicting the R2-2 invariant | Payload step made explicitly conditional on `raw_capture_level = "transport_payload"`, with the no-placeholder rule stated |
+| RC-R2-3 | **§5.1 makes a missing `annotations.head.json` INDETERMINATE, but §14 never wrote one.** Every cleanly finalized session would therefore have failed the completion predicate | Added step 6 to §14: write the zero-record head file before building the manifest, explicitly outside inventory scope. Regression tests M3 and M4 |
+
+RC-R2-3 is the substantive one. It is not a wording problem: as written, the
+R1 design would have made `is_completed` false for **every** session, and the
+defect was introduced by R1's own fix. It is the second time in this review
+sequence that a correction created the bug its own next pass had to find.
+
+**Unresolved after this pass:** none new. The §22 open list lost one item
+(payload capture disable, now answered `no` for v1) and gained none.
+
 ---
 
 ## Appendix A — Special review questions, answered explicitly
@@ -1811,7 +2140,7 @@ found in the corrections.
 | 10 | What must be written before the first sensor connects? | The session directory, `allocation.json`, and an `ALLOCATED` lifecycle record — all fsynced. Acquisition may not start before that | §12.1 |
 | 11 | What must be immutable after allocation? | `allocation.json` in full: session id, schema version, allocation time, protocol identity, participant pseudonym, host, commit, environment | §7.1 |
 | 12 | What becomes immutable only at finalization? | The file inventory and its hashes, the per-stream close statuses, the sealed `lifecycle.jsonl` prefix, and `events/events.jsonl` | §13, §14 |
-| 13 | What may remain mutable operationally? | Only three things: appends to `annotations.jsonl` (downgrade-only), `logs/`, and the entire derived registry | §5, §6 |
+| 13 | What may remain mutable operationally? | **Inside** the sealed package, exactly three: `annotations.jsonl` (append-only, downgrade-only), `annotations.head.json` (atomic replace) and `logs/`. **Outside** it: `registry.sqlite` and everything under `data/derived/`, both fully derived and freely rebuildable | §5.1, §6, §14.1 |
 | 14 | How is the registry prevented from becoming a second conflicting source of truth? | It is fully derived, every row carries `scanned_at_utc_ns`, `rebuild` drops and rescans, and the package is created before the row so no registry-only state can exist | §6, §12.1 |
 | 15 | Can a package be understood with the registry completely lost? | **Yes** for technical and scientific interpretation. **No** for identifying the human participant — by design | §19 |
 | 16 | Can the registry be rebuilt by scanning packages? | **Yes, completely** — a property bought by the allocation ordering, not assumed | §12.1, §19 |
