@@ -9,6 +9,59 @@ Versioning policy is unresolved — see `docs/OPERATIONS.md`.
 
 ## [Unreleased]
 
+### Proposed — CL-002A-R3: Session Package v2 simplification (documentation only)
+
+**Status: PROPOSAL. Not approved.** `DECISIONS.md` is untouched; production code
+and tests are unchanged. Draft decision records D27–D32 await human approval.
+
+**Why the design was reopened.** v1 survived five adversarial review rounds and
+never converged, because each round found a *different* independently falsifiable
+representation of the same fact: manifest ↔ filesystem (R1), sidecar ↔ chain
+(C1), parsed model ↔ canonical bytes and summary ↔ physical rows (C2), byte
+frame / row set / list (C3), Arrow schema and row semantics (C4). That is a
+recursion with no floor, because v1 persists the same fact in several places by
+design. v2 removes the duplicates instead of enforcing them.
+
+**New documents**
+
+- `docs/SESSION_SCHEMA_V2_PROPOSAL.md` — the complete v2 data contract,
+  `schema_version = "2.0"`, specific enough to implement without inventing
+  semantics.
+- `docs/PACKAGE_INTEGRITY_V2.md` — authority by fact, the integrity DAG,
+  physical conformance contracts, and **9** referential relations where v1 needed
+  35.
+- `docs/V1_TO_V2_SIMPLIFICATION.md` — per-representation disposition table with
+  the integrity relations each removal eliminates.
+
+`docs/CHUNK_EQUIVALENCE.md` is marked **SUPERSEDED FOR V2** and kept intact as
+the v1 implementation audit.
+
+**Principal changes proposed**
+
+- Chunk sidecars removed; `chunks.jsonl` is the only persisted commit authority.
+- Artifact paths, artifact byte counts, chunk packet ranges and chunk descriptor
+  hashes removed — all deterministically derivable.
+- `ManifestStream` replaced by a `stream_close_status` map; closure status is the
+  only stream fact with no other on-disk home.
+- `manifest.inventory` narrowed to control files and turned into a **map**, so
+  duplicate paths are structurally impossible; raw artifacts are sealed
+  transitively through the chunk chain, hashed once rather than twice.
+- Hierarchical integrity DAG: manifest seals control files and stream indexes;
+  each index seals its own artifacts.
+- **Added deliberately:** Arrow physical schema conformance and observation row
+  semantics on read, closing C4's G1 and G2. Neither is a relation between two
+  persisted copies.
+- `sparse_long` primary key resolved as
+  `(packet_seq, sample_index_in_packet, channel_id)`, closing the one open
+  specification blocker from C4.
+
+**26 equivalence relations removed, 2 added.** No provenance fact is removed —
+every deletion is a copy or a derivable summary. v1 is not to be used for Study
+001 acquisition; a v2 reader fails closed on v1 and no migration is designed.
+
+No scientific threshold, minimum data rule, hardware assumption or Focus
+semantics was introduced.
+
 ### Fixed — CL-002B-R1-C4: leaf-level integrity closure
 
 Previous Codex verdict: **`NO-GO`**, three confirmed finding groups.

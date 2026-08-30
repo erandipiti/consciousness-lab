@@ -1,5 +1,18 @@
 # CHUNK_EQUIVALENCE — representation equivalence matrix
 
+> ## Session Package v1 implementation audit — SUPERSEDED FOR V2
+>
+> This document audits **Session Package v1** and is kept as historical evidence
+> of the design process: it records how five adversarial review rounds found five
+> different representations of the same fact, which is the argument that produced
+> Session Package v2.
+>
+> **For v2, use [`PACKAGE_INTEGRITY_V2.md`](PACKAGE_INTEGRITY_V2.md)** — 9
+> relations instead of the 35 below, because v2 deletes the duplicates rather
+> than enforcing them.
+>
+> Nothing here is deleted. The v1 matrix remains accurate about v1.
+
 **Status: implementation-integrity map, not a new specification.** It records
 which representations of a committed chunk exist, which one is authoritative for
 each fact, and which relations between them are enforced. It must not, and does
