@@ -18,8 +18,9 @@ approved baseline `c5e6a9e712cd4a214162bec57d99ea89c33b01e4` (CL-002A +
 CL-002A-R1 + CL-002A-R2, human approval in CL-002A-APPROVAL), with its
 implementation audit in [`CHUNK_EQUIVALENCE.md`](CHUNK_EQUIVALENCE.md).
 
-**The implementation in `src/` still writes v1.** It is unchanged by the v2
-approval; CL-002B-R2 is the task that migrates it.
+**The implementation in `src/` writes v2** as of CL-002B-R2. A v2 reader meeting
+a v1 package raises `UnsupportedSessionPackageVersionError` rather than guessing
+(D27); no v1 package is migrated, and none exists.
 
 This document is now a **summary and a pointer**. It does not duplicate the
 schema: where implementation detail is needed, the proposal governs. Its earlier
@@ -108,11 +109,10 @@ information needed to answer them later rather than assuming an answer:
 
 ## What implementation owes this document
 
-**CL-002B-R2 implements [`SESSION_SCHEMA_V2_PROPOSAL.md`](SESSION_SCHEMA_V2_PROPOSAL.md)
+**CL-002B-R2 implemented [`SESSION_SCHEMA_V2_PROPOSAL.md`](SESSION_SCHEMA_V2_PROPOSAL.md)
 as approved and frozen.** A divergence between the implementation and that
 specification is a **bug**, unless a later record in `DECISIONS.md` explicitly
 supersedes it.
 
 CL-002B implemented `SESSION_SCHEMA_PROPOSAL.md` (v1), which D27 superseded. That
-obligation is discharged and historical: `src/` writing v1 today is the known gap
-CL-002B-R2 closes, not a defect against the frozen v2 specification.
+obligation is discharged and historical.

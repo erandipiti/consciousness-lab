@@ -1,4 +1,4 @@
-"""Raw capture level invariant — P1-P7 (spec §9.0, §9.1; D13)."""
+"""Raw capture level invariant — P1-P7 (v2 §13; D13)."""
 
 import pytest
 from pydantic import ValidationError
@@ -47,7 +47,7 @@ def test_p3_missing_payload_artifact_fails_verification(data_root: DataRoot) -> 
     payloads.unlink()
     result = verify_package(built.allocated.paths)
     assert not result.is_completed
-    assert Finding.CHUNK_ARTIFACT_MISSING in result.findings()
+    assert Finding.CHUNK_ARTIFACT_INVALID in result.findings()
 
 
 def test_p4_fabricated_payload_on_a_library_decoded_stream_is_invalid(
@@ -64,19 +64,34 @@ def test_p4_fabricated_payload_on_a_library_decoded_stream_is_invalid(
     forged.write_bytes(b"fabricated")
     result = verify_package(built.allocated.paths)
     assert not result.is_completed
-    assert Finding.ORPHAN_FILE in result.findings()
+    # v2 closes the layout, so the directory itself is the violation: a
+    # ``payloads/`` tree may not exist at all below transport_payload.
+    assert Finding.UNEXPECTED_FILE in result.findings()
 
 
-def test_p5_library_decoded_packets_have_null_payload_ref(data_root: DataRoot) -> None:
+def test_p5_the_packets_schema_is_identical_at_every_capture_level(
+    data_root: DataRoot,
+) -> None:
+    """v2 removed ``payload_ref``, so capture level no longer varies the schema.
+
+    In v1 the packets schema carried a ``payload_ref`` column that had to be
+    non-null iff the level was ``transport_payload`` — a relation that vanished
+    with the column (§5).
+    """
     built = build_session(
         data_root,
-        streams=[SyntheticStreamSpec("synthetic.ecg", RawCaptureLevel.LIBRARY_DECODED)],
-        required=("synthetic.ecg",),
+        streams=[
+            SyntheticStreamSpec("synthetic.eeg", RawCaptureLevel.TRANSPORT_PAYLOAD),
+            SyntheticStreamSpec("synthetic.ecg", RawCaptureLevel.LIBRARY_DECODED),
+        ],
+        required=("synthetic.eeg", "synthetic.ecg"),
     )
-    reader = open_package(built.allocated.paths).stream("synthetic.ecg")
-    refs = [row["payload_ref"] for row in reader.packets()]
-    assert refs and all(ref is None for ref in refs), "no fabricated pointer is written"
-    assert list(reader.payloads()) == [], "and no bytes are invented on read"
+    package = open_package(built.allocated.paths)
+    for stream_id in ("synthetic.eeg", "synthetic.ecg"):
+        rows = list(package.stream(stream_id).packets())
+        assert rows and all("payload_ref" not in row for row in rows)
+    decoded = package.stream("synthetic.ecg")
+    assert list(decoded.payloads()) == [], "no bytes are invented on read"
 
 
 def test_library_decoded_commit_omits_the_payloads_entry(data_root: DataRoot) -> None:
@@ -88,12 +103,17 @@ def test_library_decoded_commit_omits_the_payloads_entry(data_root: DataRoot) ->
     )
     commits, error = read_chunk_index(built.allocated.paths, "synthetic.ecg")
     assert error is None
-    assert commits and all(commit.payloads is None for commit in commits)
+    assert commits and all(not commit.has_payload_artifact for commit in commits)
     raw = built.allocated.paths.stream("synthetic.ecg").chunks_index.read_bytes()
     assert b'"payloads"' not in raw
 
 
-def test_transport_payload_refs_resolve_to_their_exact_bytes(data_root: DataRoot) -> None:
+def test_transport_payloads_resolve_by_frame_identity(data_root: DataRoot) -> None:
+    """Each packet's bytes are found by the ``packet_seq`` its frame carries.
+
+    There is no stored offset or length to trust: the index is derived by
+    walking the file, so there is nothing that can drift out of step with it.
+    """
     built = build_session(data_root)
     reader = open_package(built.allocated.paths).stream("synthetic.eeg")
     packets = list(reader.packets())
@@ -101,7 +121,7 @@ def test_transport_payload_refs_resolve_to_their_exact_bytes(data_root: DataRoot
     assert len(payloads) == len(packets)
     for packet, (packet_seq, blob) in zip(packets, payloads, strict=True):
         assert packet_seq == packet["packet_seq"]
-        assert len(blob) == packet["payload_ref"]["length"]
+        assert blob, "the exact device bytes come back, not a reconstruction"
 
 
 def test_p6_mixed_capture_levels_in_one_session(data_root: DataRoot) -> None:

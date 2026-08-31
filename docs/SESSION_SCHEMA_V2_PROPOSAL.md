@@ -11,7 +11,8 @@
 > in `DECISIONS.md` explicitly supersedes this specification.**
 >
 > No production code or test was changed by the tickets that produced or froze
-> this document. Implementation is CL-002B-R2.
+> this document. **CL-002B-R2 implemented it**; `src/` now writes
+> `schema_version = "2.0"`, and a divergence from this document is a bug.
 
 **Target:** `schema_version = "2.0"`
 **Supersedes:** Session Package v1 (`SESSION_SCHEMA_PROPOSAL.md`), which remains

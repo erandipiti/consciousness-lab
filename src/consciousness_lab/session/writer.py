@@ -2,8 +2,8 @@
 
 This is deliberately synchronous and single-threaded. The generic asynchronous
 multi-stream recorder with fan-in orchestration is **CL-003**, not this ticket.
-What lives here is only enough to exercise Session Package v1 end to end:
-declare streams, commit chunks, record events, finalize.
+What lives here is only enough to exercise Session Package v2 end to end:
+declare streams, commit chunks, record events, close streams durably, finalize.
 """
 
 import contextlib
@@ -20,11 +20,13 @@ from consciousness_lab.session.model import (
     RawRef,
     RecordingOutcome,
     Run,
+    StreamClose,
     StreamCloseStatus,
     StreamDescriptor,
 )
 from consciousness_lab.storage import canonical_json
 from consciousness_lab.storage.checksums import (
+    ImmutableFileError,
     append_line,
     atomic_write_new,
     sha256_bytes,
@@ -114,10 +116,30 @@ def _validate_payload(schema_id: str, payload: dict[str, Any]) -> None:
 
 @dataclass
 class OpenStream:
+    """One stream open for writing.
+
+    ``close_status`` is the *intended* status held in memory; it becomes a fact
+    only when ``close_stream`` writes ``stream_close.json``. Nothing downstream
+    reads this field: the durable file is the sole authority (D33).
+    """
+
     descriptor: StreamDescriptor
     descriptor_sha256: str
     writer: ChunkWriter
     close_status: StreamCloseStatus = StreamCloseStatus.CLEAN
+    closed: bool = False
+
+
+def write_stream_close(path: Path, status: StreamCloseStatus) -> None:
+    """Durably record a stream's terminal closure (v2 §7.1, D33).
+
+    ``tmp -> fsync -> rename -> fsync(dir)``, write-once. A stream that closed
+    earlier already has its file and must not have it rewritten, so this refuses
+    rather than clobbering: two closure records for one stream would be exactly
+    the drifting-copies defect v2 exists to remove.
+    """
+    body = canonical_json.canonicalize(StreamClose(close_status=status).model_dump(mode="json"))
+    atomic_write_new(path, body)
 
 
 @dataclass
@@ -182,7 +204,7 @@ class SessionWriter:
         opened = OpenStream(
             descriptor=descriptor,
             descriptor_sha256=sha256_bytes(body),
-            writer=ChunkWriter(stream_paths, descriptor, sha256_bytes(body)),
+            writer=ChunkWriter(stream_paths, descriptor),
         )
         self.streams[descriptor.stream_id] = opened
         return opened
@@ -217,7 +239,11 @@ class SessionWriter:
             return
         self._failed = True
         if stream_id is not None and stream_id in self.streams:
-            self.streams[stream_id].close_status = StreamCloseStatus.FAILED
+            # Best-effort: the disk that just refused a chunk may refuse this
+            # too. If it does, the stream simply has no durable close record and
+            # recovery reports RECOVERED_UNCLEAN rather than inventing FAILED.
+            with contextlib.suppress(OSError, ImmutableFileError, SealedPackageError):
+                self.close_stream(stream_id, StreamCloseStatus.FAILED)
         with contextlib.suppress(OSError, ValueError, KeyError):
             payload = {"message": message}
             if stream_id:
@@ -236,8 +262,24 @@ class SessionWriter:
             )
 
     def close_stream(self, stream_id: str, status: StreamCloseStatus) -> None:
-        """Record how a stream ended. A non-CLEAN required stream blocks completion."""
-        self.streams[stream_id].close_status = status
+        """Durably record how a stream ended. Write-once (D33).
+
+        The file is the fact. A crash after this point cannot lose the closure,
+        which is the whole reason v2 moved it out of the manifest: terminal
+        closure that lives only in RAM until the final seal is a fact recovery
+        cannot reconstruct.
+        """
+        stream = self.streams[stream_id]
+        if stream.closed:
+            raise SealedPackageError(
+                f"stream {stream_id} already has a durable stream_close.json; it is immutable"
+            )
+        try:
+            write_stream_close(self.paths.stream(stream_id).stream_close, status)
+        except ImmutableFileError as exc:
+            raise SealedPackageError(str(exc)) from exc
+        stream.close_status = status
+        stream.closed = True
 
     def emit_event(
         self,
@@ -281,17 +323,26 @@ class SessionWriter:
             "CLOCK_SNAPSHOT", "clock_snapshot.v1", origin="system", payload=payload
         )
 
-    def snapshot_schemas(self) -> list[tuple[str, Path, bytes]]:
-        """Copy every schema actually used into ``schemas/`` (spec §11).
+    def snapshot_schemas(self, schema_ids: set[str] | None = None) -> list[tuple[str, Path]]:
+        """Copy exactly the referenced schemas into ``schemas/`` (v2 §9.2).
 
         A package must be interpretable years later with no access to this
-        repository, so the schemas travel with it.
+        repository, so the schemas travel with it. The set written is the set
+        the **sealed events log references**, not what this writer happens to
+        remember emitting: the physical ``schemas/`` set must equal that exactly,
+        so no unreferenced snapshot can sit outside the integrity DAG.
         """
-        out: list[tuple[str, Path, bytes]] = []
-        for schema_id in sorted(self._used_schemas):
+        wanted = sorted(self._used_schemas if schema_ids is None else schema_ids)
+        out: list[tuple[str, Path]] = []
+        for schema_id in wanted:
+            if schema_id not in EVENT_SCHEMAS:
+                raise KeyError(
+                    f"the sealed events log references schema {schema_id!r}, which this "
+                    "writer cannot snapshot"
+                )
             body = canonical_json.canonicalize(EVENT_SCHEMAS[schema_id])
             target = self.paths.schemas / f"{schema_id}.json"
             if not target.exists():
                 atomic_write_new(target, body)
-            out.append((schema_id, target, body))
+            out.append((schema_id, target))
         return out

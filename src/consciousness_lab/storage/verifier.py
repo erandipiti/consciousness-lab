@@ -1,9 +1,25 @@
-"""Package verification and the completion predicate (spec §14; D21, D22).
+"""Package verification and the completion predicate (v2 §9; D21, D22, D30).
 
 One predicate, eight conditions, evaluating the **effective** outcome. There is
-deliberately only one definition of completion in this codebase: a second,
-subtly different one is exactly the failure five review passes were spent
-eliminating.
+deliberately only one definition of completion in this codebase.
+
+The referential relations enforced here are V01-V14 of `PACKAGE_INTEGRITY_V2.md`:
+
+    V01 chain: prev_record_sha256 == SHA-256 of the previous record's canonical bytes
+    V02 chunk_id strictly increases along the chain
+    V03 every committed artifact exists at its deterministic path and hashes right
+    V04 no raw artifact exists that no commit references
+    V05 artifact_sha256 key set matches the capture level
+    V06 packet_seq strictly increasing within a chunk and across the chain
+    V07 sample/observation references, dense key identity, sparse triple uniqueness
+    V08 frame packet_seq multiset == packets packet_seq multiset
+    V09 physical streams declared in run.json; each has a valid stream_close.json;
+        every required id is present and CLEAN
+    V10 control_sha256 key set equals the derived expected set, both directions
+    V11 every JSONL record is one complete canonical object plus one newline
+    V12 every canonical document is canonical ON DISK, byte for byte
+    V13 no immutable file outside the defined layout; schemas/ == referenced ids
+    V14 lifecycle and events records verify their own record_sha256 (pre-seal layer)
 
 Verification fails closed and reports *why*, as a list of structured findings,
 rather than collapsing every distinct failure into one exception.
@@ -11,13 +27,8 @@ rather than collapsing every distinct failure into one exception.
 
 from dataclasses import dataclass, field
 from enum import StrEnum
-from pathlib import Path
-
-import pyarrow as pa
-from pydantic import BaseModel
 
 from consciousness_lab.session import annotations as annotations_mod
-from consciousness_lab.session.finalizer import read_manifest
 from consciousness_lab.session.lifecycle import parse_records, summarize
 from consciousness_lab.session.model import (
     SCHEMA_MAJOR,
@@ -27,17 +38,15 @@ from consciousness_lab.session.model import (
     LifecycleRecord,
     LifecycleState,
     Manifest,
-    ManifestStream,
     RecordingOutcome,
     Run,
     StreamCloseStatus,
-    StreamDescriptor,
     load_on_disk,
 )
-from consciousness_lab.storage import canonical_json
+from consciousness_lab.storage import canonical_json, package_layout
 from consciousness_lab.storage.checksums import find_incomplete, sha256_bytes, sha256_file
+from consciousness_lab.storage.package_layout import read_manifest
 from consciousness_lab.storage.paths import PackagePaths
-from consciousness_lab.storage.payload import PayloadFramingError, PayloadRef, read_at
 from consciousness_lab.storage.safe_paths import (
     UnsafePathError,
     find_symlinks,
@@ -49,68 +58,65 @@ from consciousness_lab.storage.stream_state import (
     read_all_physical_streams,
 )
 
-#: The only files a sealed package may hold outside the manifest inventory
-#: (spec 14.1). Everything else is either inventoried or unexpected.
-POST_SEAL_MUTABLE = frozenset(
-    {"manifest.json", "manifest.sha256", "annotations.jsonl", "annotations.head.json"}
-)
-
 
 class Finding(StrEnum):
     """Every distinct way verification can fail."""
 
+    # condition 1 — the manifest pair
     MISSING_MANIFEST = "missing_manifest"
     MISSING_MANIFEST_SHA = "missing_manifest_sha"
     BAD_MANIFEST_HASH = "bad_manifest_hash"
     UNREADABLE_MANIFEST = "unreadable_manifest"
     SCHEMA_VERSION_UNSUPPORTED = "schema_version_unsupported"
-    INVENTORY_FILE_MISSING = "inventory_file_missing"
-    INVENTORY_HASH_MISMATCH = "inventory_hash_mismatch"
-    BROKEN_LIFECYCLE_SEAL = "broken_lifecycle_seal"
-    BROKEN_EVENTS_SEAL = "broken_events_seal"
-    NOT_CLEANLY_CLOSED = "not_cleanly_closed"
-    SEALED_OUTCOME_NOT_COMPLETED = "sealed_outcome_not_completed"
-    REQUIRED_STREAM_UNCLEAN = "required_stream_unclean"
-    REQUIRED_STREAM_MISSING = "required_stream_missing"
-    INCOMPLETE_FILE_PRESENT = "incomplete_file_present"
-    BROKEN_CHUNK_CHAIN = "broken_chunk_chain"
-    CHUNK_ARTIFACT_MISSING = "chunk_artifact_missing"
-    CHUNK_ARTIFACT_HASH_MISMATCH = "chunk_artifact_hash_mismatch"
-    ORPHAN_FILE = "orphan_file"
-    MISSING_PAYLOAD_ARTIFACT = "missing_payload_artifact"
-    UNEXPECTED_PAYLOAD_ARTIFACT = "unexpected_payload_artifact"
-    PAYLOAD_REF_INVALID = "payload_ref_invalid"
-    ANNOTATION_INTEGRITY_INDETERMINATE = "annotation_integrity_indeterminate"
-    ANNOTATION_REJECTED = "annotation_rejected"
-    EFFECTIVE_OUTCOME_NOT_COMPLETED = "effective_outcome_not_completed"
-    UNREADABLE_DESCRIPTOR = "unreadable_descriptor"
-    UNREADABLE_RUN = "unreadable_run"
-    UNREADABLE_CHUNK_ARTIFACT = "unreadable_chunk_artifact"
-    MANIFEST_STREAM_MISSING_RAW = "manifest_stream_missing_raw"
-    RAW_STREAM_MISSING_MANIFEST = "raw_stream_missing_manifest"
-    DUPLICATE_MANIFEST_STREAM = "duplicate_manifest_stream"
-    REQUIRED_FLAG_MISMATCH = "required_flag_mismatch"
-    MISSING_DESCRIPTOR = "missing_descriptor"
-    DESCRIPTOR_STREAM_ID_MISMATCH = "descriptor_stream_id_mismatch"
-    MANIFEST_DESCRIPTOR_HASH_MISMATCH = "manifest_descriptor_hash_mismatch"
-    CHUNK_DESCRIPTOR_HASH_MISMATCH = "chunk_descriptor_hash_mismatch"
-    CHUNK_COUNT_MISMATCH = "chunk_count_mismatch"
-    CHAIN_HEAD_MISMATCH = "chain_head_mismatch"
-    PACKET_RANGE_MISMATCH = "packet_range_mismatch"
-    MISSING_STREAM_STRUCTURE = "missing_stream_structure"
-    SIDECAR_MISMATCH = "sidecar_mismatch"
-    PACKET_SUMMARY_MISMATCH = "packet_summary_mismatch"
-    UNREADABLE_PACKETS_ARTIFACT = "unreadable_packets_artifact"
-    ARTIFACT_PATH_NOT_CANONICAL = "artifact_path_not_canonical"
-    ARTIFACT_PATH_REUSED = "artifact_path_reused"
-    CHAIN_ORDER_INVALID = "chain_order_invalid"
-    PAYLOAD_KEY_PRESENCE_INVALID = "payload_key_presence_invalid"
-    ROW_REFERENCE_INVALID = "row_reference_invalid"
-    DUPLICATE_INVENTORY_PATH = "duplicate_inventory_path"
-    INVENTORY_BYTES_MISMATCH = "inventory_bytes_mismatch"
+
+    # condition 2 — the package file set is closed and sealed
+    CONTROL_SET_MISMATCH = "control_set_mismatch"
+    CONTROL_FILE_MISSING = "control_file_missing"
+    CONTROL_HASH_MISMATCH = "control_hash_mismatch"
+    SCHEMA_SET_MISMATCH = "schema_set_mismatch"
     UNEXPECTED_FILE = "unexpected_file"
     SYMLINK_IN_PACKAGE = "symlink_in_package"
     UNSAFE_PATH = "unsafe_path"
+
+    # condition 3 — the sealed logs
+    BROKEN_LIFECYCLE_SEAL = "broken_lifecycle_seal"
+    BROKEN_EVENTS_SEAL = "broken_events_seal"
+    NOT_CANONICAL_ON_DISK = "not_canonical_on_disk"
+
+    # condition 4 — the sealed outcome
+    NOT_CLEANLY_CLOSED = "not_cleanly_closed"
+    SEALED_OUTCOME_NOT_COMPLETED = "sealed_outcome_not_completed"
+
+    # condition 5 — stream set agreement and closure
+    UNREADABLE_RUN = "unreadable_run"
+    STREAM_NOT_DECLARED = "stream_not_declared"
+    MISSING_STREAM_CLOSE = "missing_stream_close"
+    INVALID_STREAM_CLOSE = "invalid_stream_close"
+    REQUIRED_STREAM_MISSING = "required_stream_missing"
+    REQUIRED_STREAM_UNCLEAN = "required_stream_unclean"
+
+    # condition 6 — no incomplete write markers
+    INCOMPLETE_FILE_PRESENT = "incomplete_file_present"
+
+    # condition 7 — physical raw integrity
+    MISSING_STREAM_STRUCTURE = "missing_stream_structure"
+    MISSING_DESCRIPTOR = "missing_descriptor"
+    UNREADABLE_DESCRIPTOR = "unreadable_descriptor"
+    DESCRIPTOR_STREAM_ID_MISMATCH = "descriptor_stream_id_mismatch"
+    BROKEN_CHUNK_CHAIN = "broken_chunk_chain"
+    CHAIN_ORDER_INVALID = "chain_order_invalid"
+    CHUNK_ARTIFACT_INVALID = "chunk_artifact_invalid"
+    ARROW_SCHEMA_INVALID = "arrow_schema_invalid"
+    OBSERVATION_ROW_INVALID = "observation_row_invalid"
+    ROW_REFERENCE_INVALID = "row_reference_invalid"
+    PAYLOAD_FRAMING_INVALID = "payload_framing_invalid"
+    UNREADABLE_PACKETS_ARTIFACT = "unreadable_packets_artifact"
+    ORPHAN_FILE = "orphan_file"
+
+    # condition 8 — the effective outcome
+    ANNOTATION_INTEGRITY_INDETERMINATE = "annotation_integrity_indeterminate"
+    ANNOTATION_REJECTED = "annotation_rejected"
+    EFFECTIVE_OUTCOME_NOT_COMPLETED = "effective_outcome_not_completed"
 
 
 @dataclass(frozen=True)
@@ -149,64 +155,50 @@ class VerificationResult:
         self.issues.append(Issue(finding, detail, path))
 
 
-def _verify_sealed_jsonl(
-    raw: bytes, model: type[BaseModel], label: str, result: VerificationResult
-) -> bool:
-    """Every record in a sealed JSONL region parses, verifies and validates."""
-    finding = Finding.BROKEN_LIFECYCLE_SEAL if label == "lifecycle" else Finding.BROKEN_EVENTS_SEAL
-    for number, line in enumerate(raw.split(b"\n")):
-        if not line.strip():
-            continue
-        try:
-            obj = canonical_json.loads(line)
-        except (canonical_json.CanonicalizationError, ValueError) as exc:
-            result.add(finding, f"{label} line {number} is not parseable ({exc})")
-            return False
-        if not isinstance(obj, dict) or not canonical_json.verify_record(obj):
-            result.add(finding, f"{label} line {number}: record_sha256 does not verify")
-            return False
-        try:
-            load_on_disk(model, obj)
-        except ValueError as exc:
-            result.add(finding, f"{label} line {number} is invalid on disk ({exc})")
-            return False
-    return True
-
-
 def read_chunk_index(paths: PackagePaths, stream_id: str) -> tuple[list[ChunkCommit], str | None]:
-    """Parse and hash-chain-verify one stream's chunk index."""
-    index = paths.stream(stream_id).chunks_index
-    if not index.exists():
-        return [], None
-    commits: list[ChunkCommit] = []
-    prev = canonical_json.ZERO_HASH
-    for number, line in enumerate(index.read_bytes().split(b"\n")):
-        if not line.strip():
-            continue
-        try:
-            obj = canonical_json.loads(line)
-        except (canonical_json.CanonicalizationError, ValueError):
-            return commits, f"line {number} is not parseable"
-        if not isinstance(obj, dict) or not canonical_json.verify_record(obj):
-            return commits, f"line {number} record_sha256 does not verify"
-        try:
-            commit = load_on_disk(ChunkCommit, obj)
-        except ValueError as exc:
-            return commits, f"line {number} is malformed ({exc})"
-        if commit.prev_record_sha256 != prev:
-            return commits, f"line {number} breaks the hash chain"
-        prev = str(commit.record_sha256)
-        commits.append(commit)
-    return commits, None
+    """Parse and hash-chain-verify one stream's chunk index.
+
+    Kept as the reader's entry point; the work lives in ``stream_state`` so
+    there is one definition of what "committed" means.
+    """
+    from consciousness_lab.storage.stream_state import read_chunk_chain
+
+    records, error = read_chunk_chain(paths.stream(stream_id).chunks_index)
+    return [record.model for record in records], error
 
 
 def verify_package(paths: PackagePaths) -> VerificationResult:
     """Verify a package and evaluate the eight-condition completion predicate."""
     result = VerificationResult(session_id=paths.root.name)
+    physical = read_all_physical_streams(paths)
+    stream_ids = sorted(physical)
 
-    # --- Condition 1: manifest.json exists and manifest.sha256 matches it ----
+    manifest = _condition_1(paths, result)
+    events_bytes = paths.events.read_bytes() if paths.events.is_file() else b""
+    schema_ids, schema_error = package_layout.referenced_schema_ids(events_bytes)
+    result.conditions[2] = _condition_2(paths, manifest, result, stream_ids, schema_ids)
+    result.conditions[3] = _condition_3(paths, manifest, events_bytes, schema_error, result)
+    result.conditions[4] = _condition_4(paths, manifest, result)
+    result.conditions[5] = _condition_5(paths, physical, result)
+
+    incomplete = find_incomplete(paths.root)
+    for path in incomplete:
+        result.add(
+            Finding.INCOMPLETE_FILE_PRESENT,
+            "incomplete write marker present",
+            path.relative_to(paths.root).as_posix(),
+        )
+    result.conditions[6] = not incomplete
+
+    result.conditions[7] = _condition_7(paths, physical, result)
+    result.conditions[8] = _condition_8(paths, result)
+    return result
+
+
+def _condition_1(paths: PackagePaths, result: VerificationResult) -> Manifest | None:
+    """manifest.json exists, manifest.sha256 matches it, schema major is 2."""
     manifest_ok = True
-    manifest = None
+    manifest: Manifest | None = None
     if not paths.manifest.exists():
         result.add(Finding.MISSING_MANIFEST, "manifest.json is absent")
         manifest_ok = False
@@ -214,10 +206,14 @@ def verify_package(paths: PackagePaths) -> VerificationResult:
         result.add(Finding.MISSING_MANIFEST_SHA, "manifest.sha256 is absent")
         manifest_ok = False
     else:
+        raw = paths.manifest.read_bytes()
         recorded = paths.manifest_sha256.read_text(encoding="utf-8").strip()
-        actual = sha256_bytes(paths.manifest.read_bytes())
-        if recorded != actual:
+        if recorded != sha256_bytes(raw):
             result.add(Finding.BAD_MANIFEST_HASH, "manifest.sha256 does not match manifest.json")
+            manifest_ok = False
+        canonical_error = package_layout.canonical_document_error(raw)
+        if canonical_error is not None:
+            result.add(Finding.NOT_CANONICAL_ON_DISK, f"manifest.json {canonical_error}")
             manifest_ok = False
         manifest = read_manifest(paths.manifest)
         if manifest is None:
@@ -231,13 +227,23 @@ def verify_package(paths: PackagePaths) -> VerificationResult:
             manifest_ok = False
     result.manifest = manifest
     result.conditions[1] = manifest_ok
+    return manifest
 
-    # --- Condition 2: the package holds EXACTLY the sealed files ------------
-    # Both directions. Every inventory entry must be present and hash correctly,
-    # AND nothing outside the inventory may exist except the objects 14.1 permits
-    # to change after sealing. Checking only the first direction would let extra
-    # immutable content be ADDED to a sealed package unnoticed.
-    inventory_ok = manifest is not None
+
+def _condition_2(
+    paths: PackagePaths,
+    manifest: Manifest | None,
+    result: VerificationResult,
+    stream_ids: list[str],
+    schema_ids: set[str],
+) -> bool:
+    """The package file set is closed and sealed (V10, V13).
+
+    The expected control set is DERIVED from the physical stream directories and
+    the schema ids the sealed events log references — never read back from the
+    manifest it is being compared against. Equality in both directions.
+    """
+    ok = manifest is not None
 
     for link in find_symlinks(paths.root):
         # A symlink lets an artifact be moved out of the package and faked back
@@ -247,286 +253,229 @@ def verify_package(paths: PackagePaths) -> VerificationResult:
             "sealed package content may not contain a symlink",
             link.relative_to(paths.root).as_posix(),
         )
-        inventory_ok = False
+        ok = False
 
-    if manifest is not None:
-        # The inventory is a BIJECTION over in-scope files, not a set. Collapsing
-        # it with `{e.path for e in ...}` would let a duplicate entry disappear.
-        inventory_paths = [entry.path for entry in manifest.inventory]
-        duplicates = sorted({p for p in inventory_paths if inventory_paths.count(p) > 1})
-        for duplicate in duplicates:
-            result.add(
-                Finding.DUPLICATE_INVENTORY_PATH,
-                "path appears more than once in the manifest inventory",
-                duplicate,
-            )
-            inventory_ok = False
-
-        for entry in manifest.inventory:
-            try:
-                target = resolve_within(paths.root, entry.path)
-            except UnsafePathError as exc:
-                result.add(Finding.UNSAFE_PATH, str(exc), entry.path)
-                inventory_ok = False
-                continue
-            if not target.is_file():
-                result.add(Finding.INVENTORY_FILE_MISSING, "inventory file is absent", entry.path)
-                inventory_ok = False
-                continue
-            if sha256_file(target) != entry.sha256:
-                result.add(Finding.INVENTORY_HASH_MISMATCH, "inventory hash mismatch", entry.path)
-                inventory_ok = False
-            # bytes is an independent leaf; a matching SHA does not validate it.
-            actual_bytes = target.stat().st_size
-            if entry.bytes != actual_bytes:
-                result.add(
-                    Finding.INVENTORY_BYTES_MISMATCH,
-                    f"inventory declares {entry.bytes} bytes, file holds {actual_bytes}",
-                    entry.path,
-                )
-                inventory_ok = False
-
-        listed = set(inventory_paths)
-        for path in sorted(paths.root.rglob("*")):
-            if not path.is_file() or path.is_symlink():
-                continue
-            rel = path.relative_to(paths.root).as_posix()
-            if rel in listed or rel in POST_SEAL_MUTABLE or rel.startswith("logs/"):
-                continue
-            result.add(
-                Finding.UNEXPECTED_FILE,
-                "present in a sealed package but absent from the manifest inventory",
-                rel,
-            )
-            inventory_ok = False
-    result.conditions[2] = inventory_ok
-
-    # --- Condition 3: the sealed lifecycle prefix hashes as recorded --------
-    seal_ok = False
-    if manifest is not None and paths.lifecycle.exists():
-        raw = paths.lifecycle.read_bytes()
-        sealed_len = manifest.lifecycle_seal.sealed_len
-        prefix_bytes = raw[:sealed_len]
-        if len(raw) < sealed_len:
-            result.add(Finding.BROKEN_LIFECYCLE_SEAL, "lifecycle.jsonl is shorter than its seal")
-        elif sha256_bytes(raw[:sealed_len]) != manifest.lifecycle_seal.sealed_sha256:
-            result.add(Finding.BROKEN_LIFECYCLE_SEAL, "sealed lifecycle prefix hash mismatch")
-        else:
-            seal_ok = True
-        # The file hash proves the bytes are the sealed bytes. It does NOT prove
-        # each record's own record_sha256 still verifies, and a tamperer who can
-        # rewrite the manifest can restore the file hash. So every record inside
-        # the sealed region is checked individually.
-        if seal_ok and not _verify_sealed_jsonl(prefix_bytes, LifecycleRecord, "lifecycle", result):
-            seal_ok = False
-        if manifest.events_seal.bytes or paths.events.exists():
-            events = paths.events.read_bytes() if paths.events.exists() else b""
-            if sha256_bytes(events) != manifest.events_seal.sha256:
-                result.add(Finding.BROKEN_EVENTS_SEAL, "events seal hash mismatch")
-                seal_ok = False
-            elif not _verify_sealed_jsonl(events, EventRecord, "events", result):
-                seal_ok = False
-    elif manifest is not None:
-        result.add(Finding.BROKEN_LIFECYCLE_SEAL, "lifecycle.jsonl is absent")
-    result.conditions[3] = seal_ok
-
-    # --- Condition 4: sealed prefix says CLOSED / CLEAN / COMPLETED ---------
-    sealed_ok = False
-    if seal_ok and manifest is not None:
-        # Parsed in memory. Writing a temp file inside the package would put a
-        # post-seal file into a sealed unit, which §14.1 forbids — and a crash
-        # mid-verification would leave it there.
-        prefix = paths.lifecycle.read_bytes()[: manifest.lifecycle_seal.sealed_len]
-        summary = summarize(parse_records(prefix))
-        result.sealed_outcome = summary.sealed_outcome
-        if summary.terminal_state is not LifecycleState.CLOSED:
-            result.add(Finding.NOT_CLEANLY_CLOSED, f"terminal state is {summary.terminal_state}")
-        elif summary.closure_condition is not ClosureCondition.CLEAN:
-            result.add(
-                Finding.NOT_CLEANLY_CLOSED, f"closure condition is {summary.closure_condition}"
-            )
-        elif summary.sealed_outcome is not RecordingOutcome.COMPLETED:
-            result.add(
-                Finding.SEALED_OUTCOME_NOT_COMPLETED,
-                f"sealed outcome is {summary.sealed_outcome}",
-            )
-        else:
-            sealed_ok = True
-    result.conditions[4] = sealed_ok
-
-    # --- Condition 5: every required stream closed CLEAN --------------------
-    run = None
-    if paths.run.exists():
-        try:
-            run = load_on_disk(Run, canonical_json.loads(paths.run.read_bytes()))
-        except (canonical_json.CanonicalizationError, ValueError) as exc:
-            result.add(Finding.UNREADABLE_RUN, f"run.json could not be parsed ({exc})")
-    result.run = run
-    # Condition 5 owns SEMANTIC required-stream closure: run declares it, the
-    # manifest agrees it is required, and it closed CLEAN — and the stream
-    # physically exists, because a manifest entry alone proves nothing about
-    # what is on disk (CL-002B-R1).
-    physical = read_all_physical_streams(paths)
-    required_ok = run is not None and manifest is not None
-    if run is not None and manifest is not None:
-        by_id = {s.stream_id: s for s in manifest.streams}
-        declared_required = set(run.required_streams)
-        for stream_id in run.required_streams:
-            stream_entry = by_id.get(stream_id)
-            if stream_entry is None:
-                result.add(Finding.REQUIRED_STREAM_MISSING, "required stream absent", stream_id)
-                required_ok = False
-                continue
-            if stream_id not in physical or not physical[stream_id].directory_exists:
-                result.add(
-                    Finding.MANIFEST_STREAM_MISSING_RAW,
-                    "required stream has no raw directory on disk",
-                    stream_id,
-                )
-                required_ok = False
-            if stream_entry.close_status is not StreamCloseStatus.CLEAN:
-                result.add(
-                    Finding.REQUIRED_STREAM_UNCLEAN,
-                    f"required stream closed {stream_entry.close_status}",
-                    stream_id,
-                )
-                required_ok = False
-        # The required flag is fully determined by run.json, for every stream.
-        for stream_summary in manifest.streams:
-            expected = stream_summary.stream_id in declared_required
-            if stream_summary.required is not expected:
-                result.add(
-                    Finding.REQUIRED_FLAG_MISMATCH,
-                    f"manifest says required={stream_summary.required}, "
-                    f"run.json implies {expected}",
-                    stream_summary.stream_id,
-                )
-                required_ok = False
-    result.conditions[5] = required_ok
-
-    # --- Condition 6: no .part/.tmp/.open anywhere --------------------------
-    incomplete = find_incomplete(paths.root)
-    for path in incomplete:
+    scan = package_layout.scan_layout(paths, schema_ids)
+    for name in scan.unexpected:
         result.add(
-            Finding.INCOMPLETE_FILE_PRESENT,
-            "incomplete write marker present",
-            path.relative_to(paths.root).as_posix(),
+            Finding.UNEXPECTED_FILE,
+            "present in a sealed package but not part of the v2 layout",
+            name,
         )
-    result.conditions[6] = not incomplete
+        ok = False
+    for schema_id in scan.unreferenced_schemas:
+        result.add(
+            Finding.SCHEMA_SET_MISMATCH,
+            "schema snapshot is referenced by no sealed event",
+            f"schemas/{schema_id}.json",
+        )
+        ok = False
+    for schema_id in scan.missing_schemas:
+        result.add(
+            Finding.SCHEMA_SET_MISMATCH,
+            "sealed events reference a schema with no snapshot on disk",
+            f"schemas/{schema_id}.json",
+        )
+        ok = False
 
-    # --- Condition 7: physical raw integrity, reconciled with the manifest ---
-    chains_ok = _verify_streams(paths, manifest, result, physical)
-    result.conditions[7] = chains_ok
-
-    # --- Condition 8: the effective outcome is COMPLETED --------------------
-    effective = annotations_mod.resolve_effective_outcome(
-        sealed_outcome=result.sealed_outcome,
-        annotations_path=paths.annotations,
-        head_path=paths.annotations_head,
-    )
-    result.effective = effective
-    effective_ok = True
-    if effective.status is annotations_mod.AnnotationStatus.INDETERMINATE:
-        result.add(Finding.ANNOTATION_INTEGRITY_INDETERMINATE, effective.detail)
-        effective_ok = False
-    else:
-        for rejected in effective.rejected:
-            result.add(
-                Finding.ANNOTATION_REJECTED,
-                f"annotation {rejected.seq} rejected: {rejected.detail}",
-            )
-            effective_ok = False
-        if effective.outcome is not RecordingOutcome.COMPLETED:
-            result.add(
-                Finding.EFFECTIVE_OUTCOME_NOT_COMPLETED,
-                f"effective outcome is {effective.outcome}",
-            )
-            effective_ok = False
-    result.conditions[8] = effective_ok
-    return result
-
-
-def _verify_streams(
-    paths: PackagePaths,
-    manifest: Manifest | None,
-    result: VerificationResult,
-    physical: dict[str, PhysicalStreamState],
-) -> bool:
-    """Condition 7: physical raw integrity, reconciled against the manifest.
-
-    Every summary the manifest carries about a stream is re-derived from disk
-    and compared. The manifest is a *summary of* the raw data, never evidence
-    that the raw data exists (CL-002B-R1).
-    """
-    ok = True
     if manifest is None:
-        # No manifest yet (an unfinalized or interrupted package). The
-        # manifest-reconciliation checks do not apply, but the physical checks
-        # still do: recovery relies on orphan and chain reporting here.
-        for stream_id in sorted(physical):
-            if not _verify_stream(paths, None, physical[stream_id], result):
-                ok = False
         return False
 
-    # --- bidirectional stream-set reconciliation ---------------------------
-    manifest_ids = [entry.stream_id for entry in manifest.streams]
-    seen: set[str] = set()
-    for stream_id in manifest_ids:
-        if stream_id in seen:
+    expected = package_layout.expected_control_paths(stream_ids, schema_ids)
+    recorded = set(manifest.control_sha256)
+    for missing in sorted(set(expected) - recorded):
+        result.add(Finding.CONTROL_SET_MISMATCH, "control file is not sealed", missing)
+        ok = False
+    for extra in sorted(recorded - set(expected)):
+        result.add(
+            Finding.CONTROL_SET_MISMATCH,
+            "control_sha256 seals a path the derived control set does not contain",
+            extra,
+        )
+        ok = False
+
+    for entry, digest in sorted(manifest.control_sha256.items()):
+        try:
+            target = resolve_within(paths.root, entry)
+        except UnsafePathError as exc:
+            result.add(Finding.UNSAFE_PATH, str(exc), entry)
+            ok = False
+            continue
+        if not target.is_file():
+            result.add(Finding.CONTROL_FILE_MISSING, "sealed control file is absent", entry)
+            ok = False
+            continue
+        if sha256_file(target) != digest:
+            result.add(Finding.CONTROL_HASH_MISMATCH, "control file hash mismatch", entry)
+            ok = False
+    return ok
+
+
+def _condition_3(
+    paths: PackagePaths,
+    manifest: Manifest | None,
+    events_bytes: bytes,
+    schema_error: str | None,
+    result: VerificationResult,
+) -> bool:
+    """The sealed lifecycle prefix and the events log (V11, V12, V14)."""
+    if manifest is None:
+        return False
+    if not paths.lifecycle.exists():
+        result.add(Finding.BROKEN_LIFECYCLE_SEAL, "lifecycle.jsonl is absent")
+        return False
+
+    ok = True
+    raw = paths.lifecycle.read_bytes()
+    sealed_len = manifest.lifecycle_seal.sealed_len
+    if len(raw) < sealed_len:
+        result.add(Finding.BROKEN_LIFECYCLE_SEAL, "lifecycle.jsonl is shorter than its seal")
+        return False
+    prefix = raw[:sealed_len]
+    if sha256_bytes(prefix) != manifest.lifecycle_seal.sealed_sha256:
+        result.add(Finding.BROKEN_LIFECYCLE_SEAL, "sealed lifecycle prefix hash mismatch")
+        return False
+
+    # The file hash proves the bytes are the sealed bytes. It does NOT prove
+    # each record is canonical, valid, or that its own record_sha256 still
+    # verifies — and a tamperer who can rewrite the manifest can restore the
+    # file hash. So every record inside the sealed region is checked.
+    error = package_layout.verify_jsonl_region(prefix, LifecycleRecord, require_record_hash=True)
+    if error is not None:
+        result.add(Finding.BROKEN_LIFECYCLE_SEAL, f"lifecycle {error}")
+        ok = False
+
+    if sha256_bytes(events_bytes) != manifest.events_sha256:
+        result.add(Finding.BROKEN_EVENTS_SEAL, "events seal hash mismatch")
+        return False
+    if schema_error is not None:
+        result.add(Finding.BROKEN_EVENTS_SEAL, schema_error)
+        ok = False
+    error = package_layout.verify_jsonl_region(events_bytes, EventRecord, require_record_hash=True)
+    if error is not None:
+        result.add(Finding.BROKEN_EVENTS_SEAL, f"events {error}")
+        ok = False
+    return ok
+
+
+def _condition_4(
+    paths: PackagePaths, manifest: Manifest | None, result: VerificationResult
+) -> bool:
+    """Within the sealed prefix: CLOSED / CLEAN / sealed COMPLETED."""
+    if manifest is None or not result.conditions.get(3, False):
+        return False
+    prefix = paths.lifecycle.read_bytes()[: manifest.lifecycle_seal.sealed_len]
+    summary = summarize(parse_records(prefix))
+    result.sealed_outcome = summary.sealed_outcome
+    if summary.terminal_state is not LifecycleState.CLOSED:
+        result.add(Finding.NOT_CLEANLY_CLOSED, f"terminal state is {summary.terminal_state}")
+        return False
+    if summary.closure_condition is not ClosureCondition.CLEAN:
+        result.add(Finding.NOT_CLEANLY_CLOSED, f"closure condition is {summary.closure_condition}")
+        return False
+    if summary.sealed_outcome is not RecordingOutcome.COMPLETED:
+        result.add(
+            Finding.SEALED_OUTCOME_NOT_COMPLETED, f"sealed outcome is {summary.sealed_outcome}"
+        )
+        return False
+    return True
+
+
+def _condition_5(
+    paths: PackagePaths, physical: dict[str, PhysicalStreamState], result: VerificationResult
+) -> bool:
+    """Stream set agreement and closure, in three parts (V09).
+
+    a. every physical stream directory is declared in the run contract;
+    b. every physical stream directory has a valid ``stream_close.json``;
+    c. every required id has a directory whose close status is ``CLEAN``.
+
+    A declared **optional** stream that was never opened has no directory and no
+    close file; that is valid. A required stream recovered ``RECOVERED_UNCLEAN``
+    fails this condition, as it should.
+    """
+    run: Run | None = None
+    if paths.run.exists():
+        raw = paths.run.read_bytes()
+        error = package_layout.canonical_document_error(raw)
+        if error is not None:
+            result.add(Finding.UNREADABLE_RUN, f"run.json {error}")
+        else:
+            try:
+                run = load_on_disk(Run, canonical_json.loads(raw))
+            except ValueError as exc:
+                result.add(Finding.UNREADABLE_RUN, f"run.json could not be parsed ({exc})")
+    else:
+        result.add(Finding.UNREADABLE_RUN, "run.json is absent")
+    result.run = run
+    if run is None:
+        return False
+
+    ok = True
+    declared = set(run.required_streams) | set(run.optional_streams)
+    for stream_id in sorted(physical):
+        state = physical[stream_id]
+        if stream_id not in declared:
             result.add(
-                Finding.DUPLICATE_MANIFEST_STREAM, "stream listed twice in the manifest", stream_id
+                Finding.STREAM_NOT_DECLARED,
+                "raw directory is not declared in run.required_streams or optional_streams",
+                stream_id,
             )
             ok = False
-        seen.add(stream_id)
+        if state.close_error is not None:
+            result.add(Finding.INVALID_STREAM_CLOSE, state.close_error, stream_id)
+            ok = False
+        elif not state.close_present:
+            result.add(
+                Finding.MISSING_STREAM_CLOSE,
+                "stream has no durable stream_close.json",
+                stream_id,
+            )
+            ok = False
 
-    physical_ids = set(physical)
-    for stream_id in sorted(seen - physical_ids):
-        result.add(
-            Finding.MANIFEST_STREAM_MISSING_RAW,
-            "manifest describes a stream with no raw directory",
-            stream_id,
-        )
-        ok = False
-    for stream_id in sorted(physical_ids - seen):
-        result.add(
-            Finding.RAW_STREAM_MISSING_MANIFEST,
-            "raw directory is not described by the manifest",
-            stream_id,
-        )
-        ok = False
+    for stream_id in run.required_streams:
+        required_state = physical.get(stream_id)
+        if required_state is None or not required_state.directory_exists:
+            result.add(
+                Finding.REQUIRED_STREAM_MISSING,
+                "required stream has no raw directory on disk",
+                stream_id,
+            )
+            ok = False
+            continue
+        if required_state.close_status is not StreamCloseStatus.CLEAN:
+            result.add(
+                Finding.REQUIRED_STREAM_UNCLEAN,
+                f"required stream closed {required_state.close_status}",
+                stream_id,
+            )
+            ok = False
+    return ok
 
-    for entry in manifest.streams:
-        state = physical.get(entry.stream_id)
-        if state is None:
-            continue  # already reported above
-        if not _verify_stream(paths, entry, state, result):
+
+def _condition_7(
+    paths: PackagePaths, physical: dict[str, PhysicalStreamState], result: VerificationResult
+) -> bool:
+    """Physical raw integrity for every stream (V01-V08, V13 in the raw tree)."""
+    ok = True
+    for stream_id in sorted(physical):
+        if not _verify_stream(paths, physical[stream_id], result):
             ok = False
     return ok
 
 
 def _verify_stream(
-    paths: PackagePaths,
-    entry: ManifestStream | None,
-    state: PhysicalStreamState,
-    result: VerificationResult,
+    paths: PackagePaths, state: PhysicalStreamState, result: VerificationResult
 ) -> bool:
-    """Verify one physical stream, reconciling it against its manifest summary.
-
-    ``entry`` is ``None`` for a package with no manifest yet: the physical
-    checks still run, only the summary comparisons are skipped. Recovery relies
-    on the orphan and chain reporting here.
-    """
+    """Verify one physical stream against the v2 contract."""
     stream_id = state.stream_id
-    stream_dir = paths.stream(stream_id).root
     ok = True
 
-    # --- structural files ---------------------------------------------------
     for name in REQUIRED_STREAM_FILES:
-        if not (stream_dir / name).is_file():
+        if not (paths.stream(stream_id).root / name).is_file():
             result.add(Finding.MISSING_STREAM_STRUCTURE, f"{name} is absent", stream_id)
             ok = False
 
-    # --- descriptor ---------------------------------------------------------
     if not state.descriptor_present:
         result.add(Finding.MISSING_DESCRIPTOR, "descriptor.json is absent", stream_id)
         return False
@@ -540,318 +489,74 @@ def _verify_stream(
             stream_id,
         )
         ok = False
-    if entry is not None and state.descriptor_sha256 != entry.descriptor_sha256:
-        result.add(
-            Finding.MANIFEST_DESCRIPTOR_HASH_MISMATCH,
-            "manifest descriptor_sha256 does not match the stored descriptor bytes",
-            stream_id,
-        )
-        ok = False
 
-    # --- chunk chain --------------------------------------------------------
     if state.chain_error is not None:
         result.add(Finding.BROKEN_CHUNK_CHAIN, state.chain_error, stream_id)
         ok = False
     for order_error in state.order_errors:
-        # Chain-level, not per-chunk: every chunk of a reversed chain still
-        # matches its own artifact (matrix rows R24, R25).
         result.add(Finding.CHAIN_ORDER_INVALID, order_error, stream_id)
         ok = False
 
-    if entry is not None:
-        if entry.chunk_count != state.chunk_count:
-            result.add(
-                Finding.CHUNK_COUNT_MISMATCH,
-                f"manifest says {entry.chunk_count} chunks, the chain holds {state.chunk_count}",
-                stream_id,
-            )
-            ok = False
-        if entry.chunk_chain_head_sha256 != state.chain_head_sha256:
-            result.add(
-                Finding.CHAIN_HEAD_MISMATCH,
-                "manifest chunk_chain_head_sha256 is not the chain's final record hash",
-                stream_id,
-            )
-            ok = False
-        if (entry.first_packet_seq, entry.last_packet_seq) != (
-            state.first_packet_seq,
-            state.last_packet_seq,
-        ):
-            result.add(
-                Finding.PACKET_RANGE_MISMATCH,
-                f"manifest packet range ({entry.first_packet_seq}, {entry.last_packet_seq}) "
-                f"is not ({state.first_packet_seq}, {state.last_packet_seq})",
-                stream_id,
-            )
-            ok = False
-
-    # --- artifacts referenced by each commit --------------------------------
-    committed_paths: set[str] = set()
-    intact: set[int] = {chunk.record.chunk_id for chunk in state.chunks}
-    seen_artifact_paths: dict[str, int] = {}
     for chunk in state.chunks:
-        commit = chunk.record.model
-        chunk_id = commit.chunk_id
-
-        # --- the summary must match the PHYSICAL packet rows (B2) -----------
+        prefix = f"chunk {chunk.chunk_id}"
         if chunk.packet_error is not None:
             result.add(
-                Finding.UNREADABLE_PACKETS_ARTIFACT,
-                f"chunk {chunk_id}: {chunk.packet_error}",
-                stream_id,
+                Finding.UNREADABLE_PACKETS_ARTIFACT, f"{prefix}: {chunk.packet_error}", stream_id
             )
             ok = False
-            intact.discard(chunk_id)
-        elif (commit.first_packet_seq, commit.last_packet_seq) != (
-            chunk.physical_first_packet_seq,
-            chunk.physical_last_packet_seq,
-        ):
-            # Checked for EVERY chunk, not only the stream endpoints, so a
-            # forged middle chunk cannot hide behind correct-looking ends.
-            result.add(
-                Finding.PACKET_SUMMARY_MISMATCH,
-                f"chunk {chunk_id} claims packets "
-                f"({commit.first_packet_seq}, {commit.last_packet_seq}) but the artifact "
-                f"holds ({chunk.physical_first_packet_seq}, {chunk.physical_last_packet_seq})",
-                stream_id,
-            )
+        for detail in chunk.artifact_errors:
+            result.add(Finding.CHUNK_ARTIFACT_INVALID, f"{prefix}: {detail}", stream_id)
+            ok = False
+        for detail in chunk.schema_errors:
+            result.add(Finding.ARROW_SCHEMA_INVALID, f"{prefix}: {detail}", stream_id)
+            ok = False
+        for detail in chunk.row_semantics_errors:
+            result.add(Finding.OBSERVATION_ROW_INVALID, f"{prefix}: {detail}", stream_id)
+            ok = False
+        for detail in chunk.reference_errors:
+            result.add(Finding.ROW_REFERENCE_INVALID, f"{prefix}: {detail}", stream_id)
+            ok = False
+        for detail in chunk.payload_errors:
+            result.add(Finding.PAYLOAD_FRAMING_INVALID, f"{prefix}: {detail}", stream_id)
             ok = False
 
-        # --- payload KEY presence, which pairwise equality cannot see -------
-        # Both copies carrying an explicit null agree with each other and both
-        # violate §12.2, which requires the key omitted (matrix row R12).
-        expects_payload = state.descriptor.expects_payload_artifact
-        if chunk.record.payloads_key_present != expects_payload:
-            result.add(
-                Finding.PAYLOAD_KEY_PRESENCE_INVALID,
-                f"chunk {chunk_id}: payloads key is "
-                f"{'present' if chunk.record.payloads_key_present else 'absent'} at "
-                f"raw_capture_level={state.descriptor.acquisition.raw_capture_level.value}",
-                stream_id,
-            )
-            ok = False
-        sidecar_record = state.sidecars.get(chunk_id)
-        if sidecar_record is not None and sidecar_record.payloads_key_present != expects_payload:
-            result.add(
-                Finding.PAYLOAD_KEY_PRESENCE_INVALID,
-                f"chunk {chunk_id} sidecar: payloads key presence violates §12.2",
-                stream_id,
-            )
-            ok = False
-
-        # --- structural foreign keys from samples/observations to packets ---
-        for reference_error in chunk.reference_errors:
-            result.add(
-                Finding.ROW_REFERENCE_INVALID,
-                f"chunk {chunk_id}: {reference_error}",
-                stream_id,
-            )
-            ok = False
-
-        # --- artifact paths must be this chunk's own, and used once ---------
-        for kind, artifact in (
-            ("packets", commit.packets),
-            ("observations", commit.observations),
-            ("samples", commit.samples),
-        ):
-            expected_path = f"{kind}/{chunk_id:06d}.arrow"
-            if artifact.path != expected_path:
-                result.add(
-                    Finding.ARTIFACT_PATH_NOT_CANONICAL,
-                    f"chunk {chunk_id} {kind} artifact is {artifact.path!r}, "
-                    f"expected {expected_path!r}",
-                    stream_id,
-                )
-                ok = False
-        if commit.payloads is not None:
-            expected_payload = f"payloads/{chunk_id:06d}.bin"
-            if commit.payloads.path != expected_payload:
-                result.add(
-                    Finding.ARTIFACT_PATH_NOT_CANONICAL,
-                    f"chunk {chunk_id} payload artifact is {commit.payloads.path!r}, "
-                    f"expected {expected_payload!r}",
-                    stream_id,
-                )
-                ok = False
-
-        if commit.descriptor_sha256 != state.descriptor_sha256:
-            result.add(
-                Finding.CHUNK_DESCRIPTOR_HASH_MISMATCH,
-                f"chunk {chunk_id} was written under a different descriptor",
-                stream_id,
-            )
-            ok = False
-        artifacts = [commit.packets, commit.observations, commit.samples]
-        if commit.payloads is not None:
-            artifacts.append(commit.payloads)
-        if state.descriptor.expects_payload_artifact and commit.payloads is None:
-            result.add(
-                Finding.MISSING_PAYLOAD_ARTIFACT,
-                f"chunk {chunk_id} has no payload artifact",
-                stream_id,
-            )
-            ok = False
-        if not state.descriptor.expects_payload_artifact and commit.payloads is not None:
-            result.add(
-                Finding.UNEXPECTED_PAYLOAD_ARTIFACT,
-                f"chunk {chunk_id} carries a payload artifact at "
-                f"raw_capture_level={state.descriptor.acquisition.raw_capture_level.value}",
-                stream_id,
-            )
-            ok = False
-        for artifact in artifacts:
-            committed_paths.add(artifact.path)
-            owner = seen_artifact_paths.setdefault(artifact.path, chunk_id)
-            if owner != chunk_id:
-                result.add(
-                    Finding.ARTIFACT_PATH_REUSED,
-                    f"{artifact.path} is claimed by chunks {owner} and {chunk_id}",
-                    stream_id,
-                )
-                ok = False
-            try:
-                target = resolve_within(stream_dir, artifact.path)
-            except UnsafePathError as exc:
-                result.add(Finding.UNSAFE_PATH, str(exc), f"{stream_id}/{artifact.path}")
-                ok = False
-                intact.discard(chunk_id)
-                continue
-            if not target.is_file():
-                result.add(Finding.CHUNK_ARTIFACT_MISSING, artifact.path, stream_id)
-                ok = False
-                intact.discard(chunk_id)
-            elif sha256_file(target) != artifact.sha256:
-                result.add(Finding.CHUNK_ARTIFACT_HASH_MISMATCH, artifact.path, stream_id)
-                ok = False
-                intact.discard(chunk_id)
-
-    # --- sidecars must agree with the authoritative chain -------------------
-    # chunks.jsonl is the commit log; a sidecar is a convenience copy. If the
-    # two can disagree, a package carries two contradictory accounts of the
-    # same chunk, which is the defect class this ticket exists to close.
-    for error in state.sidecar_errors:
-        result.add(Finding.SIDECAR_MISMATCH, error, stream_id)
-        ok = False
-    for chunk in state.chunks:
-        chunk_id = chunk.record.chunk_id
-        sidecar = state.sidecars.get(chunk_id)
-        if sidecar is None:
-            result.add(
-                Finding.SIDECAR_MISMATCH,
-                f"chunk {chunk_id} has no {chunk_id:06d}.commit.json sidecar",
-                stream_id,
-            )
-            ok = False
-        elif not sidecar.same_record_as(chunk.record):
-            # Canonical on-disk records, not parsed models. Two different
-            # documents can normalize to the same ChunkCommit — an ignored
-            # unknown field, or an explicit null where the contract requires the
-            # key omitted — so model equality would call them identical.
-            result.add(
-                Finding.SIDECAR_MISMATCH,
-                f"chunk {chunk_id} sidecar is not the same on-disk record as chunks.jsonl",
-                stream_id,
-            )
-            ok = False
-    chain_ids = {chunk.record.chunk_id for chunk in state.chunks}
-    for chunk_id in sorted(set(state.sidecars) - chain_ids):
+    # Both directions. Missing committed artifacts are reported above; these are
+    # files the layout does not define, and artifacts no commit record names.
+    for name in state.unexpected_files:
         result.add(
-            Finding.ORPHAN_FILE,
-            "sidecar has no commit record in chunks.jsonl",
-            f"{stream_id}/{chunk_id:06d}.commit.json",
+            Finding.UNEXPECTED_FILE,
+            "present in a raw stream directory but not part of the v2 layout",
+            f"{stream_id}/{name}",
         )
         ok = False
-
-    # Files under raw/ that no commit record names are orphans. Recovery
-    # reports them; verification never adopts them.
-    for kind in ("payloads", "packets", "observations", "samples"):
-        directory = stream_dir / kind
-        if not directory.is_dir():
-            continue
-        for path in sorted(directory.iterdir()):
-            rel = f"{kind}/{path.name}"
-            if path.is_file() and rel not in committed_paths:
-                result.add(Finding.ORPHAN_FILE, "file has no commit record", f"{stream_id}/{rel}")
-                ok = False
-
-    readable = [c.record.model for c in state.chunks if c.record.chunk_id in intact]
-    if not _verify_payload_refs(stream_dir, state.descriptor, readable, result, stream_id):
+    for name in state.orphan_artifacts:
+        result.add(Finding.ORPHAN_FILE, "file has no commit record", f"{stream_id}/{name}")
         ok = False
     return ok
 
 
-def _verify_payload_refs(
-    root: Path,
-    descriptor: StreamDescriptor,
-    commits: list[ChunkCommit],
-    result: VerificationResult,
-    stream_id: str,
-) -> bool:
-    """payload_ref must be non-null iff the capture level is transport_payload."""
+def _condition_8(paths: PackagePaths, result: VerificationResult) -> bool:
+    """The effective outcome, failing closed on an indeterminate annotation log."""
+    effective = annotations_mod.resolve_effective_outcome(
+        sealed_outcome=result.sealed_outcome,
+        annotations_path=paths.annotations,
+        head_path=paths.annotations_head,
+    )
+    result.effective = effective
+    if effective.status is annotations_mod.AnnotationStatus.INDETERMINATE:
+        result.add(Finding.ANNOTATION_INTEGRITY_INDETERMINATE, effective.detail)
+        return False
     ok = True
-    expects = descriptor.expects_payload_artifact
-    for commit in commits:
-        packets_file = root / commit.packets.path
-        if not packets_file.is_file():
-            continue
-        try:
-            with packets_file.open("rb") as handle:
-                table = pa.ipc.open_stream(handle).read_all()
-            refs = table.column("payload_ref").to_pylist()
-        except (pa.ArrowException, OSError, KeyError, TypeError, ValueError) as exc:
-            # A corrupt artifact is a finding, never an exception out of a
-            # function whose job is to report findings.
-            result.add(
-                Finding.UNREADABLE_CHUNK_ARTIFACT,
-                f"chunk {commit.chunk_id}: {exc}",
-                stream_id,
-            )
-            ok = False
-            continue
-        if not expects:
-            if any(ref is not None for ref in refs):
-                result.add(
-                    Finding.PAYLOAD_REF_INVALID,
-                    f"chunk {commit.chunk_id} has a non-null payload_ref at "
-                    f"raw_capture_level={descriptor.acquisition.raw_capture_level.value}",
-                    stream_id,
-                )
-                ok = False
-            continue
-        if any(ref is None for ref in refs):
-            result.add(
-                Finding.PAYLOAD_REF_INVALID,
-                f"chunk {commit.chunk_id} has a null payload_ref at transport_payload",
-                stream_id,
-            )
-            ok = False
-            continue
-        if commit.payloads is None:
-            continue
-        payload_file = root / commit.payloads.path
-        if not payload_file.is_file():
-            # Already reported as CHUNK_ARTIFACT_MISSING; do not raise on top
-            # of it, and do not treat the refs as verified either.
-            ok = False
-            continue
-        blob = payload_file.read_bytes()
-        for ref in refs:
-            # The reference must name the chunk's own payload file. Otherwise a
-            # forged ref could point at another file entirely and still resolve.
-            if ref["file"] != commit.payloads.path:
-                result.add(
-                    Finding.PAYLOAD_REF_INVALID,
-                    f"payload_ref.file {ref['file']!r} is not {commit.payloads.path!r}",
-                    stream_id,
-                )
-                ok = False
-                break
-            try:
-                read_at(blob, PayloadRef(ref["file"], int(ref["offset"]), int(ref["length"])))
-            except PayloadFramingError as exc:
-                result.add(Finding.PAYLOAD_REF_INVALID, str(exc), stream_id)
-                ok = False
-                break
+    for rejected in effective.rejected:
+        result.add(
+            Finding.ANNOTATION_REJECTED, f"annotation {rejected.seq} rejected: {rejected.detail}"
+        )
+        ok = False
+    if effective.outcome is not RecordingOutcome.COMPLETED:
+        result.add(
+            Finding.EFFECTIVE_OUTCOME_NOT_COMPLETED, f"effective outcome is {effective.outcome}"
+        )
+        ok = False
     return ok
 
 

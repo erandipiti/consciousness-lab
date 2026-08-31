@@ -1,8 +1,10 @@
 """Path safety for package content (Codex CL-002B review pass 2).
 
-Every path that comes *out of a package file* — a manifest inventory entry, a
-chunk artifact path, a `payload_ref.file` — is untrusted input. Two attacks
-follow if it is used naively:
+Every path that comes *out of a package file* — a ``control_sha256`` key, or
+any path a reader resolves inside the package — is untrusted input. v2 derives
+artifact paths rather than reading them, which removes one whole class of this,
+but the control set is still a map whose keys arrive from the manifest. Two
+attacks follow if such a path is used naively:
 
 * **traversal**: ``../../etc/passwd`` or an absolute path resolves outside the
   package, so verification hashes a file that is not package content;

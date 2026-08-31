@@ -19,6 +19,7 @@ from consciousness_lab.session.model import (
     ClosureCondition,
     LifecycleRecord,
     LifecycleState,
+    Manifest,
     RecordingOutcome,
     load_on_disk,
 )
@@ -137,6 +138,24 @@ def parse_records(raw: bytes) -> list[LifecycleRecord]:
             break
         records.append(load_on_disk(LifecycleRecord, obj))
     return records
+
+
+def authoritative_records(path: Path, manifest: "Manifest | None") -> list[LifecycleRecord]:
+    """The lifecycle records that count, given whether the package is sealed.
+
+    For a sealed package that is the **sealed prefix**, never the whole file.
+    The manifest hashes ``lifecycle.jsonl[:sealed_len]``, so bytes past that
+    boundary are outside the seal by design; reading them would give recovery
+    and the derived registry a different outcome from the one the verifier
+    evaluates, and two definitions of the outcome is exactly the defect class
+    this design removes.
+    """
+    if not path.exists():
+        return []
+    raw = path.read_bytes()
+    if manifest is not None:
+        raw = raw[: manifest.lifecycle_seal.sealed_len]
+    return parse_records(raw)
 
 
 def summarize(records: Iterable[LifecycleRecord]) -> SealedLifecycle:

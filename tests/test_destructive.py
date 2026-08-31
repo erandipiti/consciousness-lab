@@ -99,7 +99,7 @@ def test_a_truncated_packet_file_reports_rather_than_raises(data_root: DataRoot)
     target.write_bytes(target.read_bytes()[:40])
     result = verify_package(built.allocated.paths)  # must not raise
     assert not result.is_completed
-    assert Finding.CHUNK_ARTIFACT_HASH_MISMATCH in result.findings()
+    assert Finding.CHUNK_ARTIFACT_INVALID in result.findings()
 
 
 def test_garbage_in_a_packet_file_reports_rather_than_raises(data_root: DataRoot) -> None:
@@ -136,24 +136,22 @@ def test_resolve_within_refuses_a_symlinked_component(tmp_path: Path) -> None:
         resolve_within(root, "link/file.bin")
 
 
-def test_a_forged_payload_ref_file_is_rejected(data_root: DataRoot) -> None:
-    """The reference must name the chunk's own payload file."""
-    import pyarrow as pa
+def test_a_payload_frame_for_an_absent_packet_is_rejected(data_root: DataRoot) -> None:
+    """The frame <-> packets relation is a bijection by identity (V08, §13).
 
-    from consciousness_lab.storage.arrow_schema import PACKETS_SCHEMA
+    There is no pointer left to forge, so the attack has to move to the frames
+    themselves: append a well-formed, correctly-checksummed frame for a packet
+    that has no row. The multiset comparison catches it.
+    """
+    from consciousness_lab.storage.payload import frame
 
     built = build_session(data_root, chunks=1, finalize_outcome=None)
-    packets_path = next((built.allocated.paths.raw / "synthetic.eeg" / "packets").iterdir())
-    with packets_path.open("rb") as reader:
-        rows = pa.ipc.open_stream(reader).read_all().to_pylist()
-    for row in rows:
-        row["payload_ref"] = dict(row["payload_ref"], file="payloads/999999.bin")
-    table = pa.Table.from_pylist(rows, schema=PACKETS_SCHEMA)
-    with packets_path.open("wb") as sink, pa.ipc.new_stream(sink, PACKETS_SCHEMA) as writer:
-        writer.write_table(table)
+    payload_path = next((built.allocated.paths.raw / "synthetic.eeg" / "payloads").iterdir())
+    payload_path.write_bytes(payload_path.read_bytes() + frame(999_999, b"orphan"))
 
     result = verify_package(built.allocated.paths)
     assert not result.is_completed
+    assert Finding.PAYLOAD_FRAMING_INVALID in result.findings()
 
 
 # --- SERIOUS: ENOSPC ---------------------------------------------------------
@@ -291,14 +289,11 @@ def test_a_tampered_event_record_hash_does_not_verify(data_root: DataRoot) -> No
     assert tampered != raw
     paths.events.write_bytes(tampered)
 
+    # Restore every hash the tamperer can recompute: the whole-file events seal
+    # and the manifest pair. What is left is the record's OWN record_sha256,
+    # which is the pre-seal integrity layer v2 keeps precisely for this (D34).
     obj = canonical_json.loads(paths.manifest.read_bytes())
-    obj["events_seal"]["bytes"] = str(len(tampered))
-    obj["events_seal"]["sha256"] = sha256_bytes(tampered)
-    # events/events.jsonl is inventoried too, so restore that entry as well.
-    for entry in obj["inventory"]:
-        if entry["path"] == "events/events.jsonl":
-            entry["bytes"] = str(len(tampered))
-            entry["sha256"] = sha256_bytes(tampered)
+    obj["events_sha256"] = sha256_bytes(tampered)
     body = canonical_json.canonicalize(obj)
     paths.manifest.write_bytes(body)
     paths.manifest_sha256.write_text(sha256_bytes(body) + "\n", encoding="utf-8")

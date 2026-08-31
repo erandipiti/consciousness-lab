@@ -62,7 +62,7 @@ def test_a_fresh_chunk_writer_refuses_an_occupied_stream(data_root: DataRoot) ->
     spec = SyntheticStreamSpec("synthetic.eeg", RawCaptureLevel.TRANSPORT_PAYLOAD)
     stream_paths = built.allocated.paths.stream("synthetic.eeg")
     with pytest.raises(ChunkWriteError, match="immutable"):
-        ChunkWriter(stream_paths, build_descriptor(spec), "deadbeef")
+        ChunkWriter(stream_paths, build_descriptor(spec))
 
 
 def test_atomic_write_new_refuses_to_clobber(data_root: DataRoot) -> None:
@@ -117,7 +117,10 @@ def test_every_on_disk_int64_is_written_as_a_string(data_root: DataRoot) -> None
     assert isinstance(raw["allocated_at"]["utc_ns"], str)
     manifest = canonical_json.loads(built.allocated.paths.manifest.read_bytes())
     assert isinstance(manifest["lifecycle_seal"]["sealed_len"], str)
-    assert isinstance(manifest["inventory"][0]["bytes"], str)
+    assert isinstance(manifest["sealed_at"]["utc_ns"], str)
+    chunks = built.allocated.paths.stream("synthetic.eeg").chunks_index.read_bytes()
+    first = canonical_json.loads(chunks.split(b"\n")[0])
+    assert isinstance(first["chunk_id"], str)
 
 
 # --- SERIOUS: observation rows -----------------------------------------------

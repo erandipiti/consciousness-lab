@@ -1,4 +1,4 @@
-"""Arrow schemas for raw chunks (spec §9.1, §9.3; D11).
+"""Arrow schemas for raw chunks (v2 §10.1; D11, D31).
 
 Three tables per stream, deliberately not one:
 
@@ -15,16 +15,12 @@ import pyarrow as pa
 
 from consciousness_lab.session.model import SampleLayout
 
-#: ``payload_ref`` is null for every stream whose capture level is not
-#: ``transport_payload``. A fabricated pointer is never written.
-PAYLOAD_REF_TYPE = pa.struct(
-    [
-        pa.field("file", pa.string(), nullable=False),
-        pa.field("offset", pa.uint64(), nullable=False),
-        pa.field("length", pa.uint64(), nullable=False),
-    ]
-)
-
+#: **There is no ``payload_ref`` in v2** (§5). A frame carries its own
+#: ``packet_seq``, so parsing ``payloads/NNNNNN.bin`` yields the packet -> bytes
+#: mapping deterministically; persisting a pointer to it was a second copy of
+#: what parsing produces. The consequence is that this schema is now identical
+#: at every capture level, which removed the "nullable iff transport_payload"
+#: relation with it.
 PACKETS_SCHEMA = pa.schema(
     [
         pa.field("packet_seq", pa.int64(), nullable=False),
@@ -33,7 +29,6 @@ PACKETS_SCHEMA = pa.schema(
         pa.field("host_arrival_monotonic_clock_id", pa.string(), nullable=False),
         pa.field("host_arrival_utc_clock_id", pa.string(), nullable=False),
         pa.field("n_samples", pa.int32(), nullable=False),
-        pa.field("payload_ref", PAYLOAD_REF_TYPE, nullable=True),
         pa.field("decode_status", pa.string(), nullable=False),
     ]
 )
@@ -89,3 +84,42 @@ def samples_schema(layout: SampleLayout, n_channels: int) -> pa.Schema:
             pa.field("value", pa.float64(), nullable=False),
         ]
     )
+
+
+def schema_for_kind(kind: str, layout: SampleLayout, n_channels: int) -> pa.Schema:
+    """The v2 contract schema for one artifact kind.
+
+    Used by the writer and by read-time verification, so there is one definition
+    of "the right schema" rather than two that can drift (D31).
+    """
+    if kind == "packets":
+        return PACKETS_SCHEMA
+    if kind == "observations":
+        return OBSERVATIONS_SCHEMA
+    if kind == "samples":
+        return samples_schema(layout, n_channels)
+    raise ValueError(f"{kind!r} has no Arrow schema")
+
+
+def schema_conformance_error(actual: pa.Schema, expected: pa.Schema) -> str | None:
+    """Why ``actual`` is not ``expected``, or ``None`` when it conforms.
+
+    Names, order, types and nullability are all contractual; Arrow **schema
+    metadata** is not, and is ignored here rather than compared (v2 §10.1).
+    A matching SHA proves identity, not conformance: it says the bytes are the
+    bytes that were sealed, never that they are a valid v2 artifact.
+    """
+    actual_names = actual.names
+    expected_names = expected.names
+    if actual_names != expected_names:
+        return f"fields are {actual_names}, expected {expected_names}"
+    for index, field in enumerate(expected):
+        found = actual.field(index)
+        if not found.type.equals(field.type):
+            return f"field {field.name!r} is {found.type}, expected {field.type}"
+        if found.nullable != field.nullable:
+            return (
+                f"field {field.name!r} is "
+                f"{'nullable' if found.nullable else 'non-nullable'}, expected the opposite"
+            )
+    return None

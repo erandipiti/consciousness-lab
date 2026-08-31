@@ -9,6 +9,76 @@ Versioning policy is unresolved — see `docs/OPERATIONS.md`.
 
 ## [Unreleased]
 
+### Added — CL-002B-R2: Session Package v2 implemented
+
+`src/` now writes and verifies **Session Package v2** (`schema_version = "2.0"`).
+The v1 implementation is replaced, not carried alongside: no Study 001 recording
+exists under v1, so backward compatibility was not a requirement, and a v2 reader
+meeting a v1 package raises `UnsupportedSchemaVersionError` rather than guessing
+(D27). No legacy or debug reader was built, because nothing needed one.
+
+**Removed from the production writer** — each was a persisted second copy of a
+fact with another authority (D28, D29):
+
+- per-chunk `NNNNNN.commit.json` sidecars; `chunks.jsonl` is the sole commit
+  authority
+- `ChunkArtifact` entirely — artifact `path` and `bytes` are gone, replaced by
+  `artifact_sha256`, a map of kind to digest
+- `first_packet_seq` / `last_packet_seq` / `descriptor_sha256` from the commit
+  record, and `record_sha256` from `chunks.jsonl`
+- `ManifestStream`, `manifest.session_id`, `manifest.scope_note`, the flat
+  `inventory`, the `schemas` list and the `events_seal` wrapper
+- `payload_ref` — from the packets Arrow schema, the writer, the reader and the
+  synthetic source. The packets schema is now identical at every capture level.
+
+**Added**
+
+- `raw/<stream_id>/stream_close.json`, written once per opened stream via
+  tmp → fsync → rename → fsync(dir) and immutable thereafter (D33). It is the
+  sole persisted closure authority; the manifest seals it and does not repeat it.
+  `RECOVERED_UNCLEAN` joins the status domain.
+- `manifest.control_sha256`, a map keyed on a **derived** control set —
+  `allocation.json`, `run.json`, each stream's three control files, and exactly
+  the schema snapshots the sealed events log references. Raw artifact hashes
+  appear once, in `chunks.jsonl` (D30).
+- `storage/package_layout.py`: the closed v2 file set, the derived control set,
+  the referenced-schema set, and canonical-on-disk verification for documents
+  and JSONL regions.
+- Physical Arrow schema conformance and observation row semantics validated on
+  **read** by the same shared validator the writer uses (D31).
+- `recovery.resume_finalization`: a durable terminal lifecycle record with no
+  manifest pair is `INTERRUPTED_FINALIZATION` and may be resumed without
+  altering the recorded outcome. Resuming an ABORTED package seals ABORTED.
+
+**Fixed while porting**
+
+- `recovery.scan` and the derived registry read the **whole** `lifecycle.jsonl`,
+  while the verifier reads only the sealed prefix. A record appended past
+  `sealed_len` therefore changed the outcome those two reported. Both now use
+  `lifecycle.authoritative_records`, so every reader agrees where the authority
+  stops.
+- The registry's stream rows were built from `manifest.streams`, which v2 does
+  not have; they now come from the physical stream directories and each
+  stream's own `stream_close.json`.
+
+**Tests: 340 → 349.** Four v1 files were deleted outright, having existed only to
+reconcile representations v2 removed: `test_equivalence_matrix.py` (the R01–R34
+matrix), `test_canonical_and_physical.py` (sidecar and summary reconciliation),
+`test_leaf_integrity.py` (inventory `bytes`, duplicate inventory paths) and
+`test_referential_integrity.py` (manifest ↔ filesystem). Six replaced them:
+`test_relations_v01_v14.py`, `test_v2_contract.py`, `test_layout_closure.py`,
+`test_arrow_conformance.py`, `test_stream_closure.py`,
+`test_finalization_and_resume.py`, `test_canonical_on_disk.py` and
+`test_mutation_properties.py`. Adversarial tests mutate physical bytes and then
+restore every hash a forger could restore, so what survives is the conformance
+rule rather than an incidental hash mismatch.
+
+**One deliberate non-enforcement, stated rather than hidden.** A deleted
+`observations` row is not detected, because §10.3 names no observation primary
+key and forbids inventing one — observations are not a complete set by contract.
+`test_mutation_properties.py` asserts that boundary explicitly instead of
+implying the class is covered.
+
 ### Fixed — CL-002A-R3-APPROVAL-ERRATA: stale implementation pointer (documentation only)
 
 `docs/SESSION_FORMAT.md` §"What implementation owes this document" still read

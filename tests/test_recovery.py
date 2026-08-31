@@ -51,7 +51,7 @@ def test_recovery_does_not_delete_or_adopt_anything(data_root: DataRoot) -> None
     from consciousness_lab.storage.verifier import read_chunk_index
 
     commits, _ = read_chunk_index(built.allocated.paths, "synthetic.eeg")
-    assert all("999999" not in c.samples.path for c in commits), "and must not adopt it"
+    assert all("999999" not in c.artifact_path("samples") for c in commits), "and must not adopt it"
 
 
 def test_known_technical_failure_is_recorded_as_such(data_root: DataRoot) -> None:

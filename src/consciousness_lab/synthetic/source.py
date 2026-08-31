@@ -1,4 +1,4 @@
-"""A deterministic synthetic stream source (spec §16, §23).
+"""A deterministic synthetic stream source (v2 §15).
 
 Produces packets, samples and observations from a recorded seed, so the same
 seed always yields byte-identical raw tables. It generates no scientific signal
@@ -141,16 +141,11 @@ class SyntheticSource:
                             }
                         )
 
-            payload_ref: dict[str, Any] | None = None
             if preserved:
+                # No payload_ref is produced: v2 removed it, and the frame the
+                # writer emits already carries this packet_seq (§5).
                 blob = b"".join(struct.pack("<f", v) for row in values for v in row)
-                offset = sum(20 + len(p) for _, p in pending.payloads)
                 pending.payloads.append((packet_seq, blob))
-                payload_ref = {
-                    "file": "payloads",
-                    "offset": offset,
-                    "length": len(blob),
-                }
 
             pending.packets.append(
                 {
@@ -160,7 +155,6 @@ class SyntheticSource:
                     "host_arrival_monotonic_clock_id": MONOTONIC_CLOCK_ID,
                     "host_arrival_utc_clock_id": UTC_CLOCK_ID,
                     "n_samples": self.spec.samples_per_packet,
-                    "payload_ref": payload_ref,
                     "decode_status": "ok",
                 }
             )

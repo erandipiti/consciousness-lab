@@ -1,10 +1,11 @@
-"""Typed models for Session Package v1 (spec §7, §8, §9, §13; D8-D26).
+"""Typed models for Session Package v2 (`SESSION_SCHEMA_V2_PROPOSAL.md`; D8-D34).
 
 These models are the on-disk contract. They encode structure and provenance
 only: nothing here interprets a physiological signal, and no scientific
 threshold appears in this file.
 """
 
+import re
 from enum import StrEnum
 from typing import Annotated, Any, Literal, TypeVar
 
@@ -19,8 +20,8 @@ from consciousness_lab.storage.integer_types import (
 _T = TypeVar("_T", bound=BaseModel)
 
 SCHEMA_NAME = "session_package"
-SCHEMA_VERSION = "1.0"
-SCHEMA_MAJOR = 1
+SCHEMA_VERSION = "2.0"
+SCHEMA_MAJOR = 2
 
 PSEUDONYM_PATTERN = r"^P[0-9]{3,6}$"
 
@@ -28,10 +29,10 @@ PSEUDONYM_PATTERN = r"^P[0-9]{3,6}$"
 class Strict(BaseModel):
     """Base model for every on-disk record.
 
-    ``extra="ignore"`` implements the minor-version tolerance of spec §17: a
-    v1.1 package carrying a new optional field must still be readable by a v1.0
-    reader. This does not weaken integrity — record hashes are computed over the
-    raw parsed document, not the model, so an added field still changes the hash
+    ``extra="ignore"`` implements minor-version tolerance: a v2.1 package
+    carrying a new optional field must still be readable by a v2.0 reader. This
+    does not weaken integrity — hashes are computed over the raw parsed
+    document, not the model, so an added field still changes the canonical bytes
     and is still detected. An unknown *major* version fails closed instead.
     """
 
@@ -82,10 +83,19 @@ class SampleLayout(StrEnum):
 
 
 class StreamCloseStatus(StrEnum):
+    """Terminal closure of one raw stream (v2 §7.1, D33).
+
+    ``RECOVERED_UNCLEAN`` is new in v2 and is an *operational* fact: recovery
+    observed that the process disappeared while this stream had no durable
+    terminal close record. It must never be silently mapped to ``FAILED`` or
+    ``DISCONNECTED``, which would assert a device-specific cause nobody saw.
+    """
+
     CLEAN = "CLEAN"
     DISCONNECTED = "DISCONNECTED"
     RECONFIGURED = "RECONFIGURED"
     FAILED = "FAILED"
+    RECOVERED_UNCLEAN = "RECOVERED_UNCLEAN"
 
 
 class ObservationKind(StrEnum):
@@ -373,45 +383,88 @@ class StreamDescriptor(Strict):
         return self.acquisition.raw_capture_level is RawCaptureLevel.TRANSPORT_PAYLOAD
 
 
-class FileEntry(Strict):
-    """One file, its size and its hash. Sizes are uint64 (spec §12.2.1)."""
+#: Artifact kinds a chunk may produce. ``payloads`` exists only at
+#: ``transport_payload``; the other three are always required (v2 §6).
+ARTIFACT_KINDS: tuple[str, ...] = ("packets", "observations", "samples", "payloads")
+REQUIRED_ARTIFACT_KINDS: frozenset[str] = frozenset({"packets", "observations", "samples"})
 
-    path: str
-    bytes: UInt64Decimal
-    sha256: str
+_SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 
 
-class ChunkArtifact(Strict):
-    path: str
-    sha256: str
-    bytes: UInt64Decimal
+def artifact_relative_path(kind: str, chunk_id: int) -> str:
+    """The one path an artifact may occupy, derived from its kind and chunk id.
+
+    v2 persists no artifact path (D29): the path is a function of
+    ``(kind, chunk_id)`` and every reader derives it the same way, so there is
+    no stored second copy that could disagree with the file system.
+    """
+    if kind not in ARTIFACT_KINDS:
+        raise ValueError(f"unknown artifact kind {kind!r}")
+    suffix = "bin" if kind == "payloads" else "arrow"
+    return f"{kind}/{chunk_id:06d}.{suffix}"
 
 
 class ChunkCommit(Strict):
-    """One chunk commit record (spec §12.2).
+    """One chunk commit record (v2 §6; D28, D29, D34).
 
-    A chunk is real iff its record appears in ``chunks.jsonl``. The record names
-    every artifact the chunk produced: four at ``transport_payload``, three at
-    the other capture levels, where ``payloads`` is omitted entirely rather than
-    written as null or an empty path.
+    A chunk is real iff its record appears in ``chunks.jsonl`` — there is no
+    sidecar in v2. The record carries exactly three things: which chunk it is,
+    what it chains to, and the hash of every artifact it produced.
+
+    **No ``record_sha256``.** A record's own hash is derivable from its
+    canonical bytes, and the next record's ``prev_record_sha256`` is precisely
+    that value, so a reader computes it either way. Persisting it was a second
+    copy of a derived value (D29). The chain's last record is covered by the
+    whole-file hash in ``control_sha256``.
+
+    **No artifact paths, sizes, packet ranges or descriptor hash.** Paths are
+    deterministic, a SHA over a whole file already fixes its length, the
+    physical ``packets`` rows are authoritative for the range, and a stream has
+    exactly one immutable descriptor.
     """
+
+    model_config = ConfigDict(extra="ignore", frozen=True)
 
     chunk_id: UInt64Decimal
     prev_record_sha256: str
-    payloads: ChunkArtifact | None = None
-    packets: ChunkArtifact
-    observations: ChunkArtifact
-    samples: ChunkArtifact
-    first_packet_seq: Int64Decimal
-    last_packet_seq: Int64Decimal
-    descriptor_sha256: str
-    record_sha256: str | None = None
+    artifact_sha256: dict[str, str]
 
     @model_validator(mode="after")
-    def _ordered(self) -> "ChunkCommit":
-        if self.last_packet_seq < self.first_packet_seq:
-            raise ValueError("last_packet_seq precedes first_packet_seq")
+    def _artifacts(self) -> "ChunkCommit":
+        keys = set(self.artifact_sha256)
+        unknown = sorted(keys - set(ARTIFACT_KINDS))
+        if unknown:
+            raise ValueError(f"artifact_sha256 carries unknown kind(s) {unknown}")
+        missing = sorted(REQUIRED_ARTIFACT_KINDS - keys)
+        if missing:
+            raise ValueError(f"artifact_sha256 is missing required kind(s) {missing}")
+        for kind, digest in sorted(self.artifact_sha256.items()):
+            if not _SHA256_PATTERN.match(digest):
+                raise ValueError(f"artifact_sha256[{kind}] is not a lowercase hex SHA-256")
+        if not _SHA256_PATTERN.match(self.prev_record_sha256):
+            raise ValueError("prev_record_sha256 is not a lowercase hex SHA-256")
         return self
+
+    @property
+    def has_payload_artifact(self) -> bool:
+        return "payloads" in self.artifact_sha256
+
+    def artifact_path(self, kind: str) -> str:
+        """Deterministic package-relative path of one artifact of this chunk."""
+        return artifact_relative_path(kind, self.chunk_id)
+
+
+class StreamClose(Strict):
+    """``raw/<stream_id>/stream_close.json`` — the sole closure authority (D33).
+
+    One immutable file per opened stream. It carries no ``stream_id``: the path
+    already owns identity, and a second copy of an identity is exactly what v2
+    removes. It carries no convenience summaries either.
+    """
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    close_status: StreamCloseStatus
 
 
 class LifecycleRecord(Strict):
@@ -494,55 +547,52 @@ class EventRecord(Strict):
 
 
 class SealPointer(Strict):
-    """A hashed prefix of an append-only file."""
+    """A hashed prefix of an append-only file.
 
-    path: str
+    ``sealed_len`` is kept because it is **semantic**: it marks the boundary
+    beyond which annotations legitimately append. Its fixed ``path`` is dropped
+    — ``lifecycle.jsonl`` is the only file this ever pointed at (v2 §12).
+    """
+
     sealed_len: UInt64Decimal
     sealed_sha256: str
 
 
-class FileSeal(Strict):
-    path: str
-    bytes: UInt64Decimal
-    sha256: str
-
-
-class ManifestStream(Strict):
-    stream_id: str
-    required: bool
-    close_status: StreamCloseStatus
-    descriptor_sha256: str
-    chunk_count: UInt64Decimal
-    chunk_chain_head_sha256: str | None = None
-    first_packet_seq: Int64Decimal | None = None
-    last_packet_seq: Int64Decimal | None = None
-
-
-class SchemaSnapshot(Strict):
-    schema_id: str
-    path: str
-    sha256: str
-
-
 class Manifest(Strict):
-    """``manifest.json`` — written once at finalization (spec §13, D21).
+    """``manifest.json`` — written once at finalization (v2 §7; D21, D30, D33).
 
-    The manifest owns bytes, not meaning. It carries **no outcome field**: the
-    outcome belongs to the lifecycle log plus annotations, resolved per §5.1.
-    A valid manifest pair is a FINALIZATION marker, never a completion marker —
-    a cleanly aborted session produces an identical, fully valid pair.
+    The v2 manifest is exactly two things: a **finalization marker** and an
+    **integrity root**. It owns no semantic stream fact at all — closure lives
+    in ``raw/<id>/stream_close.json``, requiredness in ``run.json``, chunk
+    counts and chain heads in each ``chunks.jsonl``, and packet ranges in the
+    physical ``packets`` artifacts.
+
+    It carries **no outcome field**: the outcome belongs to the lifecycle log
+    plus annotations. A valid manifest pair is a FINALIZATION marker, never a
+    completion marker — a cleanly aborted session produces an identical pair.
+
+    It carries **no ``session_id``**: identity is owned by ``allocation.json``,
+    whose hash is in ``control_sha256``, and by the directory name. A manifest
+    swapped between packages is caught because the allocation hash will not
+    match.
+
+    ``control_sha256`` is a **map**, path to SHA-256, so a duplicate path is
+    structurally impossible. Raw artifacts are absent from it by design: they
+    are sealed transitively through each stream's ``chunks.jsonl`` (D30).
     """
 
     schema_name: Literal["session_package"] = "session_package"
     schema_version: str = SCHEMA_VERSION
-    session_id: str
     sealed_at: ClockReading
     lifecycle_seal: SealPointer
-    events_seal: FileSeal
-    streams: list[ManifestStream] = Field(default_factory=list)
-    inventory: list[FileEntry] = Field(default_factory=list)
-    schemas: list[SchemaSnapshot] = Field(default_factory=list)
-    scope_note: str = (
-        "logs/, annotations.jsonl, annotations.head.json and data/derived/ are "
-        "OUTSIDE this manifest by design."
-    )
+    events_sha256: str
+    control_sha256: dict[str, str]
+
+    @model_validator(mode="after")
+    def _hashes(self) -> "Manifest":
+        if not _SHA256_PATTERN.match(self.events_sha256):
+            raise ValueError("events_sha256 is not a lowercase hex SHA-256")
+        for path, digest in sorted(self.control_sha256.items()):
+            if not _SHA256_PATTERN.match(digest):
+                raise ValueError(f"control_sha256[{path}] is not a lowercase hex SHA-256")
+        return self

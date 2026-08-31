@@ -1,4 +1,4 @@
-"""Package reading and replay (spec §16; D26).
+"""Package reading and replay (v2 §15; D26, D27).
 
 Replay lives at the storage/read boundary, deliberately not behind a fake device
 adapter: impersonating hardware is what makes a replay indistinguishable from a
@@ -15,8 +15,8 @@ from typing import Any
 
 import pyarrow as pa
 
-from consciousness_lab.session.finalizer import read_manifest
 from consciousness_lab.session.model import (
+    SCHEMA_MAJOR,
     Allocation,
     ChunkCommit,
     EventRecord,
@@ -26,13 +26,20 @@ from consciousness_lab.session.model import (
     load_on_disk,
 )
 from consciousness_lab.storage import canonical_json
+from consciousness_lab.storage.package_layout import read_manifest
 from consciousness_lab.storage.paths import PackagePaths
-from consciousness_lab.storage.payload import PayloadRef, read_at
+from consciousness_lab.storage.payload import PayloadFramingError, payloads_by_packet
 from consciousness_lab.storage.verifier import read_chunk_index
 
 
 class UnsupportedSchemaVersionError(RuntimeError):
-    """A package declares a major schema version this reader does not implement."""
+    """A package declares a major schema version this reader does not implement.
+
+    A v2 reader **fails closed** on a v1 package rather than guessing (D27).
+    There is no in-place migration and no acquisition package is ever mutated.
+    If a v1 development fixture ever needs inspecting, that is a separate,
+    explicitly versioned legacy reader; it must not constrain v2.
+    """
 
 
 @dataclass(frozen=True)
@@ -51,31 +58,41 @@ class StreamReader:
 
     def packets(self) -> Iterator[dict[str, Any]]:
         for commit in self.commits:
-            yield from self._table(commit.packets.path).to_pylist()
+            yield from self._table(commit.artifact_path("packets")).to_pylist()
 
     def samples(self) -> Iterator[dict[str, Any]]:
         for commit in self.commits:
-            yield from self._table(commit.samples.path).to_pylist()
+            yield from self._table(commit.artifact_path("samples")).to_pylist()
 
     def observations(self) -> Iterator[dict[str, Any]]:
         for commit in self.commits:
-            yield from self._table(commit.observations.path).to_pylist()
+            yield from self._table(commit.artifact_path("observations")).to_pylist()
 
     def payloads(self) -> Iterator[tuple[int, bytes]]:
-        """Resolve each packet's transport bytes through its own reference.
+        """Yield each packet's transport bytes, in packet order.
 
-        Yields nothing when the stream's capture level is not
+        v2 has no ``payload_ref``: the packet -> bytes index is produced by
+        walking the chunk's payload file, keyed by the ``packet_seq`` each frame
+        carries. Yields nothing when the capture level is not
         ``transport_payload``: there are no bytes, and none are invented.
         """
         if not self.descriptor.expects_payload_artifact:
             return
+        root = self.paths.stream(self.stream_id).root
         for commit in self.commits:
-            if commit.payloads is None:
+            if not commit.has_payload_artifact:
                 continue
-            blob = (self.paths.stream(self.stream_id).root / commit.payloads.path).read_bytes()
-            for row in self._table(commit.packets.path).to_pylist():
-                ref = row["payload_ref"]
-                yield read_at(blob, PayloadRef(ref["file"], int(ref["offset"]), int(ref["length"])))
+            blob = (root / commit.artifact_path("payloads")).read_bytes()
+            mapping, error = payloads_by_packet(blob)
+            if error is not None:
+                raise PayloadFramingError(f"chunk {commit.chunk_id}: {error}")
+            for row in self._table(commit.artifact_path("packets")).to_pylist():
+                seq = int(row["packet_seq"])
+                if seq not in mapping:
+                    raise PayloadFramingError(
+                        f"chunk {commit.chunk_id}: packet {seq} has no payload frame"
+                    )
+                yield seq, mapping[seq]
 
 
 @dataclass(frozen=True)
@@ -111,7 +128,7 @@ class UnverifiedPackageError(RuntimeError):
 
 
 def open_package(
-    paths: PackagePaths, *, supported_major: int = 1, verify: bool = True
+    paths: PackagePaths, *, supported_major: int = SCHEMA_MAJOR, verify: bool = True
 ) -> PackageReader:
     """Load a package, refusing an unsupported major schema version.
 
@@ -121,8 +138,8 @@ def open_package(
     whose whole job is to look at packages that do not verify.
 
     Minor-version tolerance is deliberate: an unknown *optional* field in a
-    v1.x package is ignored, while an unknown major fails closed. Nothing is
-    migrated and nothing is mutated (spec §17).
+    v2.x package is ignored, while an unknown major fails closed. Nothing is
+    migrated and nothing is mutated (D27).
     """
     allocation = load_on_disk(Allocation, canonical_json.loads(paths.allocation.read_bytes()))
     major = int(allocation.schema_version.split(".")[0])

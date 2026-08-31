@@ -172,13 +172,19 @@ def test_required_stream_sets_are_configuration_not_a_hardcoded_decision(
         SyntheticStreamSpec("synthetic.eeg", RawCaptureLevel.TRANSPORT_PAYLOAD),
         SyntheticStreamSpec("synthetic.ecg", RawCaptureLevel.LIBRARY_DECODED),
     ]
-    one = build_session(data_root, streams=specs, required=("synthetic.eeg",))
+    one = build_session(
+        data_root, streams=specs, required=("synthetic.eeg",), optional=("synthetic.ecg",)
+    )
     both = build_session(data_root, streams=specs, required=("synthetic.eeg", "synthetic.ecg"))
     assert verify_package(one.allocated.paths).is_completed
     assert verify_package(both.allocated.paths).is_completed
+    # run.json is the declaration of record, and the v2 manifest repeats none
+    # of it: requiredness has exactly one authority (D33, v2 §7).
     assert one.result is not None and both.result is not None
-    assert {s.stream_id for s in one.result.manifest.streams if s.required} == {"synthetic.eeg"}
-    assert {s.stream_id for s in both.result.manifest.streams if s.required} == {
-        "synthetic.eeg",
-        "synthetic.ecg",
-    }
+    one_run = verify_package(one.allocated.paths).run
+    both_run = verify_package(both.allocated.paths).run
+    assert one_run is not None and both_run is not None
+    assert set(one_run.required_streams) == {"synthetic.eeg"}
+    assert set(both_run.required_streams) == {"synthetic.eeg", "synthetic.ecg"}
+    for result in (one.result, both.result):
+        assert not hasattr(result.manifest, "streams")

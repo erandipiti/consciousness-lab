@@ -1,7 +1,9 @@
-"""Package layout (spec §3). One place that knows where things live."""
+"""Package layout (v2 §3). One place that knows where things live."""
 
 from dataclasses import dataclass
 from pathlib import Path
+
+from consciousness_lab.session.model import artifact_relative_path
 
 SESSIONS_DIR = "sessions"
 DERIVED_DIR = "derived"
@@ -76,16 +78,16 @@ class StreamPaths:
     def chunks_index(self) -> Path:
         return self.root / "chunks.jsonl"
 
+    @property
+    def stream_close(self) -> Path:
+        """The stream's durable closure record (v2 §7.1, D33)."""
+        return self.root / "stream_close.json"
+
     def artifact(self, kind: str, chunk_id: int) -> Path:
-        suffix = "bin" if kind == "payloads" else "arrow"
-        return self.root / kind / f"{chunk_id:06d}.{suffix}"
+        return self.root / artifact_relative_path(kind, chunk_id)
 
     def relative_artifact(self, kind: str, chunk_id: int) -> str:
-        suffix = "bin" if kind == "payloads" else "arrow"
-        return f"{kind}/{chunk_id:06d}.{suffix}"
-
-    def sidecar(self, chunk_id: int) -> Path:
-        return self.root / f"{chunk_id:06d}.commit.json"
+        return artifact_relative_path(kind, chunk_id)
 
 
 @dataclass(frozen=True)

@@ -16,9 +16,8 @@ from pathlib import Path
 from typing import Any
 
 from consciousness_lab.session import annotations as annotations_mod
-from consciousness_lab.session.finalizer import read_manifest
 from consciousness_lab.session.lifecycle import SealedLifecycle as LifecycleSummary
-from consciousness_lab.session.lifecycle import read_records, summarize
+from consciousness_lab.session.lifecycle import authoritative_records, summarize
 from consciousness_lab.session.model import (
     Allocation,
     LifecycleState,
@@ -28,7 +27,9 @@ from consciousness_lab.session.model import (
     load_on_disk,
 )
 from consciousness_lab.storage import canonical_json
+from consciousness_lab.storage.package_layout import read_manifest
 from consciousness_lab.storage.paths import DataRoot, PackagePaths
+from consciousness_lab.storage.stream_state import read_all_physical_streams
 from consciousness_lab.storage.verifier import verify_package
 
 SCHEMA = """
@@ -122,8 +123,8 @@ def _scan_package(paths: PackagePaths) -> ScannedPackage | None:
     except (canonical_json.CanonicalizationError, ValueError):
         return None
 
-    summary = summarize(read_records(paths.lifecycle))
     manifest = read_manifest(paths.manifest)
+    summary = summarize(authoritative_records(paths.lifecycle, manifest))
     effective = annotations_mod.resolve_effective_outcome(
         sealed_outcome=summary.sealed_outcome,
         annotations_path=paths.annotations,
@@ -237,23 +238,25 @@ def _insert(cur: sqlite3.Cursor, scanned: ScannedPackage, now: str) -> None:
                 str(record.utc_ns),
             ),
         )
+    # The v2 manifest owns no stream fact, so the derived index reads the same
+    # authorities the verifier does: the physical stream directories, each
+    # stream's own stream_close.json, and run.json for requiredness (D33).
     required = set(run.required_streams) if run is not None else set()
-    if manifest is not None:
-        for stream in manifest.streams:
-            descriptor_level = _capture_level(paths, stream.stream_id)
-            cur.execute(
-                "INSERT OR REPLACE INTO streams VALUES (?,?,?,?,?,?,?,?)",
-                (
-                    allocation.session_id,
-                    stream.stream_id,
-                    None,
-                    None,
-                    descriptor_level,
-                    int(stream.stream_id in required),
-                    str(stream.close_status),
-                    stream.descriptor_sha256,
-                ),
-            )
+    for stream_id, stream_state in sorted(read_all_physical_streams(paths).items()):
+        descriptor = stream_state.descriptor
+        cur.execute(
+            "INSERT OR REPLACE INTO streams VALUES (?,?,?,?,?,?,?,?)",
+            (
+                allocation.session_id,
+                stream_id,
+                descriptor.device_kind if descriptor is not None else None,
+                descriptor.modality if descriptor is not None else None,
+                _capture_level(paths, stream_id),
+                int(stream_id in required),
+                str(stream_state.close_status) if stream_state.close_status is not None else None,
+                stream_state.descriptor_sha256,
+            ),
+        )
 
 
 def _manifest_hash(paths: PackagePaths) -> str | None:

@@ -276,7 +276,7 @@ def test_finalizer_refuses_to_seal_completed_with_an_unclean_required_stream(
     """
     from consciousness_lab.session.finalizer import FinalizationError
 
-    with pytest.raises(FinalizationError, match="did not close CLEAN"):
+    with pytest.raises(FinalizationError, match="not CLEAN"):
         build_session(
             data_root,
             streams=[

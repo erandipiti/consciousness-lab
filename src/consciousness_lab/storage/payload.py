@@ -1,4 +1,4 @@
-"""Transport payload framing (spec §9.1).
+"""Transport payload framing (v2 §13).
 
 The exact device bytes, preserved unmodified, for streams whose
 ``raw_capture_level`` is ``transport_payload``. Framing is fixed so two
@@ -13,11 +13,16 @@ implementations cannot disagree about where a record starts or ends:
 All integers little-endian and unsigned. Total record size is
 ``20 + payload_len``; records are byte-adjacent with no file header and no
 padding, so a payload file is a pure concatenation.
+
+**v2 removes ``payload_ref``.** A frame carries its own ``packet_seq``, so the
+packet -> bytes mapping is produced by walking the file; a persisted pointer was
+a second copy of what parsing already yields (§5). The relation the verifier
+enforces is therefore a bijection by identity: the multiset of frame
+``packet_seq`` values equals the multiset of ``packets.packet_seq`` values.
 """
 
 import struct
 from dataclasses import dataclass
-from typing import BinaryIO
 
 MAGIC = 0x444C5950
 HEADER = struct.Struct("<IQI")
@@ -50,60 +55,9 @@ class PayloadFramingError(ValueError):
     """A payload record is malformed, mis-referenced or fails its checksum."""
 
 
-@dataclass(frozen=True)
-class PayloadRef:
-    """Where a packet's transport bytes live.
-
-    ``offset`` is the byte offset of the record's ``magic`` field from the start
-    of the file; ``length`` is ``payload_len``, the payload alone, excluding
-    framing.
-    """
-
-    file: str
-    offset: int
-    length: int
-
-
 def frame(packet_seq: int, payload: bytes) -> bytes:
     """Encode one payload record."""
     return HEADER.pack(MAGIC, packet_seq, len(payload)) + payload + CRC.pack(crc32c(payload))
-
-
-def write_record(
-    handle: BinaryIO, packet_seq: int, payload: bytes, *, file_name: str
-) -> PayloadRef:
-    """Append one record and return the reference that points back at it."""
-    offset = handle.tell()
-    handle.write(frame(packet_seq, payload))
-    return PayloadRef(file=file_name, offset=offset, length=len(payload))
-
-
-def read_at(data: bytes, ref: PayloadRef) -> tuple[int, bytes]:
-    """Resolve a reference to ``(packet_seq, payload)``, failing closed.
-
-    A reference whose offset does not land on ``magic`` is broken: the reader
-    raises rather than returning whatever bytes happen to be at that position.
-    """
-    if ref.offset < 0 or ref.offset + HEADER_SIZE > len(data):
-        raise PayloadFramingError(f"payload_ref offset {ref.offset} is outside the file")
-    magic, packet_seq, payload_len = HEADER.unpack_from(data, ref.offset)
-    if magic != MAGIC:
-        raise PayloadFramingError(
-            f"payload_ref offset {ref.offset} does not point at a record header"
-        )
-    if payload_len != ref.length:
-        raise PayloadFramingError(
-            f"payload_ref length {ref.length} disagrees with framed length {payload_len}"
-        )
-    start = ref.offset + HEADER_SIZE
-    end = start + payload_len
-    if end + CRC_SIZE > len(data):
-        raise PayloadFramingError("payload record is truncated")
-    payload = data[start:end]
-    (stored_crc,) = CRC.unpack_from(data, end)
-    if stored_crc != crc32c(payload):
-        raise PayloadFramingError(f"payload CRC mismatch at offset {ref.offset}")
-    return packet_seq, payload
 
 
 @dataclass(frozen=True)
@@ -159,27 +113,19 @@ def iter_frames(data: bytes) -> tuple[list[Frame], str | None]:
     return frames, None
 
 
-def iter_records(data: bytes) -> list[tuple[int, bytes]]:
-    """Walk a payload file from the start, stopping at the first bad record.
+def payloads_by_packet(data: bytes) -> tuple[dict[int, bytes], str | None]:
+    """Map ``packet_seq -> payload bytes`` by walking the file.
 
-    Used by verification and recovery. A trailing partial record — the shape a
-    crash leaves — terminates the walk rather than raising, because reporting
-    "N complete records then a torn tail" is more useful than reporting nothing.
+    This replaces v1's persisted ``payload_ref``: the index is derived, so there
+    is no stored pointer that can drift out of step with the frames. A duplicate
+    ``packet_seq`` is reported rather than silently overwritten, because two
+    frames claiming one packet is a real defect and last-write-wins would hide
+    it.
     """
-    records: list[tuple[int, bytes]] = []
-    offset = 0
-    while offset + HEADER_SIZE <= len(data):
-        magic, packet_seq, payload_len = HEADER.unpack_from(data, offset)
-        if magic != MAGIC:
-            break
-        start = offset + HEADER_SIZE
-        end = start + payload_len
-        if end + CRC_SIZE > len(data):
-            break
-        payload = data[start:end]
-        (stored_crc,) = CRC.unpack_from(data, end)
-        if stored_crc != crc32c(payload):
-            break
-        records.append((packet_seq, payload))
-        offset = end + CRC_SIZE
-    return records
+    frames, error = iter_frames(data)
+    mapping: dict[int, bytes] = {}
+    for item in frames:
+        if item.packet_seq in mapping:
+            return mapping, f"packet_seq {item.packet_seq} is framed more than once"
+        mapping[item.packet_seq] = item.payload
+    return mapping, error

@@ -3,6 +3,7 @@
 import pytest
 
 from consciousness_lab.session.model import RawCaptureLevel
+from consciousness_lab.storage import canonical_json
 from consciousness_lab.storage.paths import DataRoot
 from consciousness_lab.storage.reader import UnsupportedSchemaVersionError, open_package
 from consciousness_lab.storage.verifier import verify_package
@@ -120,10 +121,24 @@ def test_sparse_long_layout_round_trips(data_root: DataRoot) -> None:
 
 
 def test_unknown_major_schema_version_fails_closed(data_root: DataRoot) -> None:
-    """A v2 reader opening a v1 package dispatches or refuses; it never guesses."""
+    """A reader meeting an unimplemented major refuses; it never guesses."""
     built = build_session(data_root)
     with pytest.raises(UnsupportedSchemaVersionError):
-        open_package(built.allocated.paths, supported_major=2)
+        open_package(built.allocated.paths, supported_major=3)
+
+
+def test_a_v1_package_fails_closed_on_a_v2_reader(data_root: DataRoot) -> None:
+    """D27: a v2 reader meeting a v1 package refuses rather than migrating.
+
+    Nothing is mutated and no best-effort parse is attempted — "1.0" is not a
+    dialect of "2.0", and guessing is exactly what produces silently wrong data.
+    """
+    built = build_session(data_root)
+    allocation = canonical_json.loads(built.allocated.paths.allocation.read_bytes())
+    allocation["schema_version"] = "1.0"
+    built.allocated.paths.allocation.write_bytes(canonical_json.canonicalize(allocation))
+    with pytest.raises(UnsupportedSchemaVersionError):
+        open_package(built.allocated.paths, verify=False)
 
 
 def test_descriptor_records_the_generator_and_stays_unverified(data_root: DataRoot) -> None:

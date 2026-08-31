@@ -1,22 +1,23 @@
-"""Immutable raw chunk writing (spec §12.2; D10, D13).
+"""Immutable raw chunk writing (v2 §4.1, §6; D10, D13, D28).
 
-A chunk is real if and only if its record appears in ``chunks.jsonl``. Files on
-disk without such a record are orphans: recovery reports them and never adopts
-them. One commit record covers every artifact the chunk produced, so a crash
+A chunk is real if and only if its record appears in ``chunks.jsonl``. There is
+no sidecar in v2: ``chunks.jsonl`` is the sole persisted commit authority, and
+files on disk without a record in it are orphans that recovery reports and never
+adopts. One commit record covers every artifact the chunk produced, so a crash
 can never leave committed packet metadata whose sample values are gone.
 
-Write order per chunk:
+Write order per chunk (v2 §4.1):
 
     payloads (transport_payload only) -> packets -> observations -> samples
     each: .part -> flush -> fsync -> close -> rename -> fsync(dir)
-    then: NNNNNN.commit.json (atomic)
-    then: append the same record to chunks.jsonl (authoritative)
+    then: append the canonical record to chunks.jsonl -> fsync
 
 Arrow IPC *stream* format is used rather than Parquet: a truncated IPC stream
 still yields every complete record batch, while a truncated Parquet file never
 got its footer and is a total loss.
 """
 
+import hashlib
 import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
@@ -25,7 +26,7 @@ from typing import Any
 
 import pyarrow as pa
 
-from consciousness_lab.session.model import ChunkArtifact, ChunkCommit, StreamDescriptor
+from consciousness_lab.session.model import ChunkCommit, StreamDescriptor
 from consciousness_lab.storage import canonical_json
 from consciousness_lab.storage import payload as payload_mod
 from consciousness_lab.storage.arrow_schema import (
@@ -36,7 +37,6 @@ from consciousness_lab.storage.arrow_schema import (
 from consciousness_lab.storage.checksums import (
     PART_SUFFIX,
     append_line,
-    atomic_write,
     fsync_dir,
     sha256_file,
 )
@@ -44,13 +44,13 @@ from consciousness_lab.storage.observations import validate_observations
 from consciousness_lab.storage.paths import StreamPaths
 
 #: Stages a fault-injection test can interrupt. Named so tests describe the
-#: failure they are simulating rather than patching internals.
+#: failure they are simulating rather than patching internals. ``sidecar_written``
+#: is gone with the sidecar itself (D28).
 STAGES = (
     "payloads_written",
     "packets_written",
     "observations_written",
     "samples_written",
-    "sidecar_written",
     "index_appended",
 )
 
@@ -104,22 +104,12 @@ def _write_payloads(path: Path, records: Sequence[tuple[int, bytes]]) -> None:
     fsync_dir(path.parent)
 
 
-def _artifact(path: Path, relative: str) -> ChunkArtifact:
-    return ChunkArtifact(path=relative, sha256=sha256_file(path), bytes=path.stat().st_size)
-
-
 class ChunkWriter:
     """Writes immutable committed chunks for one raw stream."""
 
-    def __init__(
-        self,
-        paths: StreamPaths,
-        descriptor: StreamDescriptor,
-        descriptor_sha256: str,
-    ) -> None:
+    def __init__(self, paths: StreamPaths, descriptor: StreamDescriptor) -> None:
         self.paths = paths
         self.descriptor = descriptor
-        self.descriptor_sha256 = descriptor_sha256
         # Refuse to reuse a stream directory that already holds chunks: a fresh
         # writer would restart at chunk 0 and overwrite immutable raw files.
         index_has_commits = paths.chunks_index.is_file() and bool(
@@ -146,7 +136,11 @@ class ChunkWriter:
 
     @property
     def chain_head(self) -> str | None:
-        return self._committed[-1].record_sha256 if self._committed else None
+        """SHA-256 of the last record's canonical bytes, derived not stored."""
+        if not self._committed_canonical:
+            return None
+        last = max(self._committed_canonical)
+        return hashlib.sha256(self._committed_canonical[last]).hexdigest()
 
     @property
     def committed_canonical(self) -> dict[int, bytes]:
@@ -169,81 +163,62 @@ class ChunkWriter:
         if not expects_payload and pending.payloads:
             raise ChunkWriteError(
                 f"raw_capture_level={self.descriptor.acquisition.raw_capture_level.value} "
-                "must not produce a payload artifact (spec 9.1)"
+                "must not produce a payload artifact (v2 §13)"
             )
 
         # Arrow types cannot express "exactly one value column matches
-        # value_type", so the rule is enforced before anything reaches disk.
+        # value_type", so the rule is enforced before anything reaches disk —
+        # by the same validator read-time verification uses (D31).
         validate_observations(pending.observations)
 
         chunk_id = self._next_chunk_id
+        artifact_sha256: dict[str, str] = {}
 
-        payload_artifact: ChunkArtifact | None = None
         if expects_payload:
-            rel = self.paths.relative_artifact("payloads", chunk_id)
             target = self.paths.artifact("payloads", chunk_id)
             _write_payloads(target, pending.payloads)
-            payload_artifact = _artifact(target, rel)
-            # The writer owns chunk naming, so it — not the producer — fills in
-            # the file each reference points at. A producer cannot know the
-            # chunk id, and a guessed path would be a broken reference.
-            for row in pending.packets:
-                ref = row.get("payload_ref")
-                if isinstance(ref, dict):
-                    ref["file"] = rel
+            artifact_sha256["payloads"] = sha256_file(target)
         self._fire(fault, "payloads_written")
 
-        packets_rel = self.paths.relative_artifact("packets", chunk_id)
         packets_path = self.paths.artifact("packets", chunk_id)
         _write_arrow(packets_path, PACKETS_SCHEMA, pending.packets)
+        artifact_sha256["packets"] = sha256_file(packets_path)
         self._fire(fault, "packets_written")
 
-        obs_rel = self.paths.relative_artifact("observations", chunk_id)
         obs_path = self.paths.artifact("observations", chunk_id)
         _write_arrow(obs_path, OBSERVATIONS_SCHEMA, pending.observations)
+        artifact_sha256["observations"] = sha256_file(obs_path)
         self._fire(fault, "observations_written")
 
-        samples_rel = self.paths.relative_artifact("samples", chunk_id)
         samples_path = self.paths.artifact("samples", chunk_id)
         _write_arrow(
             samples_path,
             samples_schema(self.descriptor.layout, self.descriptor.n_channels),
             pending.samples,
         )
+        artifact_sha256["samples"] = sha256_file(samples_path)
         self._fire(fault, "samples_written")
 
-        seqs = [int(row["packet_seq"]) for row in pending.packets]
         record = ChunkCommit(
             chunk_id=chunk_id,
             prev_record_sha256=self._prev_hash,
-            payloads=payload_artifact,
-            packets=_artifact(packets_path, packets_rel),
-            observations=_artifact(obs_path, obs_rel),
-            samples=_artifact(samples_path, samples_rel),
-            first_packet_seq=min(seqs),
-            last_packet_seq=max(seqs),
-            descriptor_sha256=self.descriptor_sha256,
+            artifact_sha256=artifact_sha256,
         )
-        body = record.model_dump(mode="json", exclude_none=True, exclude={"record_sha256"})
-        digest = canonical_json.record_hash(body)
-        sealed = dict(body)
-        sealed[canonical_json.RECORD_HASH_KEY] = digest
+        # No record_sha256: the record's own hash is its canonical bytes'
+        # digest, which the next record carries as prev_record_sha256 and any
+        # reader recomputes (v2 §6, D29).
+        body = record.model_dump(mode="json", exclude_none=True)
+        canonical = canonical_json.canonicalize(body)
+        digest = hashlib.sha256(canonical).hexdigest()
 
-        # Sidecar first, then the authoritative index. A crash between the two
-        # leaves an orphan sidecar, which recovery reports and never adopts:
-        # a sidecar alone does not commit a chunk.
-        atomic_write(self.paths.sidecar(chunk_id), canonical_json.canonicalize(sealed))
-        self._fire(fault, "sidecar_written")
-
-        append_line(self.paths.chunks_index, canonical_json.canonicalize(sealed) + b"\n")
+        append_line(self.paths.chunks_index, canonical + b"\n")
         self._fire(fault, "index_appended")
 
         self._prev_hash = digest
         self._next_chunk_id += 1
-        committed = record.model_copy(update={"record_sha256": digest})
-        self._committed.append(committed)
-        self._committed_canonical[chunk_id] = canonical_json.canonicalize(sealed)
-        return committed
+        self._committed.append(record)
+        self._committed_canonical[chunk_id] = canonical
+        return record
 
     @staticmethod
     def _fire(fault: FaultHook | None, stage: str) -> None:

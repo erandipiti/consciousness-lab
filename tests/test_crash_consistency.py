@@ -65,7 +65,7 @@ def test_kill_at_every_chunk_stage(data_root: DataRoot, stage: str, level: RawCa
     assert not verify_package(package).is_completed
 
 
-@pytest.mark.parametrize("stage", ["packets_written", "samples_written", "sidecar_written"])
+@pytest.mark.parametrize("stage", ["payloads_written", "packets_written", "samples_written"])
 def test_orphan_files_are_reported_never_adopted(data_root: DataRoot, stage: str) -> None:
     """Files a crash left behind are surfaced, and they are not silently adopted."""
 
@@ -84,23 +84,39 @@ def test_orphan_files_are_reported_never_adopted(data_root: DataRoot, stage: str
     assert not result.is_completed
 
 
-def test_crash_between_sidecar_and_index_leaves_an_uncommitted_chunk(
+def test_v2_writes_no_sidecar_at_all(data_root: DataRoot) -> None:
+    """``chunks.jsonl`` is the only persisted commit authority (D28).
+
+    In v1 a crash between the sidecar and the index left two accounts of one
+    chunk that had to be reconciled forever. v2 does not create the second
+    account, so the class of defect cannot recur.
+    """
+    built = build_session(data_root, chunks=2)
+    stream_root = built.allocated.paths.raw / "synthetic.eeg"
+    assert list(stream_root.glob("*.commit.json")) == []
+    assert sorted(p.name for p in stream_root.iterdir() if p.is_file()) == [
+        "chunks.jsonl",
+        "descriptor.json",
+        "stream_close.json",
+    ]
+
+
+def test_artifacts_written_before_the_append_are_not_committed(
     data_root: DataRoot,
 ) -> None:
-    """A sidecar alone does not commit a chunk (RC-R2-1 / spec §12.2)."""
+    """Before the append lands the artifacts exist and the chunk is not real."""
 
     def fault(current: str) -> None:
-        if current == "sidecar_written":
+        if current == "samples_written":
             raise InjectedFailureError(current)
 
     with pytest.raises(InjectedFailureError):
         build_session(data_root, chunks=1, finalize_outcome=None, fault=fault)
 
     package = data_root.iter_packages()[0]
-    sidecars = list((package.raw / "synthetic.eeg").glob("*.commit.json"))
-    assert sidecars, "the sidecar did land"
+    assert list((package.raw / "synthetic.eeg" / "packets").iterdir()), "the files did land"
     commits, _ = read_chunk_index(package, "synthetic.eeg")
-    assert commits == [], "but the chunk is not committed"
+    assert commits == [], "but the chain alone decides, and it names nothing"
 
 
 def test_committed_chunks_survive_a_later_crash(data_root: DataRoot) -> None:
@@ -128,7 +144,7 @@ def test_truncating_a_committed_chunk_is_detected(data_root: DataRoot) -> None:
     target.write_bytes(target.read_bytes()[:-1])
     result = verify_package(built.allocated.paths)
     assert not result.is_completed
-    assert Finding.CHUNK_ARTIFACT_HASH_MISMATCH in result.findings()
+    assert Finding.CHUNK_ARTIFACT_INVALID in result.findings()
 
 
 def test_truncating_the_chunk_index_breaks_the_chain_detectably(data_root: DataRoot) -> None:
