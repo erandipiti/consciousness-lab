@@ -1,7 +1,7 @@
 # SESSION_SCHEMA_V2_PROPOSAL — Session Package v2
 
 > **Status: PROPOSAL. Not approved.** `DECISIONS.md` is untouched; draft records
-> D27–D32 at the end await human approval. No production code was changed by the
+> D27–D34 at the end await human approval. No production code was changed by the
 > ticket that produced this document.
 
 **Target:** `schema_version = "2.0"`
@@ -26,7 +26,7 @@ independently falsifiable representation of the same underlying fact:
 That is not a sequence of unrelated bugs converging on zero. **It is a recursion
 with no floor, because v1 persists the same fact in several places by design.**
 Every persisted copy creates a relation that must hold forever, and the verifier
-grew to 52 distinct findings enforcing 35 documented relations.
+grew to 52 distinct findings enforcing 34 documented relations (R01–R34).
 
 v2 does not add a sixth round of enforcement. It removes the duplicates.
 
@@ -686,7 +686,7 @@ the number of long-format rows.
 | `lifecycle_seal.sealed_len` | **kept** | **semantic** — it defines the prefix boundary beyond which annotations legitimately append |
 | `annotations.head.json.bytes` | **kept** | **semantic** — the anti-deletion pointer; a hash chain cannot prove no record was removed |
 | payload frame `payload_len` | **kept** | **semantic** — part of the framing that locates the next record |
-| `payload_ref.length` | **removed with `payload_ref` itself** (§5) — the frame's own `payload_len` carries the extent |
+| `payload_ref.length` | **removed** | removed with `payload_ref` itself (§5) — the frame's own `payload_len` carries the extent |
 
 The distinction is: a length that *defines a range or a boundary* stays; a length
 that merely *summarises a whole file already fixed by its hash* goes.

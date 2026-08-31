@@ -9,6 +9,44 @@ Versioning policy is unresolved — see `docs/OPERATIONS.md`.
 
 ## [Unreleased]
 
+### Proposed — CL-002A-R3-R1a: documentation consistency cleanup (documentation only)
+
+**Status: PROPOSAL. Not approved.** No architecture, authority, recovery
+semantics, minimality decision, draft record or scientific scope was reopened.
+`DECISIONS.md` is untouched; production code and tests are unchanged.
+
+- **The v1 baseline was wrong.** Every v2 document quoted "35" v1 relations. The
+  normative v1 matrix (`CHUNK_EQUIVALENCE.md` §3) has always contained **34**,
+  R01–R34, as the CL-002B-R1-C3 changelog entry itself records. The figure was
+  introduced by CL-002A-R3 and repeated four times. Corrected everywhere.
+- **The counts did not reconcile.** "35 → 14, 30 removed, 4 added" cannot sum,
+  because "removed" and "added" were counted in prose phrases from the
+  disposition table while the totals counted numbered relations. Replaced with a
+  single unit — one numbered relation in a normative list — and a per-relation
+  mapping in `PACKAGE_INTEGRITY_V2.md` **§4.1**: of v1's 34, **17 are removed
+  outright** and **17 survive, consolidating into 11** v2 relations; **3** v2
+  relations have no v1 ancestor (V11, V12, V14). `17 + 17 = 34`; `11 + 3 = 14`.
+- **Stale "9" removed.** `PACKAGE_INTEGRITY_V2.md` still said "It needs 9" and
+  `V1_TO_V2_SIMPLIFICATION.md` still reported v2 = 9, both left over from a draft
+  whose list ended at V09. Neither matched the list shipped in the same commit.
+- **V10 and V13 reclassified as reformulations, not additions.** Both are
+  remaining directions of v1's R34 inventory bijection, restated now that v2
+  persists no flat inventory. R34 is the one v1 relation that fans out (into V04,
+  V10 and V13) rather than merging.
+- **The two §3 physical conformance contracts** — Arrow schema equality and
+  observation row semantics on read — are now explicitly labelled as a different
+  counting unit and are deliberately not among the 14.
+- **The DAG claim is scoped.** "Every byte in the sealed package is reachable
+  from `manifest.sha256`" now reads "every byte **within the manifest integrity
+  scope**", since `annotations.*`, `logs/` and `data/derived/` are outside the
+  DAG by design and carry their own mechanisms.
+- **D27–D32 → D27–D34** where a document refers to the current complete draft
+  set. References describing what an earlier round contained are left as
+  historical record.
+- One malformed Markdown table row in `SESSION_SCHEMA_V2_PROPOSAL.md`
+  (`payload_ref.length`, two cells in a three-column table) repaired; wording
+  unchanged.
+
 ### Proposed — CL-002A-R3-R1: pre-seal durability and closure authority (documentation only)
 
 Human review of R3 returned **GO WITH REQUIRED CHANGES**. The simplification
@@ -52,9 +90,15 @@ Draft decisions **D33** (per-stream durable closure authority) and **D34**
 (pre-seal logs retain local record integrity) added. D27–D32 revised where
 affected. All remain drafts.
 
-Relation count: **30 removed** relative to v1 (was 32 before review restored two
-per-record hashes), **4 added** — none of the additions is a relation between two
-persisted copies. Documented relations: v1 **35** → v2 **14**.
+Relation count reconciled against the normative lists, in one unit. v1 has
+**34** numbered relations (R01–R34); v2 has **14** (V01–V14). Of the 34, **17 are
+removed outright** and **17 survive, consolidating into 11**; **3** v2 relations
+have no v1 ancestor (V11, V12, V14). `17 + 17 = 34`, `11 + 3 = 14`. None of the
+additions is a relation between two persisted copies. Two further checks were
+added as §3 physical conformance contracts and are deliberately not counted among
+the 14. `PACKAGE_INTEGRITY_V2.md` §4.1 names every relation on both sides.
+Earlier drafts reported "35 → 14, 30 removed, 4 added"; that baseline was off by
+one and mixed counting units, and did not sum.
 
 ### Proposed — CL-002A-R3: Session Package v2 simplification (documentation only)
 
@@ -75,8 +119,9 @@ design. v2 removes the duplicates instead of enforcing them.
   `schema_version = "2.0"`, specific enough to implement without inventing
   semantics.
 - `docs/PACKAGE_INTEGRITY_V2.md` — authority by fact, the integrity DAG,
-  physical conformance contracts, and **9** referential relations where v1 needed
-  35.
+  physical conformance contracts, and **11** referential relations where v1
+  needed 34. (Revised to 14 by CL-002A-R3-R1 and reconciled by CL-002A-R3-R1a;
+  the "9" first published here never matched the list this commit shipped.)
 - `docs/V1_TO_V2_SIMPLIFICATION.md` — per-representation disposition table with
   the integrity relations each removal eliminates.
 

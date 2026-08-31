@@ -46,22 +46,36 @@ where two persisted copies could disagree.
 
 | | v1 | v2 |
 |---|---|---|
-| Documented equivalence relations | **35** | **9** |
+| Documented equivalence relations | **34** (R01–R34) | **14** (V01–V14) |
 | Persisted copies of a record's own hash | 1 per record, 4 logs | 3 logs — dropped only where it added nothing (`chunks.jsonl`) |
 | Verifier finding types | 52 | fewer, and mostly conformance rather than reconciliation |
 | Persisted copies of a raw artifact hash | 2 (commit + inventory) | **1** |
 | Persisted copies of an artifact path | 1 explicit + 1 implicit | **0** — derived |
 | Collections where a duplicate must be *detected* | 4 | **1** (the chunk chain) |
 
-**Relations removed: 30** — 26 from the first draft, plus 6 from the
-authority/minimality review (`payload_ref`'s four, per-record self-hashes,
-manifest identity), minus 2 restored by human review, which reinstated the
-per-record hashes in `lifecycle.jsonl` and `events/events.jsonl` for their
-pre-seal role. Two are **added** deliberately — Arrow schema
-conformance and observation row semantics on read — because those close C4's
-G1/G2, and neither is a relation between two persisted copies. They are checks of
-a single physical artifact against its contract, which is the kind of check that
-does not compound.
+**The accounting, in one unit.** Both counts mean the same thing — one numbered
+relation in a normative list — so they reconcile exactly:
+
+| | Count |
+|---|---|
+| v1 relations (R01–R34) | **34** |
+| removed outright | 17 |
+| surviving into v2 | 17 |
+| v2 relations those 17 consolidate into | **11** |
+| v2 relations with no v1 ancestor | **3** |
+| v2 relations (V01–V14) | **14** |
+
+`17 + 17 = 34`; `11 + 3 = 14`. `PACKAGE_INTEGRITY_V2.md` §4.1 names every
+relation on both sides of that mapping. The drop is two effects, not one: 17
+relations vanish with the duplicate representation they compared, and the 17 that
+survive merge into 11 because several were separate in v1 only by virtue of those
+duplicates.
+
+Earlier drafts of this document reported "30 removed, 4 added" against a v1
+baseline of 35. Both numbers were wrong: the v1 matrix has always contained 34
+numbered relations, and "removed"/"added" were being counted in prose phrases
+rather than in numbered relations, which is why they did not sum to the stated
+total.
 
 The point is not that v2 checks less. It is that v2 has far fewer places where
 two persisted representations of one fact can drift apart.
@@ -90,15 +104,24 @@ session.
 
 ## Added by review, not removed
 
-Four checks were **added** deliberately. None is a relation between two persisted
-copies of a fact, so none compounds the way the removals did.
+Five checks were **added** deliberately, in two different units. None is a
+relation between two persisted copies of a fact, so none compounds the way the
+removals did.
 
-| Added | Why |
-|---|---|
-| Arrow physical schema conformance | a matching SHA proves identity, not conformance (C4 G1) |
-| Observation row semantics on read | validated on write only in v1 (C4 G2) |
-| Derived control key set, exact in both directions | a missing control file could otherwise go unnoticed |
-| Canonical-bytes-on-disk; closed package layout | one record must have one spelling, and the DAG's "every sealed byte is reachable" claim has to be literally enforceable |
+| Added | Unit | Why |
+|---|---|---|
+| Arrow physical schema conformance | §3 physical conformance contract — **not** one of the 14 | a matching SHA proves identity, not conformance (C4 G1) |
+| Observation row semantics on read | §3 physical conformance contract — **not** one of the 14 | validated on write only in v1 (C4 G2) |
+| What a JSONL record is (V11) | new relation | v1 never stated it: one complete canonical object, one newline, no trailing bytes |
+| Canonical bytes on disk (V12) | new relation | one record must have one spelling; v1 required canonical bytes only *between* two copies |
+| Pre-seal `record_sha256` verified (V14) | new relation | v1 persisted the values but never required a reader to check them |
+
+Two further v2 relations look new and are not: **V10** (derived control key set,
+exact in both directions) and **V13** (no immutable file outside the defined
+layout, and the `schemas/` set equals the ids the sealed events log references)
+are the two remaining directions of v1's R34 inventory bijection, restated now
+that v2 persists no flat inventory. They are what makes the DAG's "every sealed
+byte is reachable" claim literally enforceable.
 
 ## Relationship to D8–D26
 
@@ -107,5 +130,5 @@ records; v2 changes only which redundant copies are persisted alongside. The one
 v1 statement v2 supersedes is the sidecar's existence, which was an
 implementation detail of §12.2 rather than a decision record.
 
-Draft records D27–D32 in `SESSION_SCHEMA_V2_PROPOSAL.md` §16 capture what a human
+Draft records D27–D34 in `SESSION_SCHEMA_V2_PROPOSAL.md` §16 capture what a human
 would need to approve.

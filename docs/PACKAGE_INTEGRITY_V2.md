@@ -4,10 +4,11 @@
 > `SESSION_SCHEMA_V2_PROPOSAL.md`. Supersedes `CHUNK_EQUIVALENCE.md` for v2;
 > that document remains the v1 implementation audit and historical record.
 
-This document is deliberately short. The v1 equivalence matrix needed 35
-pairwise relations because v1 persisted the same fact repeatedly. **If v2 still
-needed dozens of such relations, the simplification would have failed.** It needs
-9.
+This document is deliberately short. The v1 equivalence matrix needed 34
+pairwise relations (R01–R34 in `CHUNK_EQUIVALENCE.md`) because v1 persisted the
+same fact repeatedly. **If v2 still needed dozens of such relations, the
+simplification would have failed.** It needs 14, and §4.1 accounts for the
+difference relation by relation.
 
 ---
 
@@ -59,8 +60,13 @@ manifest.sha256
                                                 └── payloads/NNNNNN.bin
 ```
 
-Every byte in the sealed package is reachable from `manifest.sha256` by exactly
-one path. No hash is persisted twice.
+Every byte **within the manifest integrity scope** — that is, every immutable
+sealed byte shown in the DAG above — is reachable from `manifest.sha256` by
+exactly one path. No hash is persisted twice. The claim is deliberately scoped:
+the artifacts listed as outside the DAG below are *not* reachable from the
+manifest and are not meant to be, because they are written after the seal, are
+never authoritative, or are regenerable. Their integrity is established by their
+own mechanisms, named in the same list.
 
 **Outside the DAG by design:** `annotations.jsonl` and `annotations.head.json`
 (written after sealing; verified by their own hash chain and head pointer),
@@ -112,13 +118,62 @@ Fourteen. That is the whole of it.
 | V13 | the package contains no immutable file outside its exhaustively defined layout; the `schemas/` set equals the schema ids referenced by the sealed events log | the defined layout |
 | V14 | `lifecycle.jsonl` and `events/events.jsonl` records verify their own `record_sha256` (pre-seal integrity layer) | the record bytes |
 
-Compare v1: **35 relations, 52 verifier findings.** The reduction comes from
-deleting duplicates, not from checking less. V10–V14 were all *added* by review,
-and **none is a relation between two persisted copies of a fact**: they pin a
-derived key set, define what a record is, require canonical bytes, close the
-layout, and verify a pre-seal integrity layer. Those are conformance checks of a
-single artifact against its contract, which do not compound the way duplicate
-representations do.
+Compare v1: **34 relations, 52 verifier findings.** The reduction comes from
+deleting duplicates, not from checking less. None of V10–V14 is a relation
+between two persisted copies of a fact: they pin a derived key set, define what a
+record is, require canonical bytes, close the layout, and verify a pre-seal
+integrity layer. Those are conformance checks of a single artifact against its
+contract, which do not compound the way duplicate representations do.
+
+## 4.1 Accounting: 34 → 14
+
+The two counts use the same unit — one numbered relation in a normative list —
+so they reconcile exactly. v1's list is R01–R34 in `CHUNK_EQUIVALENCE.md`; v2's
+is V01–V14 above. Each v2 relation is classified by whether the v1 matrix
+already enforced its content.
+
+| | Count |
+|---|---|
+| v1 documented relations (R01–R34) | **34** |
+| — removed outright, the representation they related no longer exists | 17 |
+| — surviving into v2 | 17 |
+| the v2 relations those 17 consolidate into | **11** (V01–V10, V13) |
+| v2 relations with no v1 ancestor | **3** (V11, V12, V14) |
+| v2 documented relations (V01–V14) | **14** |
+
+`11 + 3 = 14`, and `17 + 17 = 34`. The drop from 34 to 14 is therefore two
+distinct effects, not one: **17 relations disappear** because the duplicate
+representation was deleted, and the **17 that survive merge into 11** because
+several v1 relations were separate only by virtue of the duplicates they
+compared. Three checks are genuinely new.
+
+**Removed (17)** — R01–R04 (the sidecar, entirely), R05, R06 (per-commit and
+per-manifest descriptor hashes), R08, R09 (persisted artifact paths), R14, R15
+(`payload_ref` fields), R17, R18 (per-chunk packet-range summaries), R27, R28,
+R29, R32 (the `ManifestStream` summary block) and R33 (the pre-seal memory ↔
+chain byte comparison, superseded by V12's on-disk requirement).
+
+**Surviving, consolidated (17 → 11)** — V01←R26 · V02←R24 · V03←R10, R11 ·
+V04←R34 (its raw-artifact direction) · V05←R12, R13 · V06←R19, R25 · V07←R20,
+R21, R22, R23 · V08←R16 (reformulated: the frame ↔ packets bijection replaces
+`payload_ref` resolution, with no persisted reference to keep in step) ·
+V09←R07, R30, R31 · V10←R34 (its control-file direction, with the expected set
+derived rather than persisted) · V13←R34 (its no-unexpected-file direction).
+
+**New (3)** — V11 (what a JSONL record *is*: one complete canonical object plus
+one newline, no trailing bytes), V12 (canonical on disk, byte for byte, for every
+canonical document rather than only between two copies of one), V14 (verifying
+the pre-seal `record_sha256` values, which v1 persisted but never required a
+reader to check).
+
+R34 is the one v1 relation that fans out rather than merging: v1's single
+"inventory ↔ filesystem, bijection over immutable files" becomes three v2
+relations because v2 no longer persists one flat inventory covering everything.
+
+Separately from this list, review also added **two physical conformance
+contracts** in §3 — Arrow schema equality per artifact kind, and observation row
+semantics validated on read. Those are not referential relations and are not
+counted in the 14; §3 is where they live.
 
 ## 5. Collection semantics
 

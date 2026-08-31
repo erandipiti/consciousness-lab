@@ -7,8 +7,8 @@
 > different representations of the same fact, which is the argument that produced
 > Session Package v2.
 >
-> **For v2, use [`PACKAGE_INTEGRITY_V2.md`](PACKAGE_INTEGRITY_V2.md)** — 9
-> relations instead of the 35 below, because v2 deletes the duplicates rather
+> **For v2, use [`PACKAGE_INTEGRITY_V2.md`](PACKAGE_INTEGRITY_V2.md)** — 14
+> relations instead of the 34 below, because v2 deletes the duplicates rather
 > than enforcing them.
 >
 > Nothing here is deleted. The v1 matrix remains accurate about v1.
