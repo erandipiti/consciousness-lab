@@ -9,6 +9,53 @@ Versioning policy is unresolved — see `docs/OPERATIONS.md`.
 
 ## [Unreleased]
 
+### Proposed — CL-002A-R3-R1: pre-seal durability and closure authority (documentation only)
+
+Human review of R3 returned **GO WITH REQUIRED CHANGES**. The simplification
+direction is accepted; five narrow corrections were applied before freeze. Still
+docs-only: no production code, no test, no `DECISIONS.md` change.
+
+- **R1-1 — stream closure is now durable before the manifest.** R3 gave
+  `manifest.stream_close_status` authority over terminal closure, which meant
+  the fact lived only in RAM until the final seal: a crash after the terminal
+  lifecycle record but before `manifest.json` lost every per-stream status.
+  Replaced by `raw/<stream_id>/stream_close.json`, written once and immutable,
+  sealed through `control_sha256`. `RECOVERED_UNCLEAN` added to the status
+  domain as an operational observation, never mapped silently to `FAILED` or
+  `DISCONNECTED`. **The v2 manifest now owns no semantic stream fact at all.**
+- **R1-2 — `record_sha256` retained in `lifecycle.jsonl` and
+  `events/events.jsonl`.** R3 removed them on consistency grounds; review
+  reversed that, correctly. Before a manifest exists there is no whole-file
+  seal, and recovery must read exactly those logs to learn what durably
+  happened. A per-record hash there is integrity metadata protecting the sole
+  authority, not a competing one. `chunks.jsonl` still drops its self-hash.
+  Final disposition: **chunks removed, lifecycle retained, events retained,
+  annotations retained.**
+- **R1-3 — interrupted finalization is resumable.** Explicit crash-window table
+  and finalization order. A package with a durable terminal lifecycle record but
+  no manifest pair is `INTERRUPTED_FINALIZATION` — not `UNREADABLE`, and not
+  automatically `RECOVERED_UNCLEAN`. Recovery may complete the interrupted
+  sealing transaction without altering the outcome already written; that is not
+  promotion to `COMPLETED`. Contradictory durable state reports `BLOCKED`.
+- **R1-4 — the package layout is closed.** The file set is exhaustively defined
+  for the root, `events/`, `schemas/` and `raw/<stream>/`. An unexpected
+  immutable file invalidates a sealed package even if it is simply absent from
+  `control_sha256`, and the `schemas/` set must equal the schema ids the sealed
+  events log references. Enforced inside conditions 2 and 7 — **still eight
+  conditions**.
+- **R1-5 — canonical means canonical on disk.** Re-canonicalizing a parsed
+  document must reproduce the physical bytes exactly. "It parses and would
+  canonicalize to the same content" is not sufficient: one record must have one
+  spelling.
+
+Draft decisions **D33** (per-stream durable closure authority) and **D34**
+(pre-seal logs retain local record integrity) added. D27–D32 revised where
+affected. All remain drafts.
+
+Relation count: **30 removed** relative to v1 (was 32 before review restored two
+per-record hashes), **4 added** — none of the additions is a relation between two
+persisted copies. Documented relations: v1 **35** → v2 **14**.
+
 ### Proposed — CL-002A-R3: Session Package v2 simplification (documentation only)
 
 **Status: PROPOSAL. Not approved.** `DECISIONS.md` is untouched; production code

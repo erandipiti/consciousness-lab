@@ -29,13 +29,14 @@ time.
 | What happened; sealed outcome | `lifecycle.jsonl` (sealed prefix) | — |
 | Post-seal downgrades | `annotations.jsonl` + `annotations.head.json` | effective outcome |
 | System/operator events | `events/events.jsonl` | — |
-| Terminal stream closure | `manifest.stream_close_status` | — |
+| Terminal stream closure | **`raw/<id>/stream_close.json`** | — |
 | Which control files were sealed, and their bytes | `manifest.control_sha256` | — |
 | That the package was finalized | `manifest.json` + `manifest.sha256` | — |
 
-**`stream_close_status` is the only manifest field that summarises anything**,
-and it is not a summary: closure status has no on-disk representation anywhere
-else, so the manifest *is* its authority.
+**The manifest owns no semantic fact about any stream.** Its role is exactly
+two things: finalization marker and integrity root. Terminal closure lives in a
+per-stream durable file, because a fact required to resume finalization must not
+exist only in RAM until the final seal.
 
 ## 2. Integrity DAG
 
@@ -45,11 +46,11 @@ manifest.sha256
          ├── control_sha256 ──┬── allocation.json
          │                    ├── run.json
          │                    ├── raw/<stream>/descriptor.json
+         │                    ├── raw/<stream>/stream_close.json
          │                    ├── raw/<stream>/chunks.jsonl ──┐
          │                    └── schemas/<schema_id>.json    │
          ├── lifecycle_seal ───── lifecycle.jsonl[:sealed_len]│
-         ├── events_sha256 ────── events/events.jsonl         │
-         └── stream_close_status                              │
+         └── events_sha256 ────── events/events.jsonl         │
                                                               │
                     each chunks.jsonl (hash-chained records) ─┘
                           └── artifact_sha256 ──┬── packets/NNNNNN.arrow
@@ -64,6 +65,14 @@ one path. No hash is persisted twice.
 **Outside the DAG by design:** `annotations.jsonl` and `annotations.head.json`
 (written after sealing; verified by their own hash chain and head pointer),
 `logs/` (operational, never authoritative), and `data/derived/` (regenerable).
+
+**Two integrity layers, different temporal scope.** `lifecycle.jsonl` and
+`events/events.jsonl` carry a per-record `record_sha256` *and* sit under a
+whole-file manifest hash. That is not duplication: the record hash is the only
+integrity available **before** a manifest exists, which is exactly when recovery
+reads those logs; the manifest hash seals the finalized file afterwards.
+`chunks.jsonl` needs no self-hash — its records are cross-checked against
+physical artifacts recovery reads anyway.
 
 ## 3. Physical format contracts
 
@@ -84,7 +93,7 @@ definitions of "valid observation" is the defect class this design removes.
 
 ## 4. Referential relations — the complete list
 
-Eleven. That is the whole of it.
+Fourteen. That is the whole of it.
 
 | # | Relation | Authority |
 |---|---|---|
@@ -96,14 +105,20 @@ Eleven. That is the whole of it.
 | V06 | `packet_seq` strictly increasing within a chunk and across the chain | `packets` rows |
 | V07 | sample/observation `packet_seq` and `sample_index_in_packet` reference a real packet position; dense sample keys are exactly the expected multiset; sparse triples are unique | `packets` + `samples` / `observations` rows |
 | V08 | the multiset of frame `packet_seq` values equals the multiset of `packets.packet_seq` values — a bijection by identity, with no persisted reference to keep in step | frame bytes + `packets` rows |
-| V09 | every physical stream directory and every `stream_close_status` key is declared in `run.required_streams ∪ optional_streams`; the key set equals the physical directory set; every required id is present and `CLEAN` | `run.json` + filesystem |
+| V09 | every physical stream directory is declared in `run.required_streams ∪ optional_streams`; each has a valid `stream_close.json`; every required id is present with `close_status == "CLEAN"` | `run.json` + `stream_close.json` |
 | V10 | `control_sha256`'s key set equals the derived expected control set exactly, in both directions | derived from the filesystem and the sealed events log |
 | V11 | every JSONL record is one complete canonical object terminated by `\n`; no trailing bytes after the last newline in a finalized package | the file bytes |
+| V12 | every canonical document is **canonical on disk** — re-canonicalizing the parsed document reproduces the physical bytes exactly | the file bytes |
+| V13 | the package contains no immutable file outside its exhaustively defined layout; the `schemas/` set equals the schema ids referenced by the sealed events log | the defined layout |
+| V14 | `lifecycle.jsonl` and `events/events.jsonl` records verify their own `record_sha256` (pre-seal integrity layer) | the record bytes |
 
 Compare v1: **35 relations, 52 verifier findings.** The reduction comes from
-deleting duplicates, not from checking less — V10 and V11 were *added* by the
-crash/completion review, and neither is a relation between two persisted copies:
-one pins a derived key set, the other defines what a record is.
+deleting duplicates, not from checking less. V10–V14 were all *added* by review,
+and **none is a relation between two persisted copies of a fact**: they pin a
+derived key set, define what a record is, require canonical bytes, close the
+layout, and verify a pre-seal integrity layer. Those are conformance checks of a
+single artifact against its contract, which do not compound the way duplicate
+representations do.
 
 ## 5. Collection semantics
 
@@ -114,7 +129,7 @@ Multiplicity and order are part of the type.
 | `chunks.jsonl` | append-only ordered chain, `chunk_id` strictly increasing | detected by V02 |
 | `artifact_sha256` | JSON object | **no** — impossible by construction |
 | `control_sha256` | JSON object | **no** — impossible by construction |
-| `stream_close_status` | JSON object | **no** — impossible by construction |
+| `stream_close.json` per stream | one immutable file per stream directory | **no** — one path, one file |
 | packets rows | ordered sequence, `packet_seq` unique and increasing | detected by V06 |
 | samples rows (dense) | multiset of keys equal to the expected set | detected by V07 |
 | samples rows (sparse) | set of unique `(packet_seq, index, channel_id)` triples | detected by V07 |

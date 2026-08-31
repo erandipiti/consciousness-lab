@@ -71,6 +71,7 @@ data/sessions/<session_id>/
     raw/<stream_id>/
         descriptor.json
         chunks.jsonl
+        stream_close.json
         payloads/NNNNNN.bin        # transport_payload only
         packets/NNNNNN.arrow
         observations/NNNNNN.arrow
@@ -194,18 +195,40 @@ derived value.
 bytes; the first record uses `"0" * 64`. The chain's last record is protected by
 the whole-file hash in `control_sha256`, so nothing is left unsealed.
 
-**Applied consistently:** `lifecycle.jsonl` and `events/events.jsonl` records
-also drop their persisted `record_sha256` in v2, for the same reason — both live
-inside the manifest-sealed region. `annotations.jsonl` **keeps** it: that file is
-written after sealing, sits outside the manifest DAG, and
-`annotations.head.json.head_record_sha256` names the value directly, so there it
-is load-bearing rather than derived.
+**Scope: `chunks.jsonl` only.** An earlier draft extended this to
+`lifecycle.jsonl` and `events/events.jsonl` on consistency grounds. Human review
+reversed that, and correctly:
 
-> This last point extends slightly beyond the field list the R3 ticket
-> enumerated. It is applied because leaving per-record hashes in some sealed
-> logs and not others would be an inconsistency of exactly the kind this
-> redesign exists to remove. Trim it if the human review prefers the narrower
-> scope.
+| Log | `record_sha256` | Why |
+|---|---|---|
+| `chunks.jsonl` | **removed** | its meaningful fields are reconciled against the previous chain record, the capture shape, deterministic paths and physical artifact hashes; after finalization the whole chain is sealed by `control_sha256` |
+| `lifecycle.jsonl` | **retained** | see §6.1 |
+| `events/events.jsonl` | **retained** | see §6.1 |
+| `annotations.jsonl` | **retained** | written after sealing, outside the manifest DAG, and `annotations.head.json.head_record_sha256` names the value |
+
+### 6.1 Why lifecycle and events keep theirs
+
+The minimality rule is "do not persist a second **authority** for a fact". A
+per-record hash is not a second authority over a record's meaning — it is
+**integrity metadata protecting the sole authority**, and the two have different
+temporal roles:
+
+```text
+record_sha256          protects an individual durable record BEFORE sealing
+manifest whole-file    seals the finalized log as a complete byte sequence
+```
+
+Before a manifest exists there is no whole-file seal. Recovery must nevertheless
+read `lifecycle.jsonl` and `events/events.jsonl` to determine what durably
+happened before the process disappeared — and it must be able to tell an intact
+record from a corrupt one while doing so. Removing the per-record hash would
+leave the pre-seal window with no integrity at all over exactly the records
+recovery depends on.
+
+`chunks.jsonl` is different: its records are cross-checked against physical
+artifacts that recovery reads anyway, so a self-hash adds nothing there.
+
+These are complementary layers, not competing authorities.
 
 | Key | Rule |
 |---|---|
@@ -246,14 +269,15 @@ here.
                  "utc_quality": "unknown" },
   "lifecycle_seal": { "sealed_len": "8421", "sealed_sha256": "…" },
   "events_sha256": "…",
-  "stream_close_status": { "muse.eeg": "CLEAN", "polar.ecg": "CLEAN" },
   "control_sha256": {
     "allocation.json": "…",
     "run.json": "…",
     "raw/muse.eeg/descriptor.json": "…",
     "raw/muse.eeg/chunks.jsonl": "…",
+    "raw/muse.eeg/stream_close.json": "…",
     "raw/polar.ecg/descriptor.json": "…",
     "raw/polar.ecg/chunks.jsonl": "…",
+    "raw/polar.ecg/stream_close.json": "…",
     "schemas/block_start.v1.json": "…"
   }
 }
@@ -268,18 +292,74 @@ is the pattern this redesign removes.
 belongs in this specification and in the verifier, where it cannot drift away
 from the code that enforces it.
 
-**`ManifestStream` is deleted.** It is replaced by `stream_close_status`, a
-mapping whose only job is the terminal closure state — the one fact about a
-stream that has **no** on-disk representation anywhere else. Being a map, it
-cannot carry duplicate stream ids.
+**`ManifestStream` is deleted, and so is the `stream_close_status` map that an
+earlier draft put in its place.**
+
+That draft argued closure status had no other on-disk home. Human review found
+the real problem: *it should have one*. Terminal closure lived only in process
+memory until the final manifest was written, so this crash window existed —
+
+```text
+all streams closed
+      -> lifecycle CLOSED / CLEAN / COMPLETED written durably
+            -> PROCESS DIES
+                  -> manifest never written, per-stream statuses lost with RAM
+```
+
+— and a restarted process could not safely reconstruct them. **A fact required to
+resume finalization must not live only in RAM until the final seal.** See §7.1.
+
+**The v2 manifest therefore owns no semantic stream fact at all.** Its role is
+exactly two things: finalization marker, and integrity root.
 
 | v1 `ManifestStream` field | v2 authority instead |
 |---|---|
 | `required` | `run.json.required_streams` |
+| `close_status` | **`raw/<id>/stream_close.json`** (§7.1) |
 | `descriptor_sha256` | `control_sha256["raw/<id>/descriptor.json"]` |
 | `chunk_count` | `chunks.jsonl` |
 | `chunk_chain_head_sha256` | `chunks.jsonl` |
 | `first_packet_seq` / `last_packet_seq` | the physical `packets` artifacts |
+
+### 7.1 `raw/<stream_id>/stream_close.json` — durable per-stream closure
+
+Exactly one immutable file per opened stream, written once when that stream
+terminates:
+
+```json
+{ "close_status": "CLEAN" }
+```
+
+No `stream_id` — the path already owns identity. No convenience summaries.
+
+**Status domain**
+
+| Status | Meaning |
+|---|---|
+| `CLEAN` | the stream closed normally |
+| `DISCONNECTED` | the device went away |
+| `RECONFIGURED` | the configuration changed; a new `stream_id` with a new descriptor takes over |
+| `FAILED` | a diagnosed stream failure |
+| `RECOVERED_UNCLEAN` | **new in v2** — the process disappeared while this stream had no durable terminal close record |
+
+`RECOVERED_UNCLEAN` is an **operational fact, not a scientific classification**:
+recovery observed that the stream did not close normally, and says exactly that.
+It must never be silently mapped to `FAILED` or `DISCONNECTED`, which would
+assert a device-specific cause nobody observed.
+
+**Write discipline**
+
+```text
+stream_close.json.tmp -> fsync -> rename -> fsync(stream directory)
+```
+
+Only after that durable file exists may finalization treat the stream as closed.
+A stream that closed earlier already has its file and **must not have it
+rewritten** — it is immutable once written.
+
+**Authority.** `stream_close.json` is the sole persisted authority for terminal
+closure. The manifest seals it through `control_sha256` and does not repeat it,
+so no second copy exists to drift.
 
 **Other manifest reductions**
 
@@ -305,11 +385,11 @@ manifest.sha256
          ├── control_sha256 ─── allocation.json
          │                 ├── run.json
          │                 ├── raw/<stream>/descriptor.json
+         │                 ├── raw/<stream>/stream_close.json
          │                 ├── raw/<stream>/chunks.jsonl ──┐
          │                 └── schemas/<schema_id>.json    │
          ├── lifecycle_seal ── lifecycle.jsonl[:sealed_len] │
-         ├── events_sha256 ─── events/events.jsonl          │
-         └── stream_close_status (terminal fact, no other home)
+         └── events_sha256 ─── events/events.jsonl          │
                                                             │
                         each chunks.jsonl (hash-chained) ───┘
                               └── artifact_sha256 ── packets/NNNNNN.arrow
@@ -337,55 +417,181 @@ Eight conditions, same shape as v1.
 >
 > 1. `manifest.json` exists and `manifest.sha256` matches it; `schema_version`
 >    has major 2.
-> 2. `control_sha256`'s key set **equals** the expected control set exactly, and
->    every entry resolves to a regular file inside the package hashing to the
->    recorded value. The expected set is *derived*, not read from the manifest:
+> 2. **the package file set is closed and sealed.** `control_sha256`'s key set
+>    **equals** the derived expected control set exactly, every entry resolves to
+>    a regular file hashing to the recorded value, and the package contains no
+>    unexpected immutable file anywhere (§9.2). The expected set is *derived*,
+>    never read from the manifest:
 >
 >    ```text
 >    allocation.json
 >    run.json
->    raw/<id>/descriptor.json   for every physical stream directory
->    raw/<id>/chunks.jsonl      for every physical stream directory
->    schemas/<schema_id>.json   for every payload_schema referenced in the
->                               sealed events log
+>    raw/<id>/descriptor.json      for every physical stream directory
+>    raw/<id>/chunks.jsonl         for every physical stream directory
+>    raw/<id>/stream_close.json    for every physical stream directory
+>    schemas/<schema_id>.json      for every payload_schema referenced in the
+>                                  sealed events log
 >    ```
 >
->    Equality in both directions: a missing key means required interpretive
->    metadata is absent, and an extra key means an unexpected control file.
->    (Duplicates are impossible: it is a map.)
+>    Equality in both directions. (Duplicates are impossible: it is a map.)
 > 3. the first `lifecycle_seal.sealed_len` bytes of `lifecycle.jsonl` hash to
 >    `lifecycle_seal.sealed_sha256`, and `events/events.jsonl` hashes to
 >    `events_sha256`. Within both sealed ranges every line must be one complete
->    canonical JSON object (§9.1), parse, and validate against its model. **No
->    per-record `record_sha256` is required or permitted** in these logs — the
->    byte-range hash is what protects them.
+>    canonical JSON object terminated by `\n` (§4.1), be **canonical on disk**
+>    (§9.3), validate against its model, **and verify its own
+>    `record_sha256`** — the pre-seal integrity layer of §6.1.
 > 4. within the sealed prefix the terminal state is `CLOSED`, with
 >    `closure_condition = CLEAN` and **sealed** `recording_outcome = COMPLETED`.
-> 5. **stream set agreement**, in three parts:
->    a. every physical `raw/<id>/` directory and every `stream_close_status` key
->       is declared in `run.required_streams ∪ run.optional_streams` — a stream
->       outside the run contract is not a valid part of the package;
->    b. the key set of `stream_close_status` equals the set of physical stream
->       directories;
->    c. every id in `run.required_streams` has a physical directory and
->       `stream_close_status[id] == "CLEAN"`.
+> 5. **stream set agreement and closure**, in three parts:
+>    a. every physical `raw/<id>/` directory is declared in
+>       `run.required_streams ∪ run.optional_streams` — a stream outside the run
+>       contract is not a valid part of the package;
+>    b. **every physical stream directory has a valid `stream_close.json`**,
+>       whatever its status;
+>    c. every id in `run.required_streams` has a physical directory whose
+>       `stream_close.json` reads `close_status == "CLEAN"`.
 >
 >    A declared **optional** stream that was never opened has no directory and no
->    close-status entry; that is valid.
+>    close file; that is valid. A required stream recovered as
+>    `RECOVERED_UNCLEAN` fails this condition, as it should.
 > 6. no `.part`, `.tmp` or `.open` file exists anywhere in the package.
 > 7. every raw stream passes **physical integrity** (§10): descriptor valid;
 >    chain valid and ordered; every committed artifact exists at its
 >    deterministic path and hashes to `artifact_sha256`; no unreferenced or
 >    unexpected raw artifact; Arrow schema conformant; row semantics valid;
->    payload framing valid where applicable; referential integrity valid.
+>    payload framing valid where applicable; referential integrity valid; and
+>    the stream directory contains **no file outside its defined set** (§9.2).
 > 8. the **effective** recording outcome (sealed outcome after applying valid
 >    downgrade annotations, failing closed on an indeterminate annotation log) is
 >    `COMPLETED`.
 
-Condition 5 now also carries the stream-set bijection, which v1 split across
-conditions 5 and 7. No scientific completeness requirement is added anywhere.
+Condition 5 now also carries the stream-set agreement, which v1 split across
+conditions 5 and 7. **Still eight conditions** — the file-set closure of §9.2
+lands inside conditions 2 and 7 rather than becoming a ninth. No scientific
+completeness requirement is added anywhere.
+
+### 9.2 The package file set is closed, not open-ended
+
+The integrity DAG claims every immutable sealed byte is reachable from the
+manifest. That claim is only true if the package cannot contain a file the DAG
+never mentions — otherwise an unexpected immutable file simply sits outside it,
+unhashed and unnoticed. So the layout is **exhaustively defined**, and a
+finalized package with anything else in it is invalid.
+
+| Location | Exactly these files |
+|---|---|
+| package root | `allocation.json`, `run.json`, `lifecycle.jsonl`, `annotations.jsonl`, `annotations.head.json`, `manifest.json`, `manifest.sha256` |
+| `events/` | `events.jsonl` |
+| `schemas/` | `<schema_id>.json` for exactly the schema ids referenced by the sealed events log — no more, no fewer |
+| `raw/<stream_id>/` | `descriptor.json`, `chunks.jsonl`, `stream_close.json`, plus `packets/`, `observations/`, `samples/` and — only at `transport_payload` — `payloads/` |
+| `raw/<stream_id>/<kind>/` | exactly the artifacts named by committed chunks |
+| `logs/` | anything; non-authoritative, outside the DAG by design |
+
+Directories permitted at the root: `events/`, `schemas/`, `raw/`, `logs/`.
+
+Each of these MUST invalidate a sealed package:
+
+```text
+mystery.bin
+schemas/unreferenced.json
+events/extra.json
+raw/<stream>/foo.bin
+any structural JSON file v2 does not define
+```
+
+**Schema snapshot set.** The physical `schemas/*.json` set must equal the set of
+`payload_schema` ids referenced by the sealed events log, and every one of those
+paths must appear in `control_sha256`. No unreferenced snapshot may sit silently
+outside the integrity DAG.
+
+Enforcement placement: root, `events/` and `schemas/` under condition 2; the raw
+tree under condition 7.
+
+### 9.3 Canonical means canonical on disk
+
+Where the contract says a document is RFC 8785 canonical, that is a statement
+about the **bytes on disk**, not merely about what they parse to.
+
+```text
+parse the physical bytes
+canonicalize the complete logical document
+require: canonical bytes == physical bytes
+```
+
+For JSONL, each line's object bytes must equal its exact expected canonical
+bytes, followed by exactly one `\n`.
+
+"It parses, and canonicalizing it would produce equivalent content" is **not**
+sufficient. Two byte sequences that parse alike are still two different files,
+and a format that tolerates both has two spellings for one record — the same
+class of ambiguity that produced several v1 findings.
+
+Accounting per file: `lifecycle.jsonl`, `events/events.jsonl` and
+`annotations.jsonl` carry a persisted `record_sha256` and it is part of the
+canonical document; `chunks.jsonl` records have none in v2, so their canonical
+form excludes it. This is a **conformance** rule, not a new source of truth.
 
 ---
+
+## 9.4 Finalization order and crash windows
+
+Dependencies made explicit, because R1-1's crash window came from an implicit
+one:
+
+```text
+ 1. finish and commit the final raw chunks
+ 2. durably write stream_close.json for every opened stream lacking one
+ 3. append FINALIZING to lifecycle.jsonl          (with record_sha256)
+ 4. append terminal CLOSED to lifecycle.jsonl     (with record_sha256)
+ 5. seal events/events.jsonl                      (every record has record_sha256)
+ 6. snapshot the referenced event schemas
+ 7. initialise annotations.head.json if absent
+ 8. verify raw physical conformance and every durable pre-manifest fact
+ 9. construct manifest.control_sha256
+10. write manifest.json atomically
+11. write manifest.sha256 atomically      <-- FINALIZATION MARKER
+12. registry upsert (derived)
+```
+
+Step 2 precedes step 3 deliberately: after the terminal lifecycle record is
+durable, per-stream closure must already be on disk, or a crash between them
+loses it.
+
+### 9.4.1 Crash windows
+
+| Crash point | Lifecycle ends at | Recovery |
+|---|---|---|
+| before FINALIZING | `ALLOCATED` or `RECORDING` | write `RECOVERED_UNCLEAN` closure for every physical stream lacking a close file; append `FINALIZING`; append `CLOSED` / `RECOVERED_UNCLEAN` / `UNCLASSIFIED`; then it may finalize and seal the recovered package |
+| during FINALIZING, before CLOSED | `FINALIZING` | same. The intended scientific outcome is **never** guessed |
+| after CLOSED, before a valid manifest pair | `CLOSED` | **`INTERRUPTED_FINALIZATION`** — see below |
+
+### 9.4.2 CLOSED without a manifest is resumable, not unreadable
+
+A package whose terminal lifecycle record is durable but whose manifest pair is
+missing is **`INTERRUPTED_FINALIZATION`**. It is *not* `UNREADABLE`, and it is
+*not* automatically `RECOVERED_UNCLEAN` — the process already durably wrote the
+terminal fact, and throwing that away would discard something it observed.
+
+Recovery verifies the durable inputs: lifecycle records **and their record
+hashes**, event records **and their record hashes**, `stream_close.json` for
+every physical stream, raw structural integrity, and the control files.
+
+If those are internally consistent, recovery may **resume the interrupted
+sealing transaction**: write any remaining deterministically recoverable
+structures, then `manifest.json`, then `manifest.sha256` — **without altering
+the already-written lifecycle outcome**.
+
+This is not promotion to `COMPLETED`. It completes a sealing transaction for an
+outcome that was already durably decided. If the recorded outcome was
+`ABORTED`, resuming produces a sealed `ABORTED` package.
+
+If the durable pre-manifest state is contradictory or insufficient to reconstruct
+finalization, recovery reports **`BLOCKED` / `UNREADABLE`**. It does not guess,
+and it never rewrites lifecycle history.
+
+This is the concrete payoff of R1-1 and R1-2 together: resumption is possible
+only because per-stream closure is durable and the pre-seal logs are
+individually verifiable.
 
 ## 10. V2-8 — physical format conformance
 
@@ -543,7 +749,7 @@ protocol decision, not a package-integrity one.
 
 ---
 
-## 16. Draft decision records — D27–D32
+## 16. Draft decision records — D27–D34
 
 > **DRAFTS.** Not inserted into `DECISIONS.md`. They require human approval.
 
@@ -562,7 +768,8 @@ derived and rebuildable, never sealed acquisition truth.
 A value deterministically derivable from an authoritative representation is
 derived at read time, not stored again. Removed on this basis: artifact paths,
 artifact byte counts, chunk packet ranges, chunk descriptor hashes, and every
-`ManifestStream` summary except terminal closure status.
+`ManifestStream` summary. Integrity metadata protecting a sole authority is not
+a summary and is not covered by this rule — see D34.
 
 **D30 — hierarchical integrity.**
 `manifest.sha256` seals `manifest.json`; the manifest seals the control files and
@@ -580,3 +787,21 @@ read.
 Dense stays `(packet_seq, sample_index_in_packet)`. For sparse, `n_samples` means
 logical sample positions, not long-format rows, and complete channel coverage is
 not required. This resolves the v1 contradiction.
+
+**D33 — stream closure is a per-stream durable authority.**
+`raw/<stream_id>/stream_close.json` is the sole persisted authority for terminal
+stream closure, written once and immutable. The manifest seals it through
+`control_sha256` and does not repeat it. A fact required to resume finalization
+must not live only in RAM until the final seal, which is what
+`manifest.stream_close_status` would have meant. Adds `RECOVERED_UNCLEAN` to the
+status domain: an operational observation, never silently mapped to `FAILED` or
+`DISCONNECTED`.
+
+**D34 — pre-seal logs retain local record integrity.**
+`lifecycle.jsonl` and `events/events.jsonl` retain `record_sha256` because they
+must be individually verifiable **before a manifest exists**, which is exactly
+when recovery reads them. Whole-file manifest hashes serve the distinct
+post-finalization sealing role. These are complementary layers with different
+temporal scope, not competing authorities, so D29 does not apply.
+`chunks.jsonl` drops its self-hash because its records are cross-checked against
+physical artifacts recovery reads anyway.
