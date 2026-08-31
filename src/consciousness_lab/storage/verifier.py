@@ -31,7 +31,6 @@ from enum import StrEnum
 from consciousness_lab.session import annotations as annotations_mod
 from consciousness_lab.session.lifecycle import parse_records, summarize
 from consciousness_lab.session.model import (
-    SCHEMA_MAJOR,
     ChunkCommit,
     ClosureCondition,
     EventRecord,
@@ -45,7 +44,6 @@ from consciousness_lab.session.model import (
 )
 from consciousness_lab.storage import canonical_json, package_layout
 from consciousness_lab.storage.checksums import find_incomplete, sha256_bytes, sha256_file
-from consciousness_lab.storage.package_layout import read_manifest
 from consciousness_lab.storage.paths import PackagePaths
 from consciousness_lab.storage.safe_paths import (
     UnsafePathError,
@@ -119,6 +117,15 @@ class Finding(StrEnum):
     ANNOTATION_INTEGRITY_INDETERMINATE = "annotation_integrity_indeterminate"
     ANNOTATION_REJECTED = "annotation_rejected"
     EFFECTIVE_OUTCOME_NOT_COMPLETED = "effective_outcome_not_completed"
+
+
+#: How a shared manifest-contract problem surfaces as a verification finding.
+_MANIFEST_FINDINGS: dict[package_layout.ManifestProblem, Finding] = {
+    package_layout.ManifestProblem.NOT_CANONICAL: Finding.NOT_CANONICAL_ON_DISK,
+    package_layout.ManifestProblem.UNREADABLE: Finding.UNREADABLE_MANIFEST,
+    package_layout.ManifestProblem.UNSUPPORTED_MAJOR: Finding.SCHEMA_VERSION_UNSUPPORTED,
+    package_layout.ManifestProblem.REMOVED_FIELD: Finding.REMOVED_FIELD_PRESENT,
+}
 
 
 @dataclass(frozen=True)
@@ -213,36 +220,15 @@ def _condition_1(paths: PackagePaths, result: VerificationResult) -> Manifest | 
         if recorded != sha256_bytes(raw):
             result.add(Finding.BAD_MANIFEST_HASH, "manifest.sha256 does not match manifest.json")
             manifest_ok = False
-        canonical_error = package_layout.canonical_document_error(raw)
-        if canonical_error is not None:
-            result.add(Finding.NOT_CANONICAL_ON_DISK, f"manifest.json {canonical_error}")
+        # One definition of "a valid v2 manifest", shared with recovery. Two
+        # almost-identical definitions is the drift this design removes.
+        check = package_layout.check_manifest_contract(raw)
+        manifest = check.manifest
+        for problem, detail in check.problems:
+            result.add(_MANIFEST_FINDINGS[problem], detail)
             manifest_ok = False
-        else:
-            # Minor-version tolerance ignores an unknown *new* field, which is
-            # deliberate. A key v2 DELETED is not a future field: it is a
-            # resurrected v1 summary that would contradict the authority the
-            # fact actually lives in, so it fails closed (§7, D29).
-            parsed = canonical_json.loads(raw)
-            resurrected = sorted(
-                set(parsed) & package_layout.REMOVED_MANIFEST_KEYS
-                if isinstance(parsed, dict)
-                else ()
-            )
-            for key in resurrected:
-                result.add(
-                    Finding.REMOVED_FIELD_PRESENT,
-                    f"manifest.json carries {key!r}, which v2 removed",
-                )
-                manifest_ok = False
-        manifest = read_manifest(paths.manifest)
-        if manifest is None:
+        if manifest is None and not check.problems:
             result.add(Finding.UNREADABLE_MANIFEST, "manifest.json could not be parsed")
-            manifest_ok = False
-        elif int(manifest.schema_version.split(".")[0]) != SCHEMA_MAJOR:
-            result.add(
-                Finding.SCHEMA_VERSION_UNSUPPORTED,
-                f"schema_version {manifest.schema_version} is not major {SCHEMA_MAJOR}",
-            )
             manifest_ok = False
     result.manifest = manifest
     result.conditions[1] = manifest_ok

@@ -9,6 +9,41 @@ Versioning policy is unresolved — see `docs/OPERATIONS.md`.
 
 ## [Unreleased]
 
+### Fixed — CL-002B-R2-R2: pre-seal control consistency
+
+Human review of `cc5baf3` closed the five R1 findings and raised two more. Both
+were reproduced before anything changed. No frozen document, decision record,
+relation, recovery semantic or scientific assumption was touched.
+
+- **`finalize()` decided from memory and hashed from disk.** Structural and
+  completion decisions came from `writer.run`, while `control_sha256` sealed
+  whatever `run.json` physically held, and `allocation.json` was hashed without
+  ever being typed. Both physical control documents are now loaded and validated
+  before anything is written — canonical on disk, through their models,
+  `allocation` required to declare major 2 and to name its own directory — and
+  the **physical** `Run` is the authority for stream declaration, membership and
+  the required-stream checks. A valid-but-different `run.json` is the dangerous
+  case, not the malformed one: `run.json` is sealed once and never rewritten, so
+  a divergence from what the writer sealed is external mutation, and
+  finalization refuses rather than silently choosing a side. On any of these,
+  nothing is written: no closure record, no lifecycle transition, no manifest.
+  *The invariant: the control documents finalization decides on are the same
+  physical bytes `control_sha256` seals.*
+- **State B recovery could digest a manifest the verifier would reject.**
+  `_resume_over_existing_manifest` checked canonical bytes, model parse and the
+  three authoritative fields, but not schema major or the removed v1 keys — so
+  minor-version tolerance let a `schema_version: "1.0"` or a resurrected
+  `streams` block through, and recovery would happily attest to it. Verification
+  and recovery now share **one** definition of a valid v2 manifest,
+  `package_layout.check_manifest_contract`: canonical on disk, model-valid,
+  major 2, no key v2 deleted. A digest is an attestation, so it must never be
+  created over bytes the verifier would then reject — that manufactures a sealed
+  package that cannot verify, which is worse than an unsealed one that honestly
+  cannot. `extra="forbid"` was again not used, and an unknown future v2.x field
+  is still tolerated and still resumable, with a test that says so.
+
+**Tests: 398 → 421**, in `tests/test_control_authority_r2.py`.
+
 ### Fixed — CL-002B-R2-R1: human-review conformance gaps
 
 Human review of `8640d9d` returned **NO-GO** with five implementation defects.

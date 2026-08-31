@@ -13,6 +13,7 @@ the manifest it is compared against.
 """
 
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
@@ -305,6 +306,74 @@ def read_canonical_json(path: Path) -> tuple[Any, str | None]:
     if error is not None:
         return None, error
     return canonical_json.loads(raw), None
+
+
+class ManifestProblem(StrEnum):
+    """Why a manifest does not satisfy the v2 contract."""
+
+    NOT_CANONICAL = "not_canonical"
+    UNREADABLE = "unreadable"
+    UNSUPPORTED_MAJOR = "unsupported_major"
+    REMOVED_FIELD = "removed_field"
+
+
+@dataclass(frozen=True)
+class ManifestCheck:
+    """The outcome of checking a manifest against the v2 contract."""
+
+    manifest: Manifest | None
+    problems: tuple[tuple[ManifestProblem, str], ...] = ()
+
+    @property
+    def ok(self) -> bool:
+        return self.manifest is not None and not self.problems
+
+
+def check_manifest_contract(raw: bytes) -> ManifestCheck:
+    """Everything that makes bytes a valid v2 manifest, in one place.
+
+    Verification and recovery both need this, and two almost-identical
+    definitions of "a valid manifest" is precisely the drift this design
+    removes — so there is one, and both call it. What it does NOT cover is the
+    digest match and file presence, which belong to whoever is looking at the
+    pair.
+
+    Note what is deliberately absent: a rejection of unknown fields. Forward
+    tolerance for a genuine v2.x optional field is intentional. A key v2
+    *deleted* is a different thing and is rejected.
+    """
+    problems: list[tuple[ManifestProblem, str]] = []
+    error = canonical_document_error(raw)
+    if error is not None:
+        return ManifestCheck(None, ((ManifestProblem.NOT_CANONICAL, f"manifest.json {error}"),))
+
+    parsed = canonical_json.loads(raw)
+    if isinstance(parsed, dict):
+        for key in sorted(set(parsed) & REMOVED_MANIFEST_KEYS):
+            problems.append(
+                (
+                    ManifestProblem.REMOVED_FIELD,
+                    f"manifest.json carries {key!r}, which v2 removed",
+                )
+            )
+    try:
+        manifest = load_on_disk(Manifest, parsed)
+    except ValueError as exc:
+        problems.append((ManifestProblem.UNREADABLE, f"manifest.json is invalid on disk ({exc})"))
+        return ManifestCheck(None, tuple(problems))
+
+    try:
+        major = int(manifest.schema_version.split(".")[0])
+    except ValueError:
+        major = -1
+    if major != SCHEMA_MAJOR:
+        problems.append(
+            (
+                ManifestProblem.UNSUPPORTED_MAJOR,
+                f"schema_version {manifest.schema_version} is not major {SCHEMA_MAJOR}",
+            )
+        )
+    return ManifestCheck(manifest, tuple(problems))
 
 
 def read_manifest(path: Path) -> Manifest | None:

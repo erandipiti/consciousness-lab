@@ -393,12 +393,15 @@ def _resume_over_existing_manifest(
     If it disagrees, this blocks and neither file is touched.
     """
     raw = paths.manifest.read_bytes()
-    error = package_layout.canonical_document_error(raw)
-    if error is not None:
-        raise ResumeError(f"manifest.json {error}")
-    manifest = package_layout.read_manifest(paths.manifest)
-    if manifest is None:
-        raise ResumeError("manifest.json exists but cannot be parsed as a v2 manifest")
+    # The SAME contract the verifier applies. A digest is an attestation, so it
+    # must never be created over bytes the verifier would then reject: that
+    # would manufacture a sealed package that cannot verify, which is worse
+    # than an unsealed one that honestly cannot.
+    check = package_layout.check_manifest_contract(raw)
+    if not check.ok or check.manifest is None:
+        details = [detail for _, detail in check.problems] or ["manifest.json is not a v2 manifest"]
+        raise ResumeError(f"the existing manifest.json is invalid: {details}")
+    manifest = check.manifest
 
     disagreements: list[str] = []
     if (

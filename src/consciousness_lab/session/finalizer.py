@@ -35,6 +35,7 @@ from consciousness_lab.session import annotations as annotations_mod
 from consciousness_lab.session import registry
 from consciousness_lab.session.lifecycle import now_reading
 from consciousness_lab.session.model import (
+    Allocation,
     ClockReading,
     ClosureCondition,
     LifecycleState,
@@ -43,6 +44,7 @@ from consciousness_lab.session.model import (
     Run,
     SealPointer,
     StreamCloseStatus,
+    load_on_disk,
 )
 from consciousness_lab.session.writer import SessionWriter, write_stream_close
 from consciousness_lab.storage import canonical_json, package_layout
@@ -69,6 +71,53 @@ class FinalizationError(RuntimeError):
 class FinalizationResult:
     manifest: Manifest
     manifest_sha256: str
+
+
+def _control_authorities(writer: SessionWriter) -> tuple[Allocation, Run]:
+    """Load and validate the PHYSICAL control documents finalization decides on.
+
+    The invariant this exists to hold: **the control documents used to decide
+    finalization are the same physical bytes ``control_sha256`` seals.** Making
+    those decisions from ``writer.run`` in memory while hashing whatever
+    ``run.json`` happens to contain would be two competing interpretations of
+    one contract — the exact defect class v2 removes, reappearing between RAM
+    and disk instead of between two files.
+
+    Called before anything is written, so an invalid or contradicted control
+    state produces no closure record, no lifecycle transition and no manifest.
+    """
+    problem = package_layout.allocation_error(writer.paths)
+    if problem is not None:
+        raise FinalizationError(problem)
+    # allocation_error() above already proved it canonical, parseable, major 2
+    # and identity-matched, so this reload cannot fail.
+    allocation_obj, _ = package_layout.read_canonical_json(writer.paths.allocation)
+    allocation = load_on_disk(Allocation, allocation_obj)
+
+    if not writer.paths.run.is_file():
+        raise FinalizationError("cannot finalize a session that never sealed run.json")
+    raw = writer.paths.run.read_bytes()
+    error = package_layout.canonical_document_error(raw)
+    if error is not None:
+        raise FinalizationError(f"run.json {error}")
+    try:
+        run = load_on_disk(Run, canonical_json.loads(raw))
+    except ValueError as exc:
+        raise FinalizationError(f"run.json is invalid on disk ({exc})") from exc
+
+    # run.json is sealed once and never rewritten, so a divergence from what
+    # this writer sealed is external mutation. Reported rather than resolved:
+    # silently preferring either side would hide that the two disagree.
+    if writer.run is not None:
+        expected = canonical_json.canonicalize(
+            writer.run.model_dump(mode="json", exclude_none=True)
+        )
+        if expected != raw:
+            raise FinalizationError(
+                "run.json on disk is not the run this writer sealed; the durable contract "
+                "and the running one disagree and finalization will not choose between them"
+            )
+    return allocation, run
 
 
 def _assert_sealable(
@@ -241,9 +290,10 @@ def finalize(
     data_root: DataRoot | None = None,
 ) -> FinalizationResult:
     """Seal the package. ``outcome`` is the sealed recording outcome."""
-    run = writer.run
-    if run is None:
+    if writer.run is None:
         raise FinalizationError("cannot finalize a session that never sealed run.json")
+    # The physical control documents are the authority for every decision below.
+    _allocation, run = _control_authorities(writer)
 
     # Step 2 — durable closure BEFORE the terminal lifecycle record. A stream
     # the operator never closed explicitly is closed with its intended status
