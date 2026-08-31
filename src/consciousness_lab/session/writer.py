@@ -227,6 +227,31 @@ class SessionWriter:
                 f"raw write failed for {stream_id}; session closed TECHNICAL_FAILURE"
             ) from exc
 
+    def close_all_streams(self, *, failed: str | None = None) -> list[str]:
+        """Durably terminate every open stream. Returns the ids left unclosed.
+
+        D33 applies on **every** terminal path, not only ``finalize``. The
+        diagnosed failing stream gets ``FAILED``; the others get ``CLEAN``,
+        because that is what was actually observed — they were healthy and are
+        being closed as part of an orderly teardown. Nothing invents
+        ``DISCONNECTED`` or ``FAILED`` for a stream that showed neither.
+
+        Best-effort by necessity: the disk that just refused a chunk may refuse
+        these much smaller writes too. Whatever cannot be made durable is
+        returned, and the caller must not then claim a terminal state.
+        """
+        unclosed: list[str] = []
+        for candidate, stream in sorted(self.streams.items()):
+            if stream.closed or self.paths.stream(candidate).stream_close.exists():
+                stream.closed = True
+                continue
+            status = StreamCloseStatus.FAILED if candidate == failed else StreamCloseStatus.CLEAN
+            try:
+                self.close_stream(candidate, status)
+            except (OSError, ImmutableFileError, SealedPackageError):
+                unclosed.append(candidate)
+        return unclosed
+
     def fail_technical(self, message: str, *, stream_id: str | None = None) -> None:
         """Record a diagnosed fatal error and close the session.
 
@@ -234,16 +259,18 @@ class SessionWriter:
         refuse these much smaller writes. Anything that cannot be recorded is
         left to the recovery scanner, which reports an unclean close rather than
         inventing an outcome.
+
+        **Every opened stream gets durable closure before CLOSED is written.**
+        CLOSED is terminal, so a stream left without a close record after it can
+        never be given one — recovery would be permanently blocked on a fact
+        this path could still have recorded. If closure cannot be made durable,
+        no CLOSED record is written at all: the session is left interrupted,
+        which is true, rather than marked terminal, which would not be.
         """
         if self._failed:
             return
         self._failed = True
-        if stream_id is not None and stream_id in self.streams:
-            # Best-effort: the disk that just refused a chunk may refuse this
-            # too. If it does, the stream simply has no durable close record and
-            # recovery reports RECOVERED_UNCLEAN rather than inventing FAILED.
-            with contextlib.suppress(OSError, ImmutableFileError, SealedPackageError):
-                self.close_stream(stream_id, StreamCloseStatus.FAILED)
+        unclosed = self.close_all_streams(failed=stream_id)
         with contextlib.suppress(OSError, ValueError, KeyError):
             payload = {"message": message}
             if stream_id:
@@ -251,6 +278,8 @@ class SessionWriter:
             self.emit_event(
                 "TECHNICAL_ERROR", "technical_error.v1", origin="system", payload=payload
             )
+        if unclosed:
+            return
         with contextlib.suppress(OSError, LifecycleError):
             if self.lifecycle.state in (LifecycleState.ALLOCATED, LifecycleState.RECORDING):
                 self.lifecycle.append(LifecycleState.FINALIZING)

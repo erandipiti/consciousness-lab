@@ -83,6 +83,7 @@ class Finding(StrEnum):
     BROKEN_EVENTS_SEAL = "broken_events_seal"
     NOT_CANONICAL_ON_DISK = "not_canonical_on_disk"
     REMOVED_FIELD_PRESENT = "removed_field_present"
+    INVALID_ALLOCATION = "invalid_allocation"
 
     # condition 4 — the sealed outcome
     NOT_CLEANLY_CLOSED = "not_cleanly_closed"
@@ -271,6 +272,13 @@ def _condition_2(
             "sealed package content may not contain a symlink",
             link.relative_to(paths.root).as_posix(),
         )
+        ok = False
+
+    # allocation.json is the authority for package identity and for the schema
+    # major a reader must implement. Hashing it is not validating it.
+    allocation_problem = package_layout.allocation_error(paths)
+    if allocation_problem is not None:
+        result.add(Finding.INVALID_ALLOCATION, allocation_problem, "allocation.json")
         ok = False
 
     for offender in package_layout.noncanonical_documents(paths, stream_ids):

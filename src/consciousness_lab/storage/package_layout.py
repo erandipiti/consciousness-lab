@@ -18,7 +18,12 @@ from typing import Any
 
 from pydantic import BaseModel
 
-from consciousness_lab.session.model import Manifest, load_on_disk
+from consciousness_lab.session.model import (
+    SCHEMA_MAJOR,
+    Allocation,
+    Manifest,
+    load_on_disk,
+)
 from consciousness_lab.storage import canonical_json
 from consciousness_lab.storage.paths import PackagePaths
 
@@ -49,6 +54,24 @@ STREAM_CONTROL_FILES = ("descriptor.json", "chunks.jsonl", "stream_close.json")
 #: those facts actually live in, which is the whole defect class v2 removes.
 REMOVED_MANIFEST_KEYS = frozenset(
     {"session_id", "streams", "inventory", "schemas", "scope_note", "events_seal"}
+)
+#: Keys v2 DELETED from a ``chunks.jsonl`` record (§6, D28, D29, D34). Same
+#: principle as above and the same reason: a known-deleted authority is not an
+#: unknown future field. ``packets`` / ``observations`` / ``samples`` /
+#: ``payloads`` were v1's top-level ``ChunkArtifact`` blocks — in v2 those names
+#: exist only as keys INSIDE ``artifact_sha256``, so at top level they can only
+#: be a resurrected v1 representation.
+REMOVED_CHUNK_KEYS = frozenset(
+    {
+        "record_sha256",
+        "first_packet_seq",
+        "last_packet_seq",
+        "descriptor_sha256",
+        "packets",
+        "observations",
+        "samples",
+        "payloads",
+    }
 )
 
 
@@ -227,6 +250,49 @@ def noncanonical_documents(paths: PackagePaths, stream_ids: list[str]) -> list[s
         if canonical_document_error(path.read_bytes()) is not None:
             offenders.append(path.relative_to(paths.root).as_posix())
     return offenders
+
+
+def allocation_error(paths: PackagePaths) -> str | None:
+    """Why ``allocation.json`` is not a valid v2 allocation, or ``None``.
+
+    Sealing a document proves it is the document that was sealed; it does not
+    prove the document is *valid*. ``allocation.json`` is the authority for
+    package identity and for the schema major a reader must implement, so a
+    package whose allocation violates the model can be rehashed into
+    ``control_sha256`` and still look complete unless it is typed here.
+
+    The identity contract lives here too: a package's ``session_id`` is what its
+    directory is called. That is what makes a swapped manifest detectable
+    without the manifest carrying a third copy of the identity (§7).
+    """
+    path = paths.allocation
+    if not path.is_file():
+        return "allocation.json is absent"
+    raw = path.read_bytes()
+    error = canonical_document_error(raw)
+    if error is not None:
+        return f"allocation.json {error}"
+    try:
+        allocation = load_on_disk(Allocation, canonical_json.loads(raw))
+    except ValueError as exc:
+        return f"allocation.json is invalid on disk ({exc})"
+    try:
+        major = int(allocation.schema_version.split(".")[0])
+    except ValueError:
+        return (
+            f"allocation.json declares an unparseable schema_version {allocation.schema_version!r}"
+        )
+    if major != SCHEMA_MAJOR:
+        return (
+            f"allocation.json declares schema major {major}; this implementation "
+            f"writes and reads {SCHEMA_MAJOR} and will not guess"
+        )
+    if allocation.session_id != paths.root.name:
+        return (
+            f"allocation.json declares session_id {allocation.session_id!r} in a "
+            f"directory named {paths.root.name!r}"
+        )
+    return None
 
 
 def read_canonical_json(path: Path) -> tuple[Any, str | None]:

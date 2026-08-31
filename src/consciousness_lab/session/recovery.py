@@ -38,8 +38,10 @@ from consciousness_lab.session.model import (
     LifecycleState,
     Manifest,
     RecordingOutcome,
+    Run,
     SealPointer,
     StreamCloseStatus,
+    load_on_disk,
 )
 from consciousness_lab.session.writer import EVENT_SCHEMAS, write_stream_close
 from consciousness_lab.storage import canonical_json, package_layout
@@ -267,13 +269,21 @@ def resume_finalization(paths: PackagePaths) -> Manifest:
     if schema_error is not None:
         raise ResumeError(schema_error)
 
-    physical = read_all_physical_streams(paths)
+    # Typed, not merely canonical: a resumable transaction must never create a
+    # manifest pair over a structurally invalid control document.
+    allocation_problem = package_layout.allocation_error(paths)
+    if allocation_problem is not None:
+        raise ResumeError(allocation_problem)
     run_obj, run_error = package_layout.read_canonical_json(paths.run)
-    if run_error is not None or not isinstance(run_obj, dict):
-        raise ResumeError(f"run.json {run_error or 'is not a JSON object'}")
-    declared = set(run_obj.get("required_streams") or ()) | set(
-        run_obj.get("optional_streams") or ()
-    )
+    if run_error is not None:
+        raise ResumeError(f"run.json {run_error}")
+    try:
+        run = load_on_disk(Run, run_obj)
+    except ValueError as exc:
+        raise ResumeError(f"run.json is invalid on disk ({exc})") from exc
+
+    physical = read_all_physical_streams(paths)
+    declared = set(run.required_streams) | set(run.optional_streams)
     undeclared = sorted(set(physical) - declared)
     if undeclared:
         raise ResumeError(f"stream(s) {undeclared} are not declared in the run contract")
@@ -332,18 +342,91 @@ def resume_finalization(paths: PackagePaths) -> Manifest:
             raise ResumeError(f"control file {relative} is absent and cannot be sealed")
         control[relative] = sha256_file(target)
 
+    derived_seal = SealPointer(
+        sealed_len=len(lifecycle_bytes), sealed_sha256=sha256_bytes(lifecycle_bytes)
+    )
+    derived_events = sha256_bytes(events_bytes)
+
+    # The four states the writer's step 10 / step 11 boundary can leave behind.
+    if paths.manifest.is_file():
+        return _resume_over_existing_manifest(paths, derived_seal, derived_events, control)
+    if paths.manifest_sha256.exists():
+        # State C. The specified order writes manifest.json first, so this pair
+        # cannot arise from a crash — and a lone digest names bytes that no
+        # longer exist. Inventing a manifest to match it would be fabricating
+        # the very thing the digest is supposed to attest.
+        raise ResumeError(
+            "manifest.sha256 exists with no manifest.json; this cannot arise from the "
+            "specified write order and no manifest may be invented to match it"
+        )
+
+    # State A. Neither file exists: reconstruct and write the pair.
     utc_ns, monotonic_ns = now_reading()
     manifest = Manifest(
         sealed_at=ClockReading(utc_ns=utc_ns, monotonic_ns=monotonic_ns),
-        lifecycle_seal=SealPointer(
-            sealed_len=len(lifecycle_bytes), sealed_sha256=sha256_bytes(lifecycle_bytes)
-        ),
-        events_sha256=sha256_bytes(events_bytes),
+        lifecycle_seal=derived_seal,
+        events_sha256=derived_events,
         control_sha256=control,
     )
     manifest_bytes = canonical_json.canonicalize(manifest.model_dump(mode="json"))
     atomic_write_new(paths.manifest, manifest_bytes)
     atomic_write_new(paths.manifest_sha256, (sha256_bytes(manifest_bytes) + "\n").encode("utf-8"))
+    return manifest
+
+
+def _resume_over_existing_manifest(
+    paths: PackagePaths,
+    derived_seal: SealPointer,
+    derived_events: str,
+    derived_control: dict[str, str],
+) -> Manifest:
+    """States B and D: ``manifest.json`` already exists.
+
+    **The existing manifest is never replaced.** It is immutable the moment it
+    lands, and rewriting it would discard bytes the process durably wrote and
+    substitute our reconstruction of them — the same mistake as guessing an
+    outcome, one level down.
+
+    So it is *checked* instead: parsed, required to be canonical on disk, and
+    required to agree exactly with the state recovery independently derives. If
+    it agrees, only ``manifest.sha256`` is written, over those existing bytes.
+    If it disagrees, this blocks and neither file is touched.
+    """
+    raw = paths.manifest.read_bytes()
+    error = package_layout.canonical_document_error(raw)
+    if error is not None:
+        raise ResumeError(f"manifest.json {error}")
+    manifest = package_layout.read_manifest(paths.manifest)
+    if manifest is None:
+        raise ResumeError("manifest.json exists but cannot be parsed as a v2 manifest")
+
+    disagreements: list[str] = []
+    if (
+        manifest.lifecycle_seal.sealed_len != derived_seal.sealed_len
+        or manifest.lifecycle_seal.sealed_sha256 != derived_seal.sealed_sha256
+    ):
+        disagreements.append("lifecycle_seal")
+    if manifest.events_sha256 != derived_events:
+        disagreements.append("events_sha256")
+    if manifest.control_sha256 != derived_control:
+        disagreements.append("control_sha256")
+    if disagreements:
+        raise ResumeError(
+            f"the existing manifest.json disagrees with the durable state on "
+            f"{disagreements}; it will not be replaced"
+        )
+
+    digest = sha256_bytes(raw)
+    if paths.manifest_sha256.is_file():
+        # State D: both exist and the pair does not verify, or scan() would have
+        # called this package SEALED. Neither file is rewritten.
+        recorded = paths.manifest_sha256.read_text(encoding="utf-8").strip()
+        raise ResumeError(
+            "manifest.sha256 is present and does not match manifest.json "
+            f"({recorded[:12]}... vs {digest[:12]}...); neither file is rewritten"
+        )
+    # State B: complete the transaction over the bytes already on disk.
+    atomic_write_new(paths.manifest_sha256, (digest + "\n").encode("utf-8"))
     return manifest
 
 

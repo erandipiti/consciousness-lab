@@ -9,6 +9,66 @@ Versioning policy is unresolved — see `docs/OPERATIONS.md`.
 
 ## [Unreleased]
 
+### Fixed — CL-002B-R2-R1: human-review conformance gaps
+
+Human review of `8640d9d` returned **NO-GO** with five implementation defects.
+All five were reproduced against the physical bytes before anything was changed.
+No frozen document, decision record, relation, recovery semantic or scientific
+assumption was touched.
+
+- **Allocation structural validity was missing from the predicate.**
+  `allocation.json` was sealed and hashed but never typed, so a canonical
+  document violating the model — wrong schema major, an invalid participant
+  pseudonym, a `session_id` naming a different package — could be rehashed into
+  `control_sha256` and still verify complete. It is now validated from its
+  physical bytes via `load_on_disk(Allocation, ...)`, required to declare major
+  2, and required to agree with the directory name. Inside **condition 2**, so
+  the predicate still has exactly eight conditions.
+- **Known v1 `ChunkCommit` fields could be resurrected.** `parse_chunk_record`
+  rejected `record_sha256` alone; `first_packet_seq`, `last_packet_seq`,
+  `descriptor_sha256` and the old top-level `packets` / `observations` /
+  `samples` / `payloads` blocks were silently ignored. All eight now fail
+  closed via `REMOVED_CHUNK_KEYS`, the same principle already used for
+  `REMOVED_MANIFEST_KEYS`: a known-deleted authority is not an unknown future
+  field, and forward tolerance for genuine v2.x fields is preserved and tested.
+- **The real manifest crash window was unhandled.** A crash between step 10 and
+  step 11 leaves `manifest.json` present and `manifest.sha256` absent;
+  `resume_finalization` tried `atomic_write_new` over the existing manifest and
+  died on `ImmutableFileError`. All four partial-pair states are now explicit:
+  **A** neither file — reconstruct and write the pair; **B** manifest without
+  its digest — validate the existing bytes against independently derived state
+  and, only if they agree, write the digest over them, never replacing the
+  manifest; **C** a lone digest — impossible under the specified order, fails
+  closed, no manifest is invented; **D** a non-verifying pair — fails closed,
+  neither file rewritten.
+- **`fail_technical` could write CLOSED with a stream still unclosed.** With
+  two streams open, the failing one got `FAILED` while the healthy one got no
+  closure record at all — and CLOSED is terminal, so recovery could never
+  afterwards create it and resumption blocked forever. Every terminal path now
+  goes through `close_all_streams`: the diagnosed stream gets `FAILED`, the
+  others `CLEAN` because that is what was observed, and nothing invents
+  `DISCONNECTED` for a stream that showed nothing. If closure cannot be made
+  durable, **no CLOSED record is written** — an interrupted session is true, a
+  terminal one would not be. `finalize` enforces the same rule.
+- **Stream declaration was applied only to COMPLETED.** V09's stream-set
+  agreement is structural, not outcome-specific, so an ABORTED or
+  TECHNICAL_FAILURE package could be sealed with a stream declared in neither
+  `required_streams` nor `optional_streams`. The preflight is now split:
+  `_assert_sealable` (declaration, valid durable closure) runs for **every**
+  outcome; `_assert_completable` keeps only the completion-specific rules. No
+  new completion condition was introduced.
+
+`resume_finalization` additionally validates `allocation.json` and `run.json`
+through their models rather than as canonical dictionaries: a resumable
+transaction must never create a manifest pair over a structurally invalid
+control document.
+
+**Tests: 366 → 398**, in `tests/test_conformance_gaps_r1.py`. Every regression
+mutates physical bytes and then rebuilds the whole chain, `control_sha256` and
+the manifest pair, so what fails is conformance rather than a stale digest —
+and one test asserts that premise directly, proving the reseal helper leaves an
+untouched package complete.
+
 ### Added — CL-002B-R2: Session Package v2 implemented
 
 `src/` now writes and verifies **Session Package v2** (`schema_version = "2.0"`).

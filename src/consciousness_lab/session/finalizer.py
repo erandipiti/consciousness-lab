@@ -71,14 +71,48 @@ class FinalizationResult:
     manifest_sha256: str
 
 
+def _assert_sealable(
+    writer: SessionWriter, run: Run, physical: dict[str, PhysicalStreamState]
+) -> None:
+    """Structural preconditions for sealing ANY outcome.
+
+    These are not completion rules. A stream outside the run contract, or one
+    with no durable closure record, makes the package structurally invalid
+    whatever the session's scientific outcome was — V09's stream-set agreement
+    is not outcome-specific, and a sealed ABORTED package that fails it is just
+    as unverifiable as a sealed COMPLETED one.
+
+    Checked before any terminal lifecycle record is written, because that record
+    is immutable once appended.
+    """
+    declared = set(run.required_streams) | set(run.optional_streams)
+    undeclared = sorted(set(physical) - declared)
+    if undeclared:
+        raise FinalizationError(
+            f"stream(s) {undeclared} are on disk but declared in neither "
+            "run.required_streams nor run.optional_streams"
+        )
+    for stream_id in sorted(physical):
+        state = physical[stream_id]
+        if state.close_error is not None:
+            raise FinalizationError(f"stream {stream_id}: {state.close_error}")
+        if not state.close_present:
+            raise FinalizationError(f"stream {stream_id} has no durable stream_close.json")
+
+
 def _assert_completable(
-    writer: SessionWriter, run: Run, closure_condition: ClosureCondition
+    writer: SessionWriter,
+    run: Run,
+    closure_condition: ClosureCondition,
+    physical: dict[str, PhysicalStreamState],
 ) -> None:
     """Refuse to seal COMPLETED unless it is actually true (D18, D22).
 
-    Defence in depth. The verifier is authoritative after sealing, but a
-    lifecycle record claiming COMPLETED is immutable, so it must not be written
-    while the streams it describes are known to be missing or unclean.
+    Completion-specific only — the structural rules live in ``_assert_sealable``
+    and run for every outcome. Defence in depth: the verifier is authoritative
+    after sealing, but a lifecycle record claiming COMPLETED is immutable, so it
+    must not be written while the streams it describes are known to be missing
+    or unclean.
     """
     if closure_condition is not ClosureCondition.CLEAN:
         raise FinalizationError(
@@ -91,17 +125,6 @@ def _assert_completable(
     if incomplete:
         raise FinalizationError(
             f"{len(incomplete)} incomplete write marker(s) present; the session is not complete"
-        )
-    physical = read_all_physical_streams(writer.paths)
-    declared = set(run.required_streams) | set(run.optional_streams)
-    undeclared = sorted(set(physical) - declared)
-    if undeclared:
-        # A stream outside the run contract is not a valid part of the package
-        # (§9, condition 5a). Caught HERE, before the terminal lifecycle record,
-        # because a record claiming COMPLETED is immutable once written.
-        raise FinalizationError(
-            f"stream(s) {undeclared} are on disk but declared in neither "
-            "run.required_streams nor run.optional_streams"
         )
     for stream_id in run.required_streams:
         state = physical.get(stream_id)
@@ -232,12 +255,30 @@ def finalize(
         if not close_path.exists():
             write_stream_close(close_path, open_stream.close_status)
         open_stream.closed = True
+    # The same rule the fatal-error path enforces: no terminal lifecycle record
+    # may be written while an opened stream lacks durable closure (D33).
+    unclosed = [
+        stream_id
+        for stream_id in writer.streams
+        if not writer.paths.stream(stream_id).stream_close.is_file()
+    ]
+    if unclosed:
+        raise FinalizationError(
+            f"stream(s) {sorted(unclosed)} have no durable stream_close.json; a terminal "
+            "lifecycle record must not claim finalization reached a terminal state"
+        )
 
-    # A sealed COMPLETED must be true at the moment it is written. The verifier
-    # would reject the package later either way, but a lifecycle log that says
-    # COMPLETED when it was not is a lie recorded in immutable data.
+    # Structural first, for EVERY outcome: the package must be sealable at all
+    # before a terminal lifecycle record claims finalization reached one.
+    preflight = read_all_physical_streams(writer.paths)
+    _assert_sealable(writer, run, preflight)
+
+    # A sealed COMPLETED must additionally be true at the moment it is written.
+    # The verifier would reject the package later either way, but a lifecycle
+    # log that says COMPLETED when it was not is a lie recorded in immutable
+    # data.
     if outcome is RecordingOutcome.COMPLETED:
-        _assert_completable(writer, run, closure_condition)
+        _assert_completable(writer, run, closure_condition, preflight)
 
     # Steps 3, 4 — lifecycle, so the sealed prefix is complete before hashing.
     if writer.lifecycle.state is LifecycleState.ALLOCATED:

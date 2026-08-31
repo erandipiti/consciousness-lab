@@ -29,7 +29,7 @@ from consciousness_lab.session.model import (
     StreamDescriptor,
     load_on_disk,
 )
-from consciousness_lab.storage import canonical_json
+from consciousness_lab.storage import canonical_json, package_layout
 from consciousness_lab.storage import payload as payload_mod
 from consciousness_lab.storage.arrow_schema import (
     schema_conformance_error,
@@ -197,8 +197,9 @@ def parse_chunk_record(raw: bytes) -> ChunkRecordOnDisk | str:
 
     * the record is **canonical on disk** — re-canonicalizing the parsed
       document reproduces the physical bytes exactly (§9.3);
-    * it carries **no ``record_sha256``** — that key was removed from
-      ``chunks.jsonl`` in v2, and a document carrying one is not a v2 record;
+    * it carries none of the keys v2 removed from ``chunks.jsonl`` — not just
+      ``record_sha256`` but every v1 top-level representation, because a
+      known-deleted authority is categorically not an unknown future field;
     * the canonical bytes come from the FULL parsed document, so any field
       present on disk participates in identity, including one the model ignores.
     """
@@ -208,8 +209,13 @@ def parse_chunk_record(raw: bytes) -> ChunkRecordOnDisk | str:
         return f"not parseable ({exc})"
     if not isinstance(obj, dict):
         return "record is not a JSON object"
-    if canonical_json.RECORD_HASH_KEY in obj:
-        return "carries record_sha256, which chunks.jsonl does not persist in v2"
+    resurrected = sorted(set(obj) & package_layout.REMOVED_CHUNK_KEYS)
+    if resurrected:
+        # Minor-version tolerance ignores an unknown *new* field, deliberately.
+        # A key v2 DELETED is not a future field: it is a resurrected v1
+        # authority, and leaving it accepted would let a record carry a packet
+        # range or a descriptor hash contradicting the physical artifacts.
+        return f"carries {resurrected}, which v2 removed from chunks.jsonl"
     canonical = canonical_json.canonicalize(obj)
     if canonical != raw:
         return "is not canonical on disk"
