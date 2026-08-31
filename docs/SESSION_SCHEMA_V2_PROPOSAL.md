@@ -1,8 +1,17 @@
 # SESSION_SCHEMA_V2_PROPOSAL — Session Package v2
 
-> **Status: PROPOSAL. Not approved.** `DECISIONS.md` is untouched; draft records
-> D27–D34 at the end await human approval. No production code was changed by the
-> ticket that produced this document.
+> ## Status: APPROVED AND FROZEN — Session Package v2
+>
+> **Human approval recorded in:** CL-002A-R3-APPROVAL, 2026-08-31.
+> **Decision index:** [`DECISIONS.md`](DECISIONS.md) D27–D34, which supersede
+> nothing in D8–D26 and are recorded there as approved decisions.
+>
+> This document is the **authoritative specification** for Session Package v2.
+> **A future implementation discrepancy is a bug, unless a later decision record
+> in `DECISIONS.md` explicitly supersedes this specification.**
+>
+> No production code or test was changed by the tickets that produced or froze
+> this document. Implementation is CL-002B-R2.
 
 **Target:** `schema_version = "2.0"`
 **Supersedes:** Session Package v1 (`SESSION_SCHEMA_PROPOSAL.md`), which remains
@@ -749,9 +758,12 @@ protocol decision, not a package-integrity one.
 
 ---
 
-## 16. Draft decision records — D27–D34
+## 16. Decision records — D27–D34
 
-> **DRAFTS.** Not inserted into `DECISIONS.md`. They require human approval.
+> **APPROVED** by CL-002A-R3-APPROVAL and recorded in
+> [`DECISIONS.md`](DECISIONS.md), which is the authoritative index. The summaries
+> below are kept for readability in context; where the wording differs,
+> `DECISIONS.md` governs.
 
 **D27 — Session Package v2 supersedes v1 before Study 001 acquisition.**
 v1 survived five review rounds without converging because it persists the same

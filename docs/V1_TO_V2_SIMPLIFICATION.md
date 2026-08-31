@@ -1,7 +1,8 @@
 # V1_TO_V2_SIMPLIFICATION — what is removed, and why
 
-> **Status: PROPOSAL**, part of CL-002A-R3. Companion to
-> `SESSION_SCHEMA_V2_PROPOSAL.md` and `PACKAGE_INTEGRITY_V2.md`.
+> **Status: APPROVED AND FROZEN** with Session Package v2 (CL-002A-R3-APPROVAL,
+> 2026-08-31). Companion to `SESSION_SCHEMA_V2_PROPOSAL.md` and
+> `PACKAGE_INTEGRITY_V2.md`; decision index `DECISIONS.md` D27–D34.
 
 Every row is a persisted representation in Session Package v1, the reason it
 existed, and its v2 disposition. The final column names the integrity relations
@@ -62,7 +63,7 @@ relation in a normative list — so they reconcile exactly:
 | removed outright | 17 |
 | surviving into v2 | 17 |
 | v2 relations those 17 consolidate into | **11** |
-| v2 relations with no v1 ancestor | **3** |
+| v2 relations with no R01–R34 ancestor | **3** |
 | v2 relations (V01–V14) | **14** |
 
 `17 + 17 = 34`; `11 + 3 = 14`. `PACKAGE_INTEGRITY_V2.md` §4.1 names every
@@ -106,22 +107,27 @@ session.
 
 Five checks were **added** deliberately, in two different units. None is a
 relation between two persisted copies of a fact, so none compounds the way the
-removals did.
+removals did. "New" is measured against the **numbered R01–R34 matrix**, which is
+not an inventory of every normative invariant the approved v1 specification
+states — two of the three below formalize rules v1 already stated in prose.
 
 | Added | Unit | Why |
 |---|---|---|
 | Arrow physical schema conformance | §3 physical conformance contract — **not** one of the 14 | a matching SHA proves identity, not conformance (C4 G1) |
 | Observation row semantics on read | §3 physical conformance contract — **not** one of the 14 | validated on write only in v1 (C4 G2) |
-| What a JSONL record is (V11) | new relation | v1 never stated it: one complete canonical object, one newline, no trailing bytes |
-| Canonical bytes on disk (V12) | new relation | one record must have one spelling; v1 required canonical bytes only *between* two copies |
-| Pre-seal `record_sha256` verified (V14) | new relation | v1 persisted the values but never required a reader to check them |
+| What a JSONL record is (V11) | numbered relation, no R01–R34 ancestor | v1 §12.2 already required exactly one canonical record per line terminated by a newline; V11 numbers that rule and strengthens it — torn tails defined explicitly, trailing bytes rejected in a finalized package |
+| Canonical bytes on disk (V12) | numbered relation, no R01–R34 ancestor | v1 verified by re-canonicalizing from the parsed object, which tolerated a non-canonical on-disk spelling that re-canonicalized to the same content; V12 removes that latitude — one record, one spelling |
+| Pre-seal `record_sha256` verified (V14) | numbered relation, no R01–R34 ancestor | v1 §12.2 already defines the verification procedure (parse, remove `record_sha256`, canonicalize, hash, compare); V14 promotes it into the numbered matrix and gives it its explicit pre-seal role |
 
 Two further v2 relations look new and are not: **V10** (derived control key set,
 exact in both directions) and **V13** (no immutable file outside the defined
 layout, and the `schemas/` set equals the ids the sealed events log references)
-are the two remaining directions of v1's R34 inventory bijection, restated now
-that v2 persists no flat inventory. They are what makes the DAG's "every sealed
-byte is reachable" claim literally enforceable.
+descend from v1's R34 inventory bijection, restated now that v2 persists no flat
+inventory. They are what makes the DAG's "every sealed byte is reachable" claim
+literally enforceable. V13 is not a pure restatement: R34 is the ancestor of its
+closed-filesystem direction, but the requirement that the physical `schemas/` set
+equal **exactly** the schema ids the sealed events log references is a v2
+strengthening R34 did not enforce.
 
 ## Relationship to D8–D26
 
@@ -130,5 +136,5 @@ records; v2 changes only which redundant copies are persisted alongside. The one
 v1 statement v2 supersedes is the sidecar's existence, which was an
 implementation detail of §12.2 rather than a decision record.
 
-Draft records D27–D34 in `SESSION_SCHEMA_V2_PROPOSAL.md` §16 capture what a human
-would need to approve.
+Records D27–D34 were approved by CL-002A-R3-APPROVAL and are recorded in
+`DECISIONS.md`. They add to D8–D26; they supersede none of them.

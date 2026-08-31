@@ -1,8 +1,18 @@
 # SESSION_SCHEMA_PROPOSAL — Session Package v1 and Session Registry
 
-> ## Status: APPROVED FOR IMPLEMENTATION — Session Package v1
+> ## Status: SUPERSEDED BY SESSION PACKAGE v2 — historical record
 >
-> **Approved baseline:** `c5e6a9e712cd4a214162bec57d99ea89c33b01e4`
+> **Superseded by** [`SESSION_SCHEMA_V2_PROPOSAL.md`](SESSION_SCHEMA_V2_PROPOSAL.md)
+> per `DECISIONS.md` **D27** (CL-002A-R3-APPROVAL, 2026-08-31). Session Package
+> v2 is the acquisition data contract; a v2 reader fails closed on a v1 package.
+> No Study 001 recording was made under v1.
+>
+> **Nothing below is deleted.** This document remains accurate about v1 and is
+> kept as the historical design record — including the five adversarial review
+> rounds whose findings are the argument for v2. Its approval history stands as
+> recorded.
+>
+> **Approved baseline (v1):** `c5e6a9e712cd4a214162bec57d99ea89c33b01e4`
 > **Human approval recorded in:** CL-002A-APPROVAL, 2026-08-28.
 > **Decision index:** [`DECISIONS.md`](DECISIONS.md) D8–D26.
 >

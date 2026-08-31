@@ -485,6 +485,143 @@ interpretation out of the raw path:
   schemas are versioned independently and snapshotted into each package. **No
   Focus-specific semantics are added to the generic acquisition layer.** (§11)
 
+## D27 — Session Package v2 supersedes v1, before any Study 001 acquisition
+
+**Decided (CL-002A-R3-APPROVAL).** Session Package **v2** (`schema_version =
+"2.0"`) is the acquisition data contract. Session Package v1 is superseded and
+retained as the historical design record; a v2 reader fails closed on a v1
+package rather than guessing.
+
+**Why.** v1 survived five adversarial review rounds without converging: each
+round found a *different* independently falsifiable representation of the same
+fact — manifest ↔ filesystem, sidecar ↔ chain, parsed model ↔ canonical bytes,
+summary ↔ physical rows, byte frame / row set / list, Arrow schema / row
+semantics. That is a recursion with no floor, because v1 persists one fact in
+several places by design. v2 deletes the duplicates instead of enforcing them:
+the numbered equivalence matrix goes from **34 relations (R01–R34) to 14
+(V01–V14)**.
+
+**Rejected.** A sixth correction round (C5). The escalation rule in the C4
+ticket applies: when successive rounds keep finding new instances of one defect
+class, the defect is architectural.
+
+**What makes this cheap.** No Study 001 recording exists. The cost of superseding
+is zero today and a permanent enforcement burden if deferred.
+
+**Source.** `docs/SESSION_SCHEMA_V2_PROPOSAL.md`, `docs/PACKAGE_INTEGRITY_V2.md`,
+`docs/V1_TO_V2_SIMPLIFICATION.md`.
+
+## D28 — `chunks.jsonl` is the only persisted chunk commit authority
+
+**Decided (CL-002A-R3-APPROVAL).** Per-chunk `NNNNNN.commit.json` sidecars are
+removed. A chunk is committed **iff** its record is durably present in the
+hash-chained log. Any per-chunk index built for performance is derived and
+rebuildable, never sealed acquisition truth.
+
+**Why.** The sidecar was a complete second copy of a record that had to stay
+canonically identical to the chain forever. It produced two BLOCKING findings on
+its own and four of the relations v2 deletes (R01–R04).
+
+**Source.** Proposal v2 §6, §12.
+
+## D29 — A persisted summary must earn an authority or operational role
+
+**Decided (CL-002A-R3-APPROVAL).** A value deterministically derivable from an
+authoritative representation is derived at read time, not stored again.
+
+Removed on this basis: artifact paths, artifact byte counts, chunk packet ranges,
+chunk descriptor hashes, and every `ManifestStream` summary field.
+
+**Not covered by this rule:** integrity metadata protecting a sole authority — see
+D34 — and summaries with a semantic role, which are listed and justified
+individually (`lifecycle_seal.sealed_len`, `annotations.head.json`, payload frame
+`payload_len`).
+
+**Why.** Each stored summary is a place where two persisted claims about one fact
+can disagree, and every one of them must be reconciled by the verifier forever.
+
+**Source.** `docs/V1_TO_V2_SIMPLIFICATION.md`.
+
+## D30 — Hierarchical integrity; a raw artifact hash is persisted exactly once
+
+**Decided (CL-002A-R3-APPROVAL).** `manifest.sha256` seals `manifest.json`; the
+manifest seals the control files and each stream's `chunks.jsonl`; each chain
+seals its own raw artifacts. Transitive protection is protection.
+
+**Scope.** The reachability claim covers every byte **within the manifest
+integrity scope**. `annotations.jsonl` / `annotations.head.json` (written after
+sealing), `logs/` (never authoritative) and `data/derived/` (regenerable) are
+outside the DAG by design and carry their own mechanisms.
+
+**Why.** v1 hashed raw artifacts twice — in the commit and in a flat manifest
+inventory — which is pure duplication with a permanent reconciliation cost.
+
+**Source.** `docs/PACKAGE_INTEGRITY_V2.md` §2.
+
+## D31 — Physical Arrow schema and row semantics are part of package validity
+
+**Decided (CL-002A-R3-APPROVAL).** A matching SHA proves identity, not
+conformance. Field names, order, types and nullability are contractual;
+unrecognised Arrow **schema metadata** is not. Observation row semantics are
+validated by **one shared validator** invoked on both write and read.
+
+**Why.** CL-002B-R1-C4 deleted an entire `values` column from an artifact and the
+package still completed; a `uint64` observation carrying `value_f64` verified
+clean. Two definitions of "valid observation" is the defect class this removes.
+
+**Source.** `docs/PACKAGE_INTEGRITY_V2.md` §3.
+
+## D32 — `sparse_long` sample primary key
+
+**Decided (CL-002A-R3-APPROVAL).** For `sparse_long`, the sample primary key is
+`(packet_seq, sample_index_in_packet, channel_id)`. Dense stays
+`(packet_seq, sample_index_in_packet)`. For sparse, `n_samples` means logical
+sample positions, not long-format rows, and complete channel coverage is **not**
+required.
+
+**Why.** v1 named one sample primary key while sparse rows also carry
+`channel_id` — an internal contradiction, and the one open specification blocker
+carried out of CL-002B-R1-C4. This resolves it.
+
+**Source.** Proposal v2 §8.
+
+## D33 — Stream closure is a per-stream durable authority
+
+**Decided (CL-002A-R3-APPROVAL).** `raw/<stream_id>/stream_close.json` is the
+**sole** persisted authority for terminal stream closure: written once,
+immutable, one file per opened stream, sealed by the manifest through
+`control_sha256` and never repeated in it. Status domain: `CLEAN`,
+`DISCONNECTED`, `RECONFIGURED`, `FAILED`, `RECOVERED_UNCLEAN`.
+
+**Why.** A fact required to resume finalization must not live only in RAM until
+the final seal, which is what a `manifest.stream_close_status` map would have
+meant: a crash between lifecycle `CLOSED` and the manifest pair would have lost
+it. Closure is now durable *before* `FINALIZING` is appended.
+
+**`RECOVERED_UNCLEAN`** records that the process vanished with no durable close
+record. It is an operational observation and is **never** silently mapped to
+`FAILED` or `DISCONNECTED`.
+
+**Constrains.** The v2 manifest owns no semantic stream fact at all; it is a
+finalization marker and an integrity root, nothing else.
+
+**Source.** Proposal v2 §7.1, §9.4.
+
+## D34 — Pre-seal logs retain local record integrity
+
+**Decided (CL-002A-R3-APPROVAL).** `lifecycle.jsonl` and `events/events.jsonl`
+retain a per-record `record_sha256`; `annotations.jsonl` retains its own;
+`chunks.jsonl` drops it.
+
+**Why.** Those logs must be individually verifiable **before a manifest exists**,
+which is exactly when recovery reads them to learn what durably happened. The
+whole-file manifest hash serves the distinct post-finalization sealing role.
+Complementary layers with different temporal scope, not competing authorities —
+so D29 does not apply. `chunks.jsonl` needs no self-hash because its records are
+cross-checked against physical artifacts recovery reads anyway.
+
+**Source.** `docs/PACKAGE_INTEGRITY_V2.md` §2, Proposal v2 §6.1.
+
 ---
 
 ## Awaiting a named human

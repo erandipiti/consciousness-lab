@@ -9,6 +9,63 @@ Versioning policy is unresolved — see `docs/OPERATIONS.md`.
 
 ## [Unreleased]
 
+### Approved — CL-002A-R3-APPROVAL: Session Package v2 frozen (documentation only)
+
+**Human approval, 2026-08-31.** Session Package v2 architecture is **APPROVED**;
+draft records **D27–D34 are APPROVED** and are now recorded in
+[`docs/DECISIONS.md`](docs/DECISIONS.md) as decisions, not drafts. No further
+architecture or adversarial review is required. Production code and tests are
+unchanged — the implementation in `src/` still writes v1, and CL-002B-R2 is the
+task that migrates it.
+
+**Frozen**
+
+- `docs/SESSION_SCHEMA_V2_PROPOSAL.md` — now **APPROVED AND FROZEN**, the
+  authoritative specification for `schema_version = "2.0"`. A future
+  implementation discrepancy is a bug unless a later decision record supersedes
+  it. §16 no longer holds drafts; `DECISIONS.md` governs.
+- `docs/PACKAGE_INTEGRITY_V2.md`, `docs/V1_TO_V2_SIMPLIFICATION.md` — frozen with
+  it.
+- `docs/SESSION_SCHEMA_PROPOSAL.md` — marked **SUPERSEDED BY SESSION PACKAGE v2,
+  historical record**, per D27. Nothing is deleted; its approval history stands
+  as recorded, and it remains accurate about v1. `docs/CHUNK_EQUIVALENCE.md`
+  stays as the v1 implementation audit.
+- `docs/SESSION_FORMAT.md` — points at v2 as the current contract, keeps the v1
+  baseline and its audit as history, and states plainly that `src/` still writes
+  v1.
+
+**Three historical/accounting wording corrections required by the approval.**
+None changes the 34 → 14 accounting or any v2 semantics.
+
+- **Scope.** "v2 relations with no v1 ancestor" now reads "with no **R01–R34**
+  ancestor" everywhere. R01–R34 is the numbered v1 equivalence matrix, not an
+  inventory of every normative invariant the approved v1 specification states.
+- **V11 history corrected.** v1 §12.2 already required exactly one canonical
+  record per line, terminated by a newline, in `lifecycle.jsonl`,
+  `annotations.jsonl`, `chunks.jsonl` and `events/events.jsonl`. V11 is the
+  numbered form of that existing rule, strengthened to define torn tails
+  explicitly and to reject trailing bytes in a finalized package. The prior claim
+  that "v1 never stated it" was wrong.
+- **V14 history corrected.** v1 §12.2 already defines `record_sha256`
+  verification — parse, remove `record_sha256`, canonicalize, hash, compare. V14
+  promotes that existing requirement into the numbered matrix and gives it its
+  explicit pre-seal role. The prior claim that v1 "never required a reader to
+  check" the values was wrong.
+- **V13 ancestry clarified.** R34 is the ancestor of V13's closed-filesystem
+  direction only. The requirement that the physical `schemas/` set equal
+  **exactly** the schema ids the sealed events log references is a v2
+  strengthening R34 did not enforce.
+- **V12 wording tightened** in the same pass, for accuracy rather than by
+  request: v1 verified by re-canonicalizing from the parsed object, which
+  tolerated a non-canonical on-disk spelling that re-canonicalized to the same
+  content. V12 removes that latitude. The earlier phrasing ("v1 required
+  canonical bytes only between two copies") described the mechanism wrongly.
+
+**Counts unchanged:** v1 **34** (R01–R34) → v2 **14** (V01–V14); 17 removed
+outright, 17 surviving consolidated into 11, 3 with no R01–R34 ancestor.
+
+**Next:** CL-002B-R2 is unlocked. CL-003 remains locked.
+
 ### Proposed — CL-002A-R3-R1a: documentation consistency cleanup (documentation only)
 
 **Status: PROPOSAL. Not approved.** No architecture, authority, recovery
@@ -25,7 +82,8 @@ semantics, minimality decision, draft record or scientific scope was reopened.
   single unit — one numbered relation in a normative list — and a per-relation
   mapping in `PACKAGE_INTEGRITY_V2.md` **§4.1**: of v1's 34, **17 are removed
   outright** and **17 survive, consolidating into 11** v2 relations; **3** v2
-  relations have no v1 ancestor (V11, V12, V14). `17 + 17 = 34`; `11 + 3 = 14`.
+  relations have no **R01–R34** ancestor (V11, V12, V14). `17 + 17 = 34`;
+  `11 + 3 = 14`.
 - **Stale "9" removed.** `PACKAGE_INTEGRITY_V2.md` still said "It needs 9" and
   `V1_TO_V2_SIMPLIFICATION.md` still reported v2 = 9, both left over from a draft
   whose list ended at V09. Neither matched the list shipped in the same commit.
@@ -93,7 +151,9 @@ affected. All remain drafts.
 Relation count reconciled against the normative lists, in one unit. v1 has
 **34** numbered relations (R01–R34); v2 has **14** (V01–V14). Of the 34, **17 are
 removed outright** and **17 survive, consolidating into 11**; **3** v2 relations
-have no v1 ancestor (V11, V12, V14). `17 + 17 = 34`, `11 + 3 = 14`. None of the
+have no **R01–R34** ancestor (V11, V12, V14). `17 + 17 = 34`, `11 + 3 = 14`.
+R01–R34 is the numbered v1 matrix, not an inventory of every invariant the
+approved v1 specification states. None of the
 additions is a relation between two persisted copies. Two further checks were
 added as §3 physical conformance contracts and are deliberately not counted among
 the 14. `PACKAGE_INTEGRITY_V2.md` §4.1 names every relation on both sides.

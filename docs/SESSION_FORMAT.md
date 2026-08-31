@@ -1,15 +1,25 @@
 # SESSION_FORMAT
 
-**Status: Session Package v1 design is APPROVED.**
+**Status: Session Package v2 is APPROVED AND FROZEN.** It supersedes v1
+(`DECISIONS.md` D27, CL-002A-R3-APPROVAL, 2026-08-31), which is retained as the
+historical design record.
 
 **Authoritative detailed specification:**
-[`SESSION_SCHEMA_PROPOSAL.md`](SESSION_SCHEMA_PROPOSAL.md).
+[`SESSION_SCHEMA_V2_PROPOSAL.md`](SESSION_SCHEMA_V2_PROPOSAL.md), with
+[`PACKAGE_INTEGRITY_V2.md`](PACKAGE_INTEGRITY_V2.md) for authority, the integrity
+DAG and the fourteen referential relations.
 
-**Approved design baseline:** `c5e6a9e712cd4a214162bec57d99ea89c33b01e4`
-(CL-002A + CL-002A-R1 + CL-002A-R2; human approval recorded in
-CL-002A-APPROVAL).
+**Decision index:** [`DECISIONS.md`](DECISIONS.md) D8–D26 (what is authoritative
+and what the study records) and D27–D34 (which redundant copies are persisted
+alongside). D27–D34 supersede none of D8–D26.
 
-**Decision index:** [`DECISIONS.md`](DECISIONS.md) D8–D26.
+**Historical, v1:** [`SESSION_SCHEMA_PROPOSAL.md`](SESSION_SCHEMA_PROPOSAL.md),
+approved baseline `c5e6a9e712cd4a214162bec57d99ea89c33b01e4` (CL-002A +
+CL-002A-R1 + CL-002A-R2, human approval in CL-002A-APPROVAL), with its
+implementation audit in [`CHUNK_EQUIVALENCE.md`](CHUNK_EQUIVALENCE.md).
+
+**The implementation in `src/` still writes v1.** It is unchanged by the v2
+approval; CL-002B-R2 is the task that migrates it.
 
 This document is now a **summary and a pointer**. It does not duplicate the
 schema: where implementation detail is needed, the proposal governs. Its earlier

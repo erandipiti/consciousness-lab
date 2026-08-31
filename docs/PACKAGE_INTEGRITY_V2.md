@@ -1,8 +1,9 @@
 # PACKAGE_INTEGRITY_V2 — authority, integrity DAG and physical conformance
 
-> **Status: PROPOSAL**, part of CL-002A-R3. Companion to
-> `SESSION_SCHEMA_V2_PROPOSAL.md`. Supersedes `CHUNK_EQUIVALENCE.md` for v2;
-> that document remains the v1 implementation audit and historical record.
+> **Status: APPROVED AND FROZEN** with Session Package v2 (CL-002A-R3-APPROVAL,
+> 2026-08-31). Companion to `SESSION_SCHEMA_V2_PROPOSAL.md`; decision index
+> `DECISIONS.md` D27–D34. Supersedes `CHUNK_EQUIVALENCE.md` for v2; that document
+> remains the v1 implementation audit and historical record.
 
 This document is deliberately short. The v1 equivalence matrix needed 34
 pairwise relations (R01–R34 in `CHUNK_EQUIVALENCE.md`) because v1 persisted the
@@ -138,7 +139,7 @@ already enforced its content.
 | — removed outright, the representation they related no longer exists | 17 |
 | — surviving into v2 | 17 |
 | the v2 relations those 17 consolidate into | **11** (V01–V10, V13) |
-| v2 relations with no v1 ancestor | **3** (V11, V12, V14) |
+| v2 relations with no R01–R34 ancestor | **3** (V11, V12, V14) |
 | v2 documented relations (V01–V14) | **14** |
 
 `11 + 3 = 14`, and `17 + 17 = 34`. The drop from 34 to 14 is therefore two
@@ -160,15 +161,34 @@ R21, R22, R23 · V08←R16 (reformulated: the frame ↔ packets bijection replac
 V09←R07, R30, R31 · V10←R34 (its control-file direction, with the expected set
 derived rather than persisted) · V13←R34 (its no-unexpected-file direction).
 
-**New (3)** — V11 (what a JSONL record *is*: one complete canonical object plus
-one newline, no trailing bytes), V12 (canonical on disk, byte for byte, for every
-canonical document rather than only between two copies of one), V14 (verifying
-the pre-seal `record_sha256` values, which v1 persisted but never required a
-reader to check).
+**No R01–R34 ancestor (3)** — V11, V12 and V14. R01–R34 is the numbered v1
+equivalence matrix, not an inventory of every normative invariant the approved v1
+specification states, so "no ancestor" here means *absent from that matrix* — two
+of these three formalize rules v1 already stated in prose:
 
-R34 is the one v1 relation that fans out rather than merging: v1's single
+- **V11** is the numbered form of v1's existing rule that `lifecycle.jsonl`,
+  `annotations.jsonl`, `chunks.jsonl` and `events/events.jsonl` carry exactly one
+  canonical record per line terminated by a newline
+  (`SESSION_SCHEMA_PROPOSAL.md` §12.2). v2 strengthens it: torn tails are defined
+  explicitly, and trailing bytes after the last newline are rejected in a
+  finalized package.
+- **V12** requires canonical bytes **on disk**. v1 verified by re-canonicalizing
+  from the parsed object precisely so that a non-canonical external spelling
+  could not pass undetected — which also meant a non-canonical on-disk spelling
+  was tolerated as long as it re-canonicalized to the same content. v2 removes
+  that latitude: one record, one spelling.
+- **V14** promotes v1's existing `record_sha256` verification procedure — parse,
+  remove `record_sha256`, canonicalize, hash, compare
+  (`SESSION_SCHEMA_PROPOSAL.md` §12.2) — into the numbered matrix and gives it an
+  explicit pre-seal role for `lifecycle.jsonl` and `events/events.jsonl`.
+
+R34 is the one matrix relation that fans out rather than merging: v1's single
 "inventory ↔ filesystem, bijection over immutable files" becomes three v2
 relations because v2 no longer persists one flat inventory covering everything.
+V13 is not a pure restatement of it: R34 is the ancestor of its
+closed-filesystem direction, while the requirement that the physical `schemas/`
+set equal **exactly** the schema ids the sealed events log references is a v2
+strengthening that R34 did not enforce.
 
 Separately from this list, review also added **two physical conformance
 contracts** in §3 — Arrow schema equality per artifact kind, and observation row
