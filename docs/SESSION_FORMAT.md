@@ -108,6 +108,11 @@ information needed to answer them later rather than assuming an answer:
 
 ## What implementation owes this document
 
-Nothing further. CL-002B implements `SESSION_SCHEMA_PROPOSAL.md` as approved. A
-divergence between the implementation and that specification is a **bug**,
-unless a later record in `DECISIONS.md` explicitly supersedes it.
+**CL-002B-R2 implements [`SESSION_SCHEMA_V2_PROPOSAL.md`](SESSION_SCHEMA_V2_PROPOSAL.md)
+as approved and frozen.** A divergence between the implementation and that
+specification is a **bug**, unless a later record in `DECISIONS.md` explicitly
+supersedes it.
+
+CL-002B implemented `SESSION_SCHEMA_PROPOSAL.md` (v1), which D27 superseded. That
+obligation is discharged and historical: `src/` writing v1 today is the known gap
+CL-002B-R2 closes, not a defect against the frozen v2 specification.

@@ -9,6 +9,19 @@ Versioning policy is unresolved — see `docs/OPERATIONS.md`.
 
 ## [Unreleased]
 
+### Fixed — CL-002A-R3-APPROVAL-ERRATA: stale implementation pointer (documentation only)
+
+`docs/SESSION_FORMAT.md` §"What implementation owes this document" still read
+"CL-002B implements `SESSION_SCHEMA_PROPOSAL.md` as approved", pointing the live
+implementation obligation at the **superseded v1** specification and contradicting
+the freeze recorded at the top of the same document. It now points at
+`SESSION_SCHEMA_V2_PROPOSAL.md` and **CL-002B-R2**, and states that CL-002B's v1
+obligation is discharged and historical — `src/` writing v1 today is the gap
+CL-002B-R2 closes, not a defect against the frozen v2 specification.
+
+Documentation only. No architecture, decision, schema semantics, accounting,
+recovery behaviour or scientific scope was touched.
+
 ### Approved — CL-002A-R3-APPROVAL: Session Package v2 frozen (documentation only)
 
 **Human approval, 2026-08-31.** Session Package v2 architecture is **APPROVED**;
