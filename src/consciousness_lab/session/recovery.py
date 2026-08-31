@@ -268,6 +268,15 @@ def resume_finalization(paths: PackagePaths) -> Manifest:
         raise ResumeError(schema_error)
 
     physical = read_all_physical_streams(paths)
+    run_obj, run_error = package_layout.read_canonical_json(paths.run)
+    if run_error is not None or not isinstance(run_obj, dict):
+        raise ResumeError(f"run.json {run_error or 'is not a JSON object'}")
+    declared = set(run_obj.get("required_streams") or ()) | set(
+        run_obj.get("optional_streams") or ()
+    )
+    undeclared = sorted(set(physical) - declared)
+    if undeclared:
+        raise ResumeError(f"stream(s) {undeclared} are not declared in the run contract")
     for stream_id, state in sorted(physical.items()):
         if not state.structurally_complete:
             raise ResumeError(
@@ -304,6 +313,10 @@ def resume_finalization(paths: PackagePaths) -> Manifest:
                 "absent and cannot be reconstructed"
             )
         atomic_write_new(target, canonical_json.canonicalize(body))
+
+    noncanonical = package_layout.noncanonical_documents(paths, sorted(physical))
+    if noncanonical:
+        raise ResumeError(f"document(s) are not canonical on disk: {noncanonical}")
 
     scan_result = package_layout.scan_layout(paths, schema_ids)
     if scan_result.unexpected or scan_result.unreferenced_schemas or scan_result.missing_schemas:

@@ -93,6 +93,16 @@ def _assert_completable(
             f"{len(incomplete)} incomplete write marker(s) present; the session is not complete"
         )
     physical = read_all_physical_streams(writer.paths)
+    declared = set(run.required_streams) | set(run.optional_streams)
+    undeclared = sorted(set(physical) - declared)
+    if undeclared:
+        # A stream outside the run contract is not a valid part of the package
+        # (§9, condition 5a). Caught HERE, before the terminal lifecycle record,
+        # because a record claiming COMPLETED is immutable once written.
+        raise FinalizationError(
+            f"stream(s) {undeclared} are on disk but declared in neither "
+            "run.required_streams nor run.optional_streams"
+        )
     for stream_id in run.required_streams:
         state = physical.get(stream_id)
         if state is None or not state.directory_exists:
@@ -265,6 +275,22 @@ def finalize(
     physical = read_all_physical_streams(writer.paths)
     _assert_streams_on_disk(writer, physical)
     stream_ids = sorted(physical)
+
+    # The manifest is an integrity root, so it must not be written over a
+    # package the layout does not close — for ANY outcome, not only COMPLETED.
+    # A sealed ABORTED package carrying an unexpected immutable file is just as
+    # unverifiable as a sealed COMPLETED one.
+    layout = package_layout.scan_layout(writer.paths, schema_ids)
+    problems = (
+        list(layout.unexpected)
+        + [f"schemas/{s}.json (unreferenced)" for s in layout.unreferenced_schemas]
+        + [f"schemas/{s}.json (missing)" for s in layout.missing_schemas]
+    )
+    if problems:
+        raise FinalizationError(f"the package file set is not closed: {problems}")
+    noncanonical = package_layout.noncanonical_documents(writer.paths, stream_ids)
+    if noncanonical:
+        raise FinalizationError(f"document(s) are not canonical on disk: {noncanonical}")
 
     # Step 9 — the integrity root.
     control = _control_sha256(writer.paths, stream_ids, schema_ids)

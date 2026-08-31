@@ -61,7 +61,7 @@ fact with another authority (D28, D29):
   not have; they now come from the physical stream directories and each
   stream's own `stream_close.json`.
 
-**Tests: 340 → 349.** Four v1 files were deleted outright, having existed only to
+**Tests: 340 → 366.** Four v1 files were deleted outright, having existed only to
 reconcile representations v2 removed: `test_equivalence_matrix.py` (the R01–R34
 matrix), `test_canonical_and_physical.py` (sidecar and summary reconciliation),
 `test_leaf_integrity.py` (inventory `bytes`, duplicate inventory paths) and
@@ -72,6 +72,39 @@ matrix), `test_canonical_and_physical.py` (sidecar and summary reconciliation),
 `test_mutation_properties.py`. Adversarial tests mutate physical bytes and then
 restore every hash a forger could restore, so what survives is the conformance
 rule rather than an incidental hash mismatch.
+
+**Five defects the scoped conformance review found, all reproduced
+independently before being fixed:**
+
+- The manifest accepted the keys v2 *deleted* — `streams`, `session_id`,
+  `inventory`, `schemas`, `scope_note`, `events_seal` — because
+  minor-version tolerance ignores unknown fields. A resealed package could
+  therefore carry a `streams` block contradicting the authority the fact
+  actually lives in. Those six names now fail closed; a genuinely new v2.x
+  field is still tolerated, which is the point of the tolerance.
+- Canonical-on-disk was enforced for the manifest and the JSONL logs but not
+  for `allocation.json`, `run.json`, `descriptor.json`, `stream_close.json`,
+  the schema snapshots or `annotations.head.json`. A hash proves identity, not
+  canonicity, so each could have been sealed in a second spelling.
+  `annotations.head.json` mattered most: it sits outside the DAG, so nothing
+  else would have noticed.
+- The closed-layout scan checked the root, `events/` and `schemas/`, then
+  descended per stream — so a file dropped straight into `raw/` fell between
+  the two passes and no per-stream scan ever saw it.
+- `finalize` would write an immutable `CLOSED / CLEAN / COMPLETED` lifecycle
+  record for a package containing an undeclared stream, or an unclosed file
+  set, and only the verifier would object afterwards. Both are now refused
+  before any lifecycle record is written, and the file-set check runs for
+  every outcome — a sealed ABORTED package with an unexpected file is just as
+  unverifiable as a sealed COMPLETED one. `resume_finalization` enforces the
+  same.
+- `open_package` skipped condition 5 entirely, so a package with an undeclared
+  stream or no closure record was readable. Condition 5 is now **split**: its
+  structural half (declaration, a valid `stream_close.json`, a readable
+  `run.json`) gates reading; its outcome half (required stream CLEAN) does
+  not, because a required stream that closed DISCONNECTED is exactly what a
+  legitimately aborted package looks like, and refusing to read it would make
+  the failure case the unreadable one.
 
 **One deliberate non-enforcement, stated rather than hidden.** A deleted
 `observations` row is not detected, because §10.3 names no observation primary

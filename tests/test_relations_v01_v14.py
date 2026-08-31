@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 import pyarrow as pa
+import pytest
 
 from consciousness_lab.session.model import RawCaptureLevel, SampleLayout
 from consciousness_lab.storage import canonical_json
@@ -212,7 +213,18 @@ def test_v08b_a_packet_with_no_frame_is_rejected(data_root: DataRoot) -> None:
     assert Finding.PAYLOAD_FRAMING_INVALID in result.findings()
 
 
-def test_v09_an_undeclared_physical_stream_is_rejected(data_root: DataRoot) -> None:
+def test_v09_an_undeclared_physical_stream_is_refused_at_finalization(
+    data_root: DataRoot,
+) -> None:
+    """A stream outside the run contract is not a valid part of the package.
+
+    Caught before any lifecycle record is written, not merely by the verifier
+    afterwards: a record claiming COMPLETED is immutable once appended, so the
+    finalizer must not write one over a package it can already see is invalid.
+    """
+    from consciousness_lab.session.finalizer import FinalizationError, finalize
+    from consciousness_lab.session.model import LifecycleState, RecordingOutcome
+
     built = build_session(
         data_root,
         streams=[
@@ -222,14 +234,25 @@ def test_v09_an_undeclared_physical_stream_is_rejected(data_root: DataRoot) -> N
         required=(STREAM,),
         finalize_outcome=None,
     )
-    paths = built.allocated.paths
-    from consciousness_lab.session.finalizer import finalize
-    from consciousness_lab.session.model import RecordingOutcome
+    with pytest.raises(FinalizationError, match="declared in neither"):
+        finalize(built.writer, outcome=RecordingOutcome.COMPLETED)
+    assert built.writer.lifecycle.state is not LifecycleState.CLOSED
 
-    finalize(built.writer, outcome=RecordingOutcome.COMPLETED)
+
+def test_v09_an_undeclared_stream_also_fails_verification(data_root: DataRoot) -> None:
+    """And if one reaches disk anyway, condition 5 rejects the sealed package."""
+    built = build_session(data_root)
+    paths = built.allocated.paths
+    rogue = paths.raw / "synthetic.rogue"
+    (rogue / "packets").mkdir(parents=True)
+    (rogue / "descriptor.json").write_bytes(paths.stream(STREAM).descriptor.read_bytes())
+    (rogue / "chunks.jsonl").write_bytes(b"")
+    (rogue / "stream_close.json").write_bytes(b'{"close_status":"CLEAN"}')
+    reseal_manifest(paths)
     result = verify_package(paths)
     assert not result.is_completed
     assert Finding.STREAM_NOT_DECLARED in result.findings()
+    assert result.conditions[5] is False
 
 
 def test_v10_a_control_file_missing_from_the_seal_is_rejected(

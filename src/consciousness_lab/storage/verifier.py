@@ -82,6 +82,7 @@ class Finding(StrEnum):
     BROKEN_LIFECYCLE_SEAL = "broken_lifecycle_seal"
     BROKEN_EVENTS_SEAL = "broken_events_seal"
     NOT_CANONICAL_ON_DISK = "not_canonical_on_disk"
+    REMOVED_FIELD_PRESENT = "removed_field_present"
 
     # condition 4 — the sealed outcome
     NOT_CLEANLY_CLOSED = "not_cleanly_closed"
@@ -215,6 +216,23 @@ def _condition_1(paths: PackagePaths, result: VerificationResult) -> Manifest | 
         if canonical_error is not None:
             result.add(Finding.NOT_CANONICAL_ON_DISK, f"manifest.json {canonical_error}")
             manifest_ok = False
+        else:
+            # Minor-version tolerance ignores an unknown *new* field, which is
+            # deliberate. A key v2 DELETED is not a future field: it is a
+            # resurrected v1 summary that would contradict the authority the
+            # fact actually lives in, so it fails closed (§7, D29).
+            parsed = canonical_json.loads(raw)
+            resurrected = sorted(
+                set(parsed) & package_layout.REMOVED_MANIFEST_KEYS
+                if isinstance(parsed, dict)
+                else ()
+            )
+            for key in resurrected:
+                result.add(
+                    Finding.REMOVED_FIELD_PRESENT,
+                    f"manifest.json carries {key!r}, which v2 removed",
+                )
+                manifest_ok = False
         manifest = read_manifest(paths.manifest)
         if manifest is None:
             result.add(Finding.UNREADABLE_MANIFEST, "manifest.json could not be parsed")
@@ -252,6 +270,14 @@ def _condition_2(
             Finding.SYMLINK_IN_PACKAGE,
             "sealed package content may not contain a symlink",
             link.relative_to(paths.root).as_posix(),
+        )
+        ok = False
+
+    for offender in package_layout.noncanonical_documents(paths, stream_ids):
+        result.add(
+            Finding.NOT_CANONICAL_ON_DISK,
+            "structural document is not canonical on disk",
+            offender,
         )
         ok = False
 

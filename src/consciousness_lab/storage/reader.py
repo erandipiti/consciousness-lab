@@ -172,12 +172,27 @@ def open_package(
             )
 
     if verify:
-        from consciousness_lab.storage.verifier import verify_package
+        from consciousness_lab.storage.verifier import Finding, verify_package
 
         result = verify_package(paths)
         # Integrity only: a correctly sealed ABORTED package is perfectly
         # readable, so the outcome conditions (4 and 8) are not gates here.
+        #
+        # Condition 5 is split deliberately. Its STRUCTURAL half gates reading:
+        # an undeclared stream directory, or a stream with no valid closure
+        # record, means the reader cannot say what it is handing back. Its
+        # OUTCOME half does not: a required stream that closed DISCONNECTED is
+        # exactly what a legitimately aborted package looks like, and refusing
+        # to read it would make the failure case the unreadable one.
+        structural = {
+            Finding.STREAM_NOT_DECLARED,
+            Finding.MISSING_STREAM_CLOSE,
+            Finding.INVALID_STREAM_CLOSE,
+            Finding.UNREADABLE_RUN,
+        }
         integrity = [n for n in (1, 2, 3, 6, 7) if not result.conditions.get(n, False)]
+        if result.findings() & structural:
+            integrity.append(5)
         if integrity:
             raise UnverifiedPackageError(
                 paths.root.name,

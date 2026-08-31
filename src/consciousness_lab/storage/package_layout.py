@@ -42,6 +42,14 @@ EVENTS_FILES = frozenset({"events.jsonl"})
 ROOT_CONTROL_FILES = ("allocation.json", "run.json")
 #: Per-stream control files (§7.1, D33).
 STREAM_CONTROL_FILES = ("descriptor.json", "chunks.jsonl", "stream_close.json")
+#: Keys v2 DELETED from the manifest (§7). Minor-version tolerance means an
+#: unknown *new* field is ignored, which is deliberate — but a key v2 removed is
+#: not a future field, it is a resurrected v1 summary. Left accepted, a package
+#: could carry a `streams` block or a `session_id` contradicting the authorities
+#: those facts actually live in, which is the whole defect class v2 removes.
+REMOVED_MANIFEST_KEYS = frozenset(
+    {"session_id", "streams", "inventory", "schemas", "scope_note", "events_seal"}
+)
 
 
 class JsonlRegionError(ValueError):
@@ -109,6 +117,14 @@ def scan_layout(paths: PackagePaths, schema_ids: set[str]) -> LayoutScan:
                 unexpected.append(f"{entry.name}/")
         elif entry.name not in ROOT_FILES:
             unexpected.append(entry.name)
+
+    raw_dir = root / "raw"
+    if raw_dir.is_dir():
+        for entry in sorted(raw_dir.iterdir()):
+            # Only stream directories live here. A file dropped straight into
+            # raw/ belongs to no stream, so no per-stream scan would ever see it.
+            if not entry.is_dir() or entry.is_symlink():
+                unexpected.append(f"raw/{entry.name}")
 
     events_dir = root / "events"
     if events_dir.is_dir():
@@ -182,6 +198,35 @@ def verify_jsonl_region(
         except ValueError as exc:
             return f"line {number} is invalid on disk ({exc})"
     return None
+
+
+def noncanonical_documents(paths: PackagePaths, stream_ids: list[str]) -> list[str]:
+    """Every structural JSON document whose bytes are not canonical (§9.3).
+
+    Hashing a document proves it is the document that was sealed; it does not
+    prove it is canonical. A control file could be sealed in a second spelling
+    and every hash would still agree, so the byte-level rule is checked here for
+    each document rather than being assumed from the seal.
+
+    ``chunks.jsonl`` is excluded because it is JSONL, not a document: its lines
+    are checked per record while the chain is walked.
+    """
+    documents = [
+        paths.allocation,
+        paths.run,
+        paths.annotations_head,
+        *(paths.stream(sid).descriptor for sid in stream_ids),
+        *(paths.stream(sid).stream_close for sid in stream_ids),
+    ]
+    if paths.schemas.is_dir():
+        documents.extend(sorted(p for p in paths.schemas.iterdir() if p.is_file()))
+    offenders: list[str] = []
+    for path in documents:
+        if not path.is_file():
+            continue  # absence is reported by whichever condition owns it
+        if canonical_document_error(path.read_bytes()) is not None:
+            offenders.append(path.relative_to(paths.root).as_posix())
+    return offenders
 
 
 def read_canonical_json(path: Path) -> tuple[Any, str | None]:
