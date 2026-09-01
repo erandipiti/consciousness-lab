@@ -1,9 +1,10 @@
 """Consciousness Lab — Study 001 research platform.
 
-At CL-001 this package contains no acquisition, no session handling and no
-analysis. It exists to hold the locked environment, the package boundary and
-the operator entry point that later tickets build on. See docs/ARCHITECTURE.md
-for the module boundaries that future code must respect.
+This package holds session handling and storage — Session Package v2 and the
+CL-003 multi-stream recorder. It contains **no acquisition and no analysis**:
+no device adapter, no BLE or serial transport, no interpretation of any kind.
+See docs/ARCHITECTURE.md for the module boundaries all code here must respect,
+and AGENTS.md for the rules that outrank convenience.
 """
 
 from importlib.metadata import PackageNotFoundError, version

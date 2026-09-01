@@ -9,6 +9,28 @@ Versioning policy is unresolved — see `docs/OPERATIONS.md`.
 
 ## [Unreleased]
 
+### Fixed — CL-003-R3: stale status statements (documentation only)
+
+Three places still described the repository as it was at CL-001, which stopped
+being true when CL-002B landed and has been false through two more tickets. They
+were reported as findings during CL-003 and left alone as out of scope; they are
+corrected here, in their own documentation-only change.
+
+- `README.md` said the current milestone was CL-001 and that "no acquisition,
+  session or analysis code exists yet". Now names CL-003, says what exists and —
+  more importantly — what deliberately does not: no device adapter, no BLE or
+  serial transport, no reconstructed timing, no analysis.
+- `docs/ARCHITECTURE.md` said "Nothing described below is implemented".
+  Now carries a per-layer status table. `acquisition` and `analysis` are empty
+  and `core` does not exist, which is stated rather than implied.
+- `src/consciousness_lab/__init__.py` said the package contained no session
+  handling. It has contained the session layer since CL-002B.
+
+**No code, test or behavior changed**, and no claim about hardware moved: every
+device is still unverified and README's hardware section is untouched. The point
+of this change is that a document which overstates what exists is the same defect
+as one that understates it — both make the next reader guess.
+
 ### Fixed — CL-003-R1-R2: account for every accepted-but-unwritten packet
 
 Review of the CL-003-R1 barrier found the new `dropped` accounting incomplete on
