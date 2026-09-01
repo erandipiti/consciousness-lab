@@ -34,6 +34,36 @@ So CL-003 is the four named properties, and nothing else:
    up, the device's own counter is what reveals it (``TIMING.md``: counters
    govern loss), and the recorder never fabricates a substitute.
 
+**The shutdown barrier (CL-003-R1).** Back-pressure is only honest if shutdown
+cannot lose an in-flight packet, so acceptance and the shutdown decision are one
+atomic step in :class:`_Handoff`, not two operations against a queue:
+
+    once teardown has decided that no more packets will be consumed, no producer
+    can subsequently make a new packet visible to the fan-in; and every packet
+    that was successfully submitted before that barrier is either written to the
+    package or reported as an explicit failure — never silently abandoned.
+
+A producer waiting to submit when the barrier drops is *refused*, loudly: its
+packet was never accepted, and its stream closes ``FAILED`` saying so.
+
+**Ownership (CL-003-R1).** Keeping that promise on a fatal write needs one more
+thing: at every instant, an accepted packet must be in exactly one place, and
+every place must be reachable from the fatal path. There are four:
+
+    _Handoff queue  ->  stream.pending  ->  stream.in_flight  ->  written
+
+``in_flight`` exists precisely because the third place used to be a local
+variable inside ``_commit``: the batch whose write just failed was invisible to
+the accounting, so a session could lose a whole chunk and still report
+``dropped == 0``. Entering a fatal path now walks all three unwritten places,
+counts them, and clears them — so the count is exactly once — and the identity
+
+    submitted == written + dropped
+
+holds on every path. It is *checked* rather than used to derive anything: a
+count inferred by subtraction would agree with itself no matter which packets
+actually reached the disk.
+
 **Deliberately out of scope**, because no other repository record puts them in
 CL-003: device adapters, BLE or serial transport, reconstructed timing, cross-
 device alignment, any analysis, and any hardware claim. The recorder is defined
@@ -63,6 +93,7 @@ Packets already received from a stream that then fails are committed before it
 closes. Data that arrived is real, whatever happened next.
 """
 
+import collections
 import contextlib
 import queue
 import threading
@@ -184,7 +215,13 @@ class StreamReport:
     """
 
     stream_id: str
+    #: Packets accepted off the hand-off by the fan-in thread.
     packets: int
+    #: Packets whose ``submit()`` returned. Differs from ``packets`` only when
+    #: some were still queued when recording ended.
+    submitted: int
+    #: Packets that reached disk inside a committed chunk.
+    written: int
     samples: int
     observations: int
     chunks: int
@@ -197,6 +234,14 @@ class StreamReport:
     blocked_ns: int
     #: True if the source thread never returned after being asked to stop.
     unstopped: bool
+    #: Packets refused at the shutdown barrier. They were never accepted, so no
+    #: acquired data was lost silently — the stream closes FAILED saying so.
+    refused: int = 0
+    #: Packets accepted but never made durable, because a fatal error ended the
+    #: session first: the queued tail, the in-flight batch whose write failed,
+    #: and every stream's pending accumulator. Counted exactly once, never
+    #: silent — ``submitted == written + dropped`` always.
+    dropped: int = 0
 
 
 @dataclass(frozen=True)
@@ -213,10 +258,34 @@ class RecorderReport:
     fatal: str | None = None
 
     @property
+    def accounted(self) -> bool:
+        """Is every submitted packet either durable or explicitly counted lost?
+
+        The R1 contract as one boolean. False means a packet was acquired and
+        the recorder cannot say what became of it, which is the failure this
+        whole ticket exists to make impossible.
+        """
+        return all(
+            report.submitted == report.written + report.dropped for report in self.streams.values()
+        )
+
+    @property
+    def unaccounted(self) -> dict[str, int]:
+        """Per stream, submitted minus (written + dropped). Empty when sound."""
+        return {
+            stream_id: report.submitted - report.written - report.dropped
+            for stream_id, report in self.streams.items()
+            if report.submitted != report.written + report.dropped
+        }
+
+    @property
     def ok(self) -> bool:
         """True when nothing failed. Says nothing about the scientific outcome."""
         return self.fatal is None and all(
-            report.close_status is StreamCloseStatus.CLEAN for report in self.streams.values()
+            report.close_status is StreamCloseStatus.CLEAN
+            and report.refused == 0
+            and report.dropped == 0
+            for report in self.streams.values()
         )
 
 
@@ -234,6 +303,11 @@ class _StreamState:
 
     stream_id: str
     pending: PendingChunk = field(default_factory=PendingChunk)
+    #: The batch handed to ``commit_chunk`` and not yet known to be durable.
+    #: Its own slot, not a local in ``_commit``: a local would vanish with the
+    #: stack frame of a failed write, taking a whole chunk of acquired packets
+    #: out of the accounting with it.
+    in_flight: PendingChunk | None = None
     #: Host monotonic time the current chunk began accumulating, for
     #: ``chunk_max_seconds``. A durability cadence measured on the host clock —
     #: never device time, which would let a device's timebase decide how our
@@ -243,19 +317,117 @@ class _StreamState:
     samples: int = 0
     observations: int = 0
     chunks: int = 0
+    #: Packets that reached disk inside a committed chunk.
+    written: int = 0
     consumed: int = 0
+    #: Packets that were accepted but could not be written, because a diagnosed
+    #: fatal error ended the session first. Never silent: it reaches the report.
+    dropped: int = 0
     closed: bool = False
     close_status: StreamCloseStatus | None = None
     error: str | None = None
     unstopped: bool = False
 
 
+class _HandoffClosedError(RuntimeError):
+    """The barrier is down. This packet was never accepted by the fan-in."""
+
+
+class _Handoff:
+    """The bounded fan-in hand-off and its shutdown barrier, under one lock.
+
+    **Why not a ``queue.Queue`` (CL-003-R1).** With a plain queue, "is the
+    recorder still consuming?" and "enqueue this packet" are two separate
+    operations, and teardown can land between them: a producer checks the flag,
+    blocks inside ``put``, and its packet is accepted *after* teardown has done
+    its final drain. That packet is acquired data that is never written and
+    never reported — precisely the silent drop back-pressure exists to prevent.
+    Re-checking the flag after ``put`` does not fix it either; it only moves the
+    window, and the packet is by then already visible to a consumer that has
+    stopped looking.
+
+    Here the two are one critical section:
+
+    * ``put`` decides acceptance and enqueues under the same lock hold, so a
+      packet is either accepted before the barrier or refused, never both;
+    * ``close`` sets the barrier **and** takes everything still queued in that
+      same hold, so the list it returns is provably every packet that was ever
+      accepted and not yet consumed — no window on either side;
+    * a producer waiting inside ``put`` when ``close`` runs is woken and
+      refused with :class:`_HandoffClosedError`, which the sink turns into a
+      loud stream failure rather than a lost packet.
+    """
+
+    def __init__(self, capacity: int) -> None:
+        if capacity < 1:
+            raise RecorderError("the fan-in hand-off needs a capacity of at least 1")
+        self._cv = threading.Condition()
+        self._items: collections.deque[tuple[str, SourcePacket]] = collections.deque()
+        self._capacity = capacity
+        self._closed = False
+
+    @property
+    def closed(self) -> bool:
+        with self._cv:
+            return self._closed
+
+    def put(self, item: tuple[str, SourcePacket], timeout: float) -> bool:
+        """Accept one packet. True if accepted, False if the wait timed out.
+
+        Raises :class:`_HandoffClosedError` when the barrier is down. The packet
+        was **not** accepted, and the caller must treat it as never submitted.
+        """
+        deadline = time.monotonic() + timeout
+        with self._cv:
+            while True:
+                if self._closed:
+                    raise _HandoffClosedError("the recorder has stopped consuming packets")
+                if len(self._items) < self._capacity:
+                    self._items.append(item)
+                    self._cv.notify_all()
+                    return True
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return False
+                self._cv.wait(remaining)
+
+    def get(self, timeout: float) -> tuple[str, SourcePacket]:
+        """One packet, or ``queue.Empty`` if none arrived within ``timeout``."""
+        deadline = time.monotonic() + timeout
+        with self._cv:
+            while not self._items:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0 or self._closed:
+                    raise queue.Empty
+                self._cv.wait(remaining)
+            item = self._items.popleft()
+            self._cv.notify_all()
+            return item
+
+    def empty(self) -> bool:
+        with self._cv:
+            return not self._items
+
+    def close(self) -> list[tuple[str, SourcePacket]]:
+        """Lower the barrier and take what is still queued, atomically.
+
+        Idempotent: a second call returns an empty list, because the first one
+        already took everything and no producer can have added more.
+        """
+        with self._cv:
+            self._closed = True
+            rest = list(self._items)
+            self._items.clear()
+            self._cv.notify_all()
+            return rest
+
+
 class _Sink:
     """The bounded hand-off one producer writes into.
 
-    ``submit`` blocks while the queue is full — that is the back-pressure. It
-    refuses only when the fan-in loop has stopped consuming, because blocking
-    forever on a queue nobody drains is a hang, not back-pressure.
+    ``submit`` blocks while the hand-off is full — that is the back-pressure.
+    It fails only when the barrier is down, and that failure is visible: the
+    packet was never accepted, and the stream will close ``FAILED`` saying so.
     """
 
     def __init__(self, recorder: "Recorder", stream_id: str) -> None:
@@ -263,29 +435,33 @@ class _Sink:
         self._stream_id = stream_id
         self.submitted = 0
         self.blocked_ns = 0
+        #: Packets the barrier refused. Non-zero means this stream did not end
+        #: cleanly, whatever else it did.
+        self.refused = 0
 
     def submit(self, packet: SourcePacket) -> None:
         recorder = self._recorder
         blocked_from: int | None = None
         while True:
-            if recorder._abandoned.is_set():
-                raise RecorderStoppingError(
-                    f"{self._stream_id}: the recorder is no longer consuming packets"
-                )
             try:
-                recorder._queue.put((self._stream_id, packet), timeout=recorder._tick_seconds)
-            except queue.Full:
-                if blocked_from is None:
-                    blocked_from = recorder._monotonic_ns()
-                continue
-            if blocked_from is not None:
-                self.blocked_ns += recorder._monotonic_ns() - blocked_from
-            # Incremented only after the packet is durably in the queue, and
-            # always before the producer thread records that it finished. The
-            # fan-in loop therefore never sees "finished" while a packet it has
-            # not counted is still in flight.
-            self.submitted += 1
-            return
+                accepted = recorder._handoff.put((self._stream_id, packet), recorder._tick_seconds)
+            except _HandoffClosedError as exc:
+                self.refused += 1
+                raise RecorderStoppingError(
+                    f"{self._stream_id}: the recorder stopped consuming before this packet "
+                    "was accepted; it was refused, not dropped"
+                ) from exc
+            if accepted:
+                if blocked_from is not None:
+                    self.blocked_ns += recorder._monotonic_ns() - blocked_from
+                # Incremented only after the packet is in the hand-off, and
+                # always before the producer thread records that it finished.
+                # The fan-in loop therefore never sees "finished" while a packet
+                # it has not counted is still in flight.
+                self.submitted += 1
+                return
+            if blocked_from is None:
+                blocked_from = recorder._monotonic_ns()
 
 
 class Recorder:
@@ -342,17 +518,18 @@ class Recorder:
         self._join_timeout_seconds = join_timeout_seconds
         self._monotonic_ns = monotonic_ns
 
-        self._queue: queue.Queue[tuple[str, SourcePacket]] = queue.Queue(maxsize=queue_capacity)
+        self._handoff = _Handoff(queue_capacity)
         #: Set to ask sources to finish. Cooperative: a source decides when it
         #: can safely stop talking to its device.
         self._stop = threading.Event()
-        #: Set when the fan-in loop has stopped consuming, so a blocked
-        #: producer fails fast instead of waiting on a queue nobody drains.
-        self._abandoned = threading.Event()
         self._lock = threading.Lock()
         self._finished: dict[str, tuple[str, str]] = {}
         self._sinks: dict[str, _Sink] = {}
-        self._threads: list[threading.Thread] = []
+        #: (thread, stream_id) pairs. Paired at creation rather than matched by
+        #: position against ``_sources`` later: a positional zip is a coupling
+        #: between two lists that nothing enforces, and it made an internal
+        #: helper explode when the lists legitimately differed in length.
+        self._threads: list[tuple[threading.Thread, str]] = []
         self._streams: dict[str, _StreamState] = {
             stream_id: _StreamState(stream_id=stream_id) for stream_id in ids
         }
@@ -375,6 +552,8 @@ class Recorder:
             streams[stream_id] = StreamReport(
                 stream_id=stream_id,
                 packets=state.packets,
+                submitted=sink.submitted if sink is not None else 0,
+                written=state.written,
                 samples=state.samples,
                 observations=state.observations,
                 chunks=state.chunks,
@@ -382,6 +561,8 @@ class Recorder:
                 error=state.error,
                 blocked_ns=sink.blocked_ns if sink is not None else 0,
                 unstopped=state.unstopped,
+                refused=sink.refused if sink is not None else 0,
+                dropped=state.dropped,
             )
         return RecorderReport(streams=streams, fatal=self._fatal)
 
@@ -413,7 +594,7 @@ class Recorder:
                 # alive after the operator has been told the session is over.
                 daemon=True,
             )
-            self._threads.append(thread)
+            self._threads.append((thread, source.descriptor.stream_id))
             thread.start()
 
         try:
@@ -430,9 +611,24 @@ class Recorder:
 
     def _fan_in(self) -> None:
         """The single writer thread. Nothing else calls ``SessionWriter``."""
+        stop_deadline: float | None = None
         while self._fatal is None:
+            # A source is free to ignore ``stop`` — a vendor SDK can sit inside
+            # a blocking read that nothing can interrupt. The operator asked to
+            # stop, so the fan-in stops on a grace period instead of waiting
+            # forever for a producer that may never return; teardown then closes
+            # the barrier, and any packet still in flight is refused rather than
+            # accepted into a package nobody is writing.
+            #
+            # Real wall time on purpose: this is a safety timer, not scheduling,
+            # so an injected scheduling clock must not be able to defer it.
+            if self._stop.is_set():
+                if stop_deadline is None:
+                    stop_deadline = time.monotonic() + self._join_timeout_seconds
+                elif time.monotonic() >= stop_deadline:
+                    return
             try:
-                stream_id, packet = self._queue.get(timeout=self._tick_seconds)
+                stream_id, packet = self._handoff.get(self._tick_seconds)
             except queue.Empty:
                 self._on_tick()
                 if self._all_closed():
@@ -483,7 +679,11 @@ class Recorder:
             # Unreachable by contract: a stream is closed only once its
             # producer has finished and every packet it submitted has been
             # consumed. If it happens anyway, data was acquired that cannot be
-            # written, and that must fail loudly rather than vanish.
+            # written, and that must fail loudly rather than vanish. This packet
+            # is held by nothing but this frame, so it is counted here — the one
+            # unwritten packet _account_unwritten cannot reach.
+            state.packets += 1
+            state.dropped += 1
             self._fail(
                 f"packet arrived for {stream_id} after it was closed; acquired data "
                 "cannot be written and must not be discarded silently",
@@ -530,23 +730,29 @@ class Recorder:
         if not state.pending.packets:
             state.started_ns = None
             return
-        pending = state.pending
-        # Swapped out before the write so a failed commit can never be retried
-        # into a second chunk carrying the same packets.
+        # Ownership moves pending -> in_flight here, and stays there until the
+        # write is KNOWN to have succeeded. Swapping out before the write is
+        # what stops a failed commit being retried into a second chunk carrying
+        # the same packets; holding it in the stream rather than in a local is
+        # what keeps a failed batch visible to the fatal accounting (D39).
+        state.in_flight = state.pending
         state.pending = PendingChunk()
         state.started_ns = None
         try:
-            self._writer.commit_chunk(state.stream_id, pending)
+            self._writer.commit_chunk(state.stream_id, state.in_flight)
         except FatalWriteError as exc:
             # commit_chunk already closed the session CLEAN / TECHNICAL_FAILURE
             # and durably closed every stream. Nothing more may be written.
+            # in_flight is left set on purpose: _account_unwritten owns it now.
             self._enter_fatal(str(exc))
             return
         # Any commit failure at all is fatal; see the module docstring.
         except Exception as exc:
             self._fail(f"{type(exc).__name__}: {exc}", stream_id=state.stream_id)
             return
+        state.written += len(state.in_flight.packets)
         state.chunks += 1
+        state.in_flight = None
 
     # -------------------------------------------------------------- closures
 
@@ -604,7 +810,7 @@ class Recorder:
         state.error = message or None
 
     def _all_closed(self) -> bool:
-        return self._queue.empty() and all(state.closed for state in self._streams.values())
+        return self._handoff.empty() and all(state.closed for state in self._streams.values())
 
     # -------------------------------------------------------------- teardown
 
@@ -612,30 +818,42 @@ class Recorder:
         """Stop the sources, write everything they queued, close every stream."""
         self._stop.set()
         deadline = time.monotonic() + self._join_timeout_seconds
-        for thread in self._threads:
+        for thread, _stream_id in self._threads:
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
-        # After the join window: a source still alive must fail fast rather than
-        # block forever on a queue that is about to stop being drained.
-        self._abandoned.set()
-        for thread, source in zip(self._threads, self._sources, strict=True):
+        for thread, stream_id in self._threads:
             if thread.is_alive():
-                self._streams[source.descriptor.stream_id].unstopped = True
+                self._streams[stream_id].unstopped = True
 
         if self._fatal is not None:
             # The session is already CLOSED / TECHNICAL_FAILURE. Writing
-            # anything else into it would append to a terminal package.
+            # anything else into it would append to a terminal package. The
+            # failing path already accounted for every unwritten packet; this
+            # call is idempotent and only guards a fatal that somehow skipped
+            # it. Lost to a DIAGNOSED failure, and counted, not invisible.
+            self._account_unwritten()
             for state in self._streams.values():
                 state.closed = True
             return
 
-        while True:
-            try:
-                stream_id, packet = self._queue.get_nowait()
-            except queue.Empty:
-                break
-            self._accept(stream_id, packet)
+        # THE BARRIER (CL-003-R1). One atomic step: after it returns, no
+        # producer can make another packet visible, and ``remaining`` is exactly
+        # every packet that was accepted and not yet consumed. A producer still
+        # blocked in ``submit`` — including one whose thread outlived the join
+        # window — is woken and refused, so nothing can arrive behind us.
+        remaining = self._lower_barrier()
+
+        for index, (stream_id, packet) in enumerate(remaining):
             if self._fatal is not None:
+                # A commit failed while writing this tail. Everything the
+                # streams still held was accounted for inside that failure; this
+                # slice is held only by this local list, so it is counted here
+                # and nowhere else.
+                for lost_id, _packet in remaining[index:]:
+                    self._streams[lost_id].dropped += 1
+                for state in self._streams.values():
+                    state.closed = True
                 return
+            self._accept(stream_id, packet)
         self._close_finished()
         if self._fatal is not None:
             return
@@ -652,12 +870,46 @@ class Recorder:
             if self._fatal is not None:
                 return
 
+    def _lower_barrier(self) -> list[tuple[str, SourcePacket]]:
+        """Stop accepting packets for good. Idempotent; returns what was queued."""
+        return self._handoff.close()
+
+    def _account_unwritten(self) -> None:
+        """Count every accepted-but-not-durable packet, exactly once (D39).
+
+        Ownership, not arithmetic. An accepted packet is in exactly one of three
+        unwritten places, and this walks all three:
+
+        1. the **queued tail** — still in the hand-off, never consumed;
+        2. each stream's **in-flight batch** — handed to ``commit_chunk``, whose
+           write failed. This is the one that used to be a local variable and
+           therefore vanished from the count along with a whole chunk;
+        3. each stream's **pending accumulator** — accepted on some other stream
+           and not yet cut into a chunk when the session died.
+
+        Counting and clearing happen together, which is what makes it exactly
+        once: a second call finds nothing left to own. Deriving the number from
+        ``submitted - written`` instead would be self-consistent whatever
+        actually reached the disk, which is why the identity is asserted rather
+        than used as the source.
+        """
+        for stream_id, _packet in self._lower_barrier():
+            self._streams[stream_id].dropped += 1
+        for state in self._streams.values():
+            if state.in_flight is not None:
+                state.dropped += len(state.in_flight.packets)
+                state.in_flight = None
+            if state.pending.packets:
+                state.dropped += len(state.pending.packets)
+                state.pending = PendingChunk()
+            state.started_ns = None
+
     def _enter_fatal(self, message: str) -> None:
         """Record a fatal error whose closure the writer has already performed."""
         if self._fatal is None:
             self._fatal = message
         self._stop.set()
-        self._abandoned.set()
+        self._account_unwritten()
 
     def _fail(self, message: str, *, stream_id: str | None = None) -> None:
         """Close the session CLEAN / TECHNICAL_FAILURE, then stop everything."""
@@ -665,7 +917,7 @@ class Recorder:
             return
         self._fatal = message
         self._stop.set()
-        self._abandoned.set()
+        self._account_unwritten()
         with contextlib.suppress(OSError):
             self._writer.fail_technical(message, stream_id=stream_id)
 
@@ -678,9 +930,20 @@ class Recorder:
         try:
             source.run(sink, self._stop)
         except RecorderStoppingError:
-            # Teardown, not a device fault: the stream was healthy and is being
-            # closed as part of an orderly stop.
-            kind, message = "clean", ""
+            # Teardown. Ordinarily that is not a device fault and the stream is
+            # closed CLEAN. But if the barrier REFUSED a packet, acquired data
+            # never reached the package, and calling that stream clean would be
+            # exactly the silent loss CL-003-R1 exists to make impossible.
+            if sink.refused:
+                kind, message = (
+                    "failed",
+                    (
+                        f"{sink.refused} packet(s) were refused at the fan-in shutdown barrier; "
+                        "acquired data did not reach the package"
+                    ),
+                )
+            else:
+                kind, message = "clean", ""
         except SourceDisconnectedError as exc:
             kind, message = "disconnected", str(exc)
         # A source may raise anything at all; none of it may escape this thread.

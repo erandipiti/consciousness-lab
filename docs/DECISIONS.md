@@ -709,6 +709,76 @@ new persisted fact needs an approved decision, and this one has no reader yet.
 package, and in what representation, is a question for the ticket that has a
 consumer for it.
 
+## D38 — Acceptance and shutdown are one atomic step, not two
+
+**Decided (CL-003-R1).** The fan-in hand-off is not a `queue.Queue` guarded by a
+flag. `_Handoff` decides acceptance and lowers the shutdown barrier under one
+lock, and `close()` sets the barrier **and** takes everything still queued in the
+same lock hold.
+
+**Why.** With a queue plus a flag, "is the recorder still consuming?" and
+"enqueue" are two operations, and teardown lands between them: a producer checks
+the flag, blocks inside `put`, and its packet is accepted *after* teardown's
+final drain. That packet is acquired data that is never written and never
+reported — the exact silent loss back-pressure exists to prevent. The invariant
+now holds by construction:
+
+> once teardown has decided that no more packets will be consumed, no producer
+> can subsequently make a new packet visible to the fan-in; and every packet
+> successfully submitted before that barrier is either written to the package or
+> reported as an explicit failure — never silently abandoned.
+
+**Rejected.** A second flag check *after* `put` — it moves the window rather than
+closing it, and by then the packet is already visible to a consumer that has
+stopped looking. Removing the packet after the fact — that races the consumer.
+An unbounded queue — that deletes back-pressure instead of making it safe.
+
+**Consequences.** A producer refused at the barrier closes its stream `FAILED`
+with the count, because a stream that lost acquired data is not clean. The
+fan-in loop also gained a wall-clock grace period after `request_stop()`: a
+source that never notices `stop` — a vendor SDK inside a blocking read — used to
+make `run()` unreturnable, and a barrier that can never be reached is not a
+barrier. That timer is real time on purpose, so an injected scheduling clock
+cannot defer it.
+
+**Source.** Human review of CL-003; the first task carried end to end by the
+Handoff/ChatGPT review bridge.
+
+## D39 — Every accepted packet has exactly one owner
+
+**Decided (CL-003-R1-R2).** At any instant an accepted packet is in exactly one
+of four places, and the fatal path walks all three unwritten ones:
+
+```text
+_Handoff queue  ->  stream.pending  ->  stream.in_flight  ->  written
+```
+
+`in_flight` is a field on the stream, not a local in `_commit()`. Entering a
+fatal path counts and **clears** all three unwritten places, which is what makes
+the count exactly once, and the identity `submitted == written + dropped` holds
+on every path.
+
+**Why.** The batch handed to `commit_chunk` used to live in a local variable. If
+that write failed, the batch vanished with the stack frame, and packets accepted
+onto *other* streams sat unseen in their pending accumulators — so a session
+could lose two whole chunks of acquired data and still report `dropped == 0`.
+Reproduced before the fix: 5 packets submitted on one stream, 2 durable, 1
+counted; a second stream with 3 accepted packets reported 0. That contradicts
+D38's guarantee that every submitted packet is either durable or explicitly
+surfaced.
+
+**Rejected.** Deriving `dropped` as `submitted - written`. It is self-consistent
+whatever actually reached the disk, so it would report a sound-looking balance
+while proving nothing about which packets were lost. The identity is *checked*
+against an independent ownership count, never used as its source.
+
+**Rejected.** Counting the failed batch at the call site in `_commit()`. It
+closes one hole and leaves the other two, and puts the accounting rule in three
+places instead of one.
+
+**Source.** ChatGPT review of PR #2, routed automatically by the Handoff review
+bridge.
+
 ---
 
 ## Awaiting a named human
