@@ -687,9 +687,38 @@ decided by the existing eight-condition predicate (D22), not here.
 driven by `run.json.writer_config` — `chunk_max_rows`, `chunk_max_seconds`,
 `clock_snapshot_interval_seconds` — which the approved schema already labels
 writer configuration and explicitly not a scientific parameter. `chunk_max_rows`
-is applied to **every** raw table, so no table in a chunk exceeds it. What the
-recorder observes about *itself* — how long a producer was blocked, whether a
-source stopped when asked — is returned in memory and persisted nowhere.
+is applied to **every** raw table. What the recorder observes about *itself* —
+how long a producer was blocked, whether a source stopped when asked — is
+returned in memory and persisted nowhere.
+
+> ### Corrected (CL-003-R3, 2026-09-01)
+>
+> As first written this record claimed "**so no table in a chunk exceeds it**".
+> That was not true and could not have been. The recorder appended a whole
+> packet and only then tested the threshold, so a single packet carrying more
+> than `chunk_max_rows` rows produced an oversized chunk — reproduced at a limit
+> of 4 with 16-sample packets, which yielded chunks of 16. The original wording
+> is kept above the strike so the overclaim is on the record.
+>
+> **The actual rule.** A chunk is cut on a **packet boundary**. The bound is now
+> enforced *before* a packet is appended, so no chunk exceeds `chunk_max_rows`
+> in any raw table — with exactly one exception:
+>
+> > A packet whose own rows exceed `chunk_max_rows` becomes an oversized chunk
+> > of its own, and is committed immediately so the overflow is one packet wide
+> > and never drags others with it.
+>
+> **Why the exception is not optional.** The alternative is splitting a packet
+> across chunks. The packet→sample grouping is a preserved acquisition fact —
+> v1 spec §19 lists dropping it among the things that would make future
+> Athena/H10 timing analysis impossible — so raw packet contents are not
+> reinterpreted to satisfy a storage bound. Chunk boundaries, by contrast, carry
+> no analytical meaning at all (v1 spec §10.2), so moving them is free.
+>
+> The frozen spec is unaffected: §12.2 says only "whichever comes first" and
+> never claimed a hard cap. The overclaim was in this record, not in the schema.
+>
+> **Source.** ChatGPT review of PR #3, routed by the Handoff review bridge.
 
 **Why.** The scheduling policy already existed in the frozen schema and had no
 implementation, because nothing ran a loop. Reading it from there means CL-003

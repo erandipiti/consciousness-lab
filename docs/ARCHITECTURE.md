@@ -1,14 +1,24 @@
 # ARCHITECTURE
 
-Scope of this document at CL-001: **module boundaries only.** It says where
-code is allowed to live and what each area may and may not know about. It does
-not design components that have not been ticketed.
+Scope of this document: **module boundaries only.** It says where code is
+allowed to live and what each area may and may not know about. It does not
+design components that have not been ticketed.
 
 ## Status
 
-Nothing described below is implemented. `src/consciousness_lab/` currently
-contains the package marker and a single-command CLI. The boundaries are
-declared now so that the first code to arrive lands in the right place.
+The boundaries were declared at CL-001, before any code existed, so that the
+first code to arrive would land in the right place. Three of the five layers now
+hold code:
+
+| layer | status |
+|---|---|
+| `analysis` | **empty.** Not started; no ticket is open. |
+| `session` | allocator, lifecycle, annotations, writer, finalizer, registry, recovery, and the CL-003 recorder. |
+| `storage` | canonical JSON, integer types, payload framing, Arrow schemas, chunk writer, verifier, reader. |
+| `acquisition` | **empty.** No device adapter, no BLE, no serial. The recorder consumes an abstract source (`session/recorder.py`), which a future adapter satisfies structurally without importing upward. |
+| `core` | **not created.** Its shared types have not been needed yet; the ticket that needs them creates it. |
+
+The one structural rule below has not moved and is not negotiable.
 
 ---
 

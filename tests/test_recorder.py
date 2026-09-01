@@ -783,6 +783,188 @@ def test_request_stop_terminates_even_when_a_source_ignores_it(data_root: DataRo
     assert time.monotonic() - started < 10.0
 
 
+# --------------------- CL-003-R3: chunk_max_rows is a packet-boundary bound
+
+
+def chunk_sample_counts(paths: object, stream_id: str) -> list[int]:
+    """Sample rows per committed chunk, read from the artifacts on disk."""
+    import pyarrow as pa
+
+    directory = paths.stream(stream_id).root / "samples"  # type: ignore[attr-defined]
+    counts = []
+    for artifact in sorted(directory.iterdir()):
+        with pa.ipc.open_stream(artifact.open("rb")) as reader:
+            counts.append(reader.read_all().num_rows)
+    return counts
+
+
+def test_no_chunk_exceeds_chunk_max_rows(data_root: DataRoot) -> None:
+    """The bound is enforced BEFORE a packet is appended, not tested after.
+
+    Appending first and checking afterwards produces a chunk that has already
+    exceeded the limit, and nothing later can undo it without splitting the
+    packet. With 3-sample packets and a limit of 10, a post-hoc check would let
+    a chunk reach 12.
+    """
+    writer = open_writer(
+        data_root, config=WriterConfig(chunk_max_rows=10, chunk_max_seconds=1_000_000)
+    )
+    spec = SyntheticStreamSpec(
+        stream_id=EEG, capture_level=RawCaptureLevel.SYNTHETIC, samples_per_packet=3
+    )
+    Recorder(
+        writer, [SyntheticStreamSource(spec, n_packets=9, seed=1)], monotonic_ns=FakeClock()
+    ).run()
+    finalize(writer, outcome=RecordingOutcome.COMPLETED, data_root=data_root)
+
+    counts = chunk_sample_counts(writer.paths, EEG)
+    assert counts, "the stream committed no chunks"
+    assert max(counts) <= 10, f"a chunk exceeded chunk_max_rows: {counts}"
+    assert sum(counts) == 27, counts
+    assert verify_package(writer.paths).is_completed
+
+
+def test_a_packet_bigger_than_the_limit_becomes_its_own_oversized_chunk(
+    data_root: DataRoot,
+) -> None:
+    """The one documented exception (D37): packets are never split.
+
+    The packet -> sample grouping is a preserved acquisition fact (v1 spec §19),
+    so a packet that alone exceeds ``chunk_max_rows`` cannot be divided to
+    satisfy a storage bound. It becomes a chunk of its own — and is committed
+    immediately, so the overflow is exactly one packet and never drags others
+    along with it.
+    """
+    writer = open_writer(
+        data_root, config=WriterConfig(chunk_max_rows=4, chunk_max_seconds=1_000_000)
+    )
+    spec = SyntheticStreamSpec(
+        stream_id=EEG, capture_level=RawCaptureLevel.SYNTHETIC, samples_per_packet=16
+    )
+    Recorder(
+        writer, [SyntheticStreamSource(spec, n_packets=3, seed=1)], monotonic_ns=FakeClock()
+    ).run()
+    finalize(writer, outcome=RecordingOutcome.COMPLETED, data_root=data_root)
+
+    counts = chunk_sample_counts(writer.paths, EEG)
+    # One chunk per packet: each is oversized on its own and nothing is merged
+    # into it. The alternative — splitting 16 sample rows across four chunks —
+    # would break the packet grouping, which no approved contract permits.
+    assert counts == [16, 16, 16], counts
+    assert verify_package(writer.paths).is_completed
+    package = open_package(writer.paths)
+    assert len(list(package.stream(EEG).packets())) == 3
+    assert len(list(package.stream(EEG).samples())) == 48
+
+
+def test_an_oversized_packet_does_not_drag_ordinary_packets_with_it(
+    data_root: DataRoot,
+) -> None:
+    """The exception is one packet wide, not one chunk wide."""
+    writer = open_writer(
+        data_root,
+        required=(EEG, ECG),
+        config=WriterConfig(chunk_max_rows=8, chunk_max_seconds=1_000_000),
+    )
+    big = SyntheticStreamSpec(
+        stream_id=EEG, capture_level=RawCaptureLevel.SYNTHETIC, samples_per_packet=20
+    )
+    small = SyntheticStreamSpec(
+        stream_id=ECG, capture_level=RawCaptureLevel.SYNTHETIC, samples_per_packet=2
+    )
+    Recorder(
+        writer,
+        [
+            SyntheticStreamSource(big, n_packets=2, seed=1),
+            SyntheticStreamSource(small, n_packets=8, seed=2),
+        ],
+        monotonic_ns=FakeClock(),
+    ).run()
+    finalize(writer, outcome=RecordingOutcome.COMPLETED, data_root=data_root)
+
+    oversized = chunk_sample_counts(writer.paths, EEG)
+    ordinary = chunk_sample_counts(writer.paths, ECG)
+    assert oversized == [20, 20], oversized
+    assert max(ordinary) <= 8, ordinary
+    assert sum(ordinary) == 16, ordinary
+
+
+def test_observation_rows_are_bounded_too(data_root: DataRoot) -> None:
+    """`chunk_max_rows` applies to every raw table, not only samples."""
+    writer = open_writer(
+        data_root, config=WriterConfig(chunk_max_rows=4, chunk_max_seconds=1_000_000)
+    )
+    # 1 sample and 2 observations per packet: observations hit the bound first.
+    spec = SyntheticStreamSpec(
+        stream_id=EEG, capture_level=RawCaptureLevel.SYNTHETIC, samples_per_packet=1
+    )
+    Recorder(
+        writer, [SyntheticStreamSource(spec, n_packets=7, seed=1)], monotonic_ns=FakeClock()
+    ).run()
+    finalize(writer, outcome=RecordingOutcome.COMPLETED, data_root=data_root)
+
+    import pyarrow as pa
+
+    counts = []
+    for artifact in sorted((writer.paths.stream(EEG).root / "observations").iterdir()):
+        with pa.ipc.open_stream(artifact.open("rb")) as reader:
+            counts.append(reader.read_all().num_rows)
+    assert max(counts) <= 4, counts
+    assert sum(counts) == 14, counts
+
+
+def test_a_packet_lost_to_a_failed_pre_emptive_commit_is_counted(
+    data_root: DataRoot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cutting to make room can fail, and the waiting packet must not vanish.
+
+    Regression for a hole this ticket's own change opened: the pre-emptive
+    commit returns early on a fatal write, and the packet it was making room for
+    is held by nothing the accounting can walk — not the queue, not `pending`,
+    not `in_flight`. The `accounted` identity caught it on the first run, which
+    is the entire reason that identity is asserted rather than assumed.
+
+    Shaped so the pre-emptive cut is what fires: one sample and one observation
+    per packet against a limit of 2 packets, so the third arrival is the first
+    thing that would exceed the bound.
+    """
+    writer = open_writer(
+        data_root, config=WriterConfig(chunk_max_rows=2, chunk_max_seconds=1_000_000)
+    )
+    spec = SyntheticStreamSpec(
+        stream_id=EEG,
+        capture_level=RawCaptureLevel.SYNTHETIC,
+        samples_per_packet=1,
+        emit_device_time=False,
+    )
+    source = SyntheticStreamSource(spec, n_packets=0, seed=1)
+    recorder = Recorder(writer, [source], queue_capacity=8, monotonic_ns=FakeClock())
+    writer.open_stream(source.descriptor)
+    sink = _Sink(recorder, EEG)
+    recorder._sinks[EEG] = sink
+
+    gen = SyntheticSource(spec, seed=1)
+    for _ in range(3):
+        sink.submit(as_source_packet(gen.next_chunk(1)))
+    drive_one_packet(recorder)
+    drive_one_packet(recorder)
+    assert len(recorder._streams[EEG].pending.packets) == 2, "nothing was committed yet"
+
+    def refuse(self: ChunkWriter, *args: object, **kwargs: object) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(ChunkWriter, "commit", refuse)
+    drive_one_packet(recorder)  # the pre-emptive commit fires here, and fails
+
+    report = recorder.report
+    assert report.fatal is not None
+    assert report.streams[EEG].submitted == 3
+    assert report.streams[EEG].written == 0
+    # 2 in the failed batch + the one it was making room for.
+    assert report.streams[EEG].dropped == 3, "the waiting packet must be counted too"
+    assert_accounted(report)
+
+
 # -------------------------- CL-003-R1-R2: accounting for unwritten packets
 
 

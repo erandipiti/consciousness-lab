@@ -29,6 +29,13 @@ So CL-003 is the four named properties, and nothing else:
    snapshots and which nothing implemented until now). No new policy value is
    invented here: the numbers come from a frozen schema field that is itself
    labelled writer configuration and explicitly not a scientific parameter.
+
+   **Chunks are cut on packet boundaries** (D37). No chunk exceeds
+   ``chunk_max_rows`` in any raw table, with exactly one exception: a packet
+   whose own rows exceed the limit becomes an oversized chunk of its own,
+   because a packet is never split. Chunk boundaries carry no analytical
+   meaning (v1 spec §10.2), so where they fall is free; the packet→sample
+   grouping does carry meaning (§19), so it is not.
 4. **Back-pressure.** The hand-off is bounded. A source that outruns the writer
    **blocks**; nothing is ever silently dropped. Where the host could not keep
    up, the device's own counter is what reveals it (``TIMING.md``: counters
@@ -644,8 +651,9 @@ class Recorder:
         for state in self._streams.values():
             # The same rule arrival uses. A chunk that has aged past
             # chunk_max_seconds must be cut even when no packet arrives to
-            # trigger the check, and two copies of that rule would drift.
-            if not state.closed and self._should_cut(state):
+            # trigger the check, and two copies of that rule would drift. The
+            # row bound needs no tick: it can only be approached by an arrival.
+            if not state.closed and self._aged_out(state):
                 self._commit(state)
                 if self._fatal is not None:
                     return
@@ -690,6 +698,22 @@ class Recorder:
                 stream_id=stream_id,
             )
             return
+        # Cut BEFORE appending, so the open chunk never exceeds the bound in the
+        # first place. The previous order appended and then tested, which let a
+        # packet carry a chunk past the limit with nothing able to undo it.
+        if self._would_exceed_rows(state, packet):
+            self._commit(state)
+            if self._fatal is not None:
+                # The commit that was making room failed. This packet has been
+                # accepted off the hand-off but is held by nothing the fatal
+                # accounting can walk — not the queue, not pending, not
+                # in_flight — so it is counted here, exactly like the
+                # closed-stream branch above. Returning without this is how a
+                # packet goes missing, which is the defect D39 exists to
+                # prevent; the accounting identity caught it immediately.
+                state.packets += 1
+                state.dropped += 1
+                return
         if state.started_ns is None:
             state.started_ns = self._monotonic_ns()
         state.pending.packets.append(packet.packet)
@@ -700,27 +724,52 @@ class Recorder:
         state.packets += 1
         state.samples += len(packet.samples)
         state.observations += len(packet.observations)
-        if self._should_cut(state):
+        if self._oversized_alone(state) or self._aged_out(state):
             self._commit(state)
 
-    def _should_cut(self, state: _StreamState) -> bool:
-        """``chunk_max_rows`` / ``chunk_max_seconds``, whichever comes first.
+    def _would_exceed_rows(self, state: _StreamState, packet: SourcePacket) -> bool:
+        """Would adding this packet push any raw table past ``chunk_max_rows``?
 
-        The spec says "rows" without naming a table, and the stated purpose is
-        to bound how much in-flight data a crash can cost. Rather than pick one
-        table and call the choice a definition, the bound is applied to **every**
-        raw table: no table in a chunk exceeds ``chunk_max_rows``. That is the
-        strictly safer reading of the frozen field under either interpretation,
-        so no new decision is needed to implement it.
+        Checked **before** the packet is appended, which is the whole point.
+        Appending first and testing afterwards produces a chunk that has already
+        exceeded the bound, and no later check can undo that without splitting
+        the packet.
+
+        Returns False on an empty accumulator: there is nothing to cut, and a
+        packet is never split. See :meth:`_oversized_alone` for what happens to a
+        packet that is bigger than the limit all by itself.
         """
         limit = self._config.chunk_max_rows
-        if limit > 0 and (
-            len(state.pending.packets) >= limit
-            or len(state.pending.samples) >= limit
-            or len(state.pending.observations) >= limit
-        ):
-            return True
-        if state.started_ns is None:
+        if limit <= 0 or not state.pending.packets:
+            return False
+        return (
+            len(state.pending.packets) + 1 > limit
+            or len(state.pending.samples) + len(packet.samples) > limit
+            or len(state.pending.observations) + len(packet.observations) > limit
+        )
+
+    def _oversized_alone(self, state: _StreamState) -> bool:
+        """Is this chunk a single packet that alone exceeds ``chunk_max_rows``?
+
+        The documented exception (D37). The packet→sample grouping is a
+        preserved acquisition fact — the v1 spec §19 lists dropping it among the
+        things that would make future timing analysis impossible — so a packet is
+        never split across chunks to satisfy a storage bound. Such a packet
+        becomes a chunk of its own and is committed immediately, so the overflow
+        is exactly one packet and never drags others with it.
+        """
+        limit = self._config.chunk_max_rows
+        if limit <= 0 or len(state.pending.packets) != 1:
+            return False
+        return len(state.pending.samples) > limit or len(state.pending.observations) > limit
+
+    def _aged_out(self, state: _StreamState) -> bool:
+        """Has the open chunk lived longer than ``chunk_max_seconds``?
+
+        Host wall time, never device time: this is a durability cadence, not a
+        property of the data.
+        """
+        if state.started_ns is None or not state.pending.packets:
             return False
         seconds_ns = self._config.chunk_max_seconds * 1_000_000_000
         return self._monotonic_ns() - state.started_ns >= seconds_ns

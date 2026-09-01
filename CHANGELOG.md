@@ -9,6 +9,57 @@ Versioning policy is unresolved — see `docs/OPERATIONS.md`.
 
 ## [Unreleased]
 
+### Fixed — CL-003-R3: chunk_max_rows is a packet-boundary bound, and D37 said otherwise
+
+Final CL-003 verification found a contract mismatch. D37 and `_should_cut()`
+claimed no raw table in a chunk exceeds `chunk_max_rows`, but `_accept()`
+appended a whole packet and only then tested the threshold. Reproduced: a limit
+of 4 with 16-sample packets produced chunks of 16, four times the bound.
+
+Resolved as a contract, not papered over:
+
+- **The bound is enforced before a packet is appended.** With 3-sample packets
+  and a limit of 10 a chunk now reaches 9; under the old order it reached 12.
+- **One documented exception**, because packets are never split: a packet whose
+  own rows exceed the limit becomes an oversized chunk of its own, committed
+  immediately so the overflow is one packet wide. The packet→sample grouping is
+  a preserved acquisition fact (v1 spec §19); chunk boundaries carry no
+  analytical meaning (§10.2), so the boundary moves and the grouping does not.
+- **D37 corrected in place**, with the original overclaim kept on the record.
+  The frozen spec is untouched: §12.2 only ever said "whichever comes first" and
+  never claimed a hard cap — the overclaim was in the decision record.
+
+The change opened a new hole and the accounting identity caught it immediately:
+a pre-emptive commit can fail, and the packet it was making room for is held by
+nothing `_account_unwritten()` can walk. It is now counted at that point, like
+the closed-stream branch. That is what D39's identity is for.
+
+**5 new tests** (456 → 461): the bound across many packets, the oversized-packet
+exception and that it does not drag ordinary packets along, observation rows
+bounded as well as samples, and the failed pre-emptive commit.
+
+### Fixed — CL-003-R3: stale status statements (documentation only)
+
+Three places still described the repository as it was at CL-001, which stopped
+being true when CL-002B landed and has been false through two more tickets. They
+were reported as findings during CL-003 and left alone as out of scope; they are
+corrected here, in their own documentation-only change.
+
+- `README.md` said the current milestone was CL-001 and that "no acquisition,
+  session or analysis code exists yet". Now names CL-003, says what exists and —
+  more importantly — what deliberately does not: no device adapter, no BLE or
+  serial transport, no reconstructed timing, no analysis.
+- `docs/ARCHITECTURE.md` said "Nothing described below is implemented".
+  Now carries a per-layer status table. `acquisition` and `analysis` are empty
+  and `core` does not exist, which is stated rather than implied.
+- `src/consciousness_lab/__init__.py` said the package contained no session
+  handling. It has contained the session layer since CL-002B.
+
+**No code, test or behavior changed**, and no claim about hardware moved: every
+device is still unverified and README's hardware section is untouched. The point
+of this change is that a document which overstates what exists is the same defect
+as one that understates it — both make the next reader guess.
+
 ### Fixed — CL-003-R1-R2: account for every accepted-but-unwritten packet
 
 Review of the CL-003-R1 barrier found the new `dropped` accounting incomplete on

@@ -4,10 +4,18 @@ Research platform for **Study 001**. This repository holds the acquisition,
 session-handling and analysis code for the study, plus the documentation that
 defines how that code is allowed to behave.
 
-Current milestone: **CL-001 — repository bootstrap and engineering contract.**
-No acquisition, session or analysis code exists yet. What exists is the locked
-environment, the validation pipeline, and the documents that constrain every
-later ticket.
+Current milestone: **CL-003 — the asynchronous multi-stream recorder.**
+
+What exists: the locked environment and validation pipeline (CL-001), Session
+Package v2 as the acquisition data contract (CL-002A/CL-002B, `docs/DECISIONS.md`
+D8–D34), and a recorder that drives several stream sources concurrently into one
+package (CL-003, D35–D39).
+
+What does **not** exist, deliberately: any device adapter, any BLE or serial
+transport, any reconstructed timing or cross-device alignment, and any analysis.
+The recorder is defined against an abstract source and exercised by a
+deterministic synthetic one. **No hardware has ever been connected** — see
+[Hardware status](#hardware-status) below, which is unchanged and still binding.
 
 ---
 
