@@ -744,6 +744,41 @@ cannot defer it.
 **Source.** Human review of CL-003; the first task carried end to end by the
 Handoff/ChatGPT review bridge.
 
+## D39 — Every accepted packet has exactly one owner
+
+**Decided (CL-003-R1-R2).** At any instant an accepted packet is in exactly one
+of four places, and the fatal path walks all three unwritten ones:
+
+```text
+_Handoff queue  ->  stream.pending  ->  stream.in_flight  ->  written
+```
+
+`in_flight` is a field on the stream, not a local in `_commit()`. Entering a
+fatal path counts and **clears** all three unwritten places, which is what makes
+the count exactly once, and the identity `submitted == written + dropped` holds
+on every path.
+
+**Why.** The batch handed to `commit_chunk` used to live in a local variable. If
+that write failed, the batch vanished with the stack frame, and packets accepted
+onto *other* streams sat unseen in their pending accumulators — so a session
+could lose two whole chunks of acquired data and still report `dropped == 0`.
+Reproduced before the fix: 5 packets submitted on one stream, 2 durable, 1
+counted; a second stream with 3 accepted packets reported 0. That contradicts
+D38's guarantee that every submitted packet is either durable or explicitly
+surfaced.
+
+**Rejected.** Deriving `dropped` as `submitted - written`. It is self-consistent
+whatever actually reached the disk, so it would report a sound-looking balance
+while proving nothing about which packets were lost. The identity is *checked*
+against an independent ownership count, never used as its source.
+
+**Rejected.** Counting the failed batch at the call site in `_commit()`. It
+closes one hole and leaves the other two, and puts the accounting rule in three
+places instead of one.
+
+**Source.** ChatGPT review of PR #2, routed automatically by the Handoff review
+bridge.
+
 ---
 
 ## Awaiting a named human

@@ -33,6 +33,7 @@ from consciousness_lab.session.recorder import (
     SourcePacket,
     _Handoff,
     _HandoffClosedError,
+    _Sink,
 )
 from consciousness_lab.session.writer import SessionWriter
 from consciousness_lab.storage.chunk_writer import ChunkWriter
@@ -780,3 +781,205 @@ def test_request_stop_terminates_even_when_a_source_ignores_it(data_root: DataRo
     # The grace period plus the join window, with generous slack for a loaded
     # machine. The point is that it terminates at all, not the exact number.
     assert time.monotonic() - started < 10.0
+
+
+# -------------------------- CL-003-R1-R2: accounting for unwritten packets
+
+
+def assert_accounted(report: RecorderReport) -> None:
+    """The R1 contract: every submitted packet is durable or counted lost."""
+    assert report.accounted, f"unaccounted packets: {report.unaccounted}"
+
+
+def drive_one_packet(recorder: Recorder) -> None:
+    """Pop one packet off the hand-off and accept it, exactly as _fan_in does."""
+    stream_id, packet = recorder._handoff.get(1.0)
+    recorder._accept(stream_id, packet)
+
+
+def test_a_fatal_write_accounts_for_every_accepted_packet(
+    data_root: DataRoot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CL-003-R1-R2. The failed batch and other streams' pending are not lost.
+
+    An accepted packet lives in one of three unwritten places, and a fatal write
+    must reach all three. Before this fix only the queued tail was counted: the
+    batch whose commit failed was a local inside ``_commit`` and vanished with
+    the frame, and packets accepted onto *other* streams sat in their pending
+    accumulators unseen. A session could lose two whole chunks and report
+    ``dropped == 0``.
+
+    Driven a packet at a time from this thread — which is the fan-in thread's
+    own job — so the placement of every packet at the moment of failure is
+    exact rather than a matter of interleaving.
+    """
+    # Nothing auto-cuts: this test decides when a chunk is committed.
+    writer = open_writer(
+        data_root,
+        required=(EEG, ECG),
+        config=WriterConfig(chunk_max_rows=1_000_000, chunk_max_seconds=1_000_000),
+    )
+    source_a = SyntheticStreamSource(spec_for(EEG), n_packets=0, seed=1)
+    source_b = SyntheticStreamSource(spec_for(ECG), n_packets=0, seed=2)
+    recorder = Recorder(writer, [source_a, source_b], queue_capacity=16, monotonic_ns=FakeClock())
+    for source in (source_a, source_b):
+        writer.open_stream(source.descriptor)
+    sinks = {sid: _Sink(recorder, sid) for sid in (EEG, ECG)}
+    recorder._sinks.update(sinks)
+
+    gen_a = SyntheticSource(spec_for(EEG), seed=1)
+    gen_b = SyntheticSource(spec_for(ECG), seed=2)
+
+    def submit_a() -> None:
+        sinks[EEG].submit(as_source_packet(gen_a.next_chunk(1)))
+
+    def submit_b() -> None:
+        sinks[ECG].submit(as_source_packet(gen_b.next_chunk(1)))
+
+    state_a = recorder._streams[EEG]
+    state_b = recorder._streams[ECG]
+
+    # 2 packets on A, committed durably.
+    submit_a()
+    submit_a()
+    drive_one_packet(recorder)
+    drive_one_packet(recorder)
+    recorder._commit(state_a)
+    assert state_a.written == 2 and state_a.chunks == 1
+
+    # 2 more on A, accepted but not yet cut into a chunk.
+    submit_a()
+    submit_a()
+    drive_one_packet(recorder)
+    drive_one_packet(recorder)
+    # 3 on B, accepted onto a DIFFERENT stream's pending accumulator.
+    submit_b()
+    submit_b()
+    submit_b()
+    for _ in range(3):
+        drive_one_packet(recorder)
+    # 1 more on A, still sitting in the hand-off queue.
+    submit_a()
+
+    assert len(state_a.pending.packets) == 2
+    assert len(state_b.pending.packets) == 3
+    assert not recorder._handoff.empty()
+
+    def refuse(self: ChunkWriter, *args: object, **kwargs: object) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(ChunkWriter, "commit", refuse)
+    recorder._commit(state_a)  # -> FatalWriteError -> _enter_fatal
+
+    report = recorder.report
+    assert report.fatal is not None
+
+    # A: 5 submitted = 2 written + (2 in the failed batch + 1 still queued).
+    assert report.streams[EEG].submitted == 5
+    assert report.streams[EEG].written == 2
+    assert report.streams[EEG].dropped == 3, (
+        "the batch whose commit failed must be counted, not lost with the frame"
+    )
+    # B: never touched the failing write, but its accepted packets are just as
+    # unwritten, and used to be reported as dropped == 0.
+    assert report.streams[ECG].submitted == 3
+    assert report.streams[ECG].written == 0
+    assert report.streams[ECG].dropped == 3, "packets pending on another stream are unwritten too"
+    assert_accounted(report)
+    assert not report.ok
+
+
+def test_unwritten_packets_are_counted_exactly_once(
+    data_root: DataRoot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Repeated fatal accounting must not inflate the count either.
+
+    Counting and releasing happen together, so a second pass owns nothing. Both
+    directions matter: an over-count is as wrong as an omission, and would make
+    the report's accounting identity meaningless.
+    """
+    writer = open_writer(
+        data_root,
+        required=(EEG,),
+        config=WriterConfig(chunk_max_rows=1_000_000, chunk_max_seconds=1_000_000),
+    )
+    source = SyntheticStreamSource(spec_for(EEG), n_packets=0, seed=1)
+    recorder = Recorder(writer, [source], queue_capacity=8, monotonic_ns=FakeClock())
+    writer.open_stream(source.descriptor)
+    sink = _Sink(recorder, EEG)
+    recorder._sinks[EEG] = sink
+
+    gen = SyntheticSource(spec_for(EEG), seed=1)
+    for _ in range(4):
+        sink.submit(as_source_packet(gen.next_chunk(1)))
+    for _ in range(2):
+        drive_one_packet(recorder)
+
+    def refuse(self: ChunkWriter, *args: object, **kwargs: object) -> None:
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(ChunkWriter, "commit", refuse)
+    recorder._commit(recorder._streams[EEG])
+    once = recorder.report.streams[EEG].dropped
+    assert once == 4  # 2 in the failed batch + 2 still queued
+
+    for _ in range(3):
+        recorder._account_unwritten()
+    assert recorder.report.streams[EEG].dropped == once
+    assert_accounted(recorder.report)
+
+    recorder._teardown()
+    assert recorder.report.streams[EEG].dropped == once
+    assert_accounted(recorder.report)
+
+
+def test_the_accounting_identity_holds_end_to_end_on_a_fatal_write(
+    data_root: DataRoot, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Through run(), with real threads: whatever the interleaving, it balances."""
+    writer = open_writer(data_root, required=(EEG, ECG), config=WriterConfig(chunk_max_rows=4))
+    committed: list[str] = []
+    original = ChunkWriter.commit
+
+    def fail_after_the_first_chunk(self: ChunkWriter, *args: object, **kwargs: object) -> object:
+        committed.append(self.descriptor.stream_id)
+        if len(committed) > 1:
+            raise OSError(28, "No space left on device")
+        return original(self, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(ChunkWriter, "commit", fail_after_the_first_chunk)
+    sources = [
+        SyntheticStreamSource(spec_for(EEG), n_packets=40, seed=1),
+        SyntheticStreamSource(spec_for(ECG), n_packets=40, seed=2),
+    ]
+    with pytest.raises(RecorderFatalError) as raised:
+        Recorder(sources=sources, writer=writer, queue_capacity=2, tick_seconds=0.005).run()
+
+    report = raised.value.report
+    assert report.fatal is not None
+    assert_accounted(report)
+    assert sum(r.dropped for r in report.streams.values()) > 0, (
+        "a fatal write mid-session must leave unwritten packets to report"
+    )
+    assert writer.lifecycle.state is LifecycleState.CLOSED
+
+
+def test_a_clean_session_writes_every_submitted_packet(data_root: DataRoot) -> None:
+    """The same identity on the happy path: nothing submitted, nothing lost."""
+    writer = open_writer(data_root, required=(EEG, ECG), config=WriterConfig(chunk_max_rows=5))
+    sources = [
+        SyntheticStreamSource(spec_for(EEG), n_packets=13, seed=1),
+        SyntheticStreamSource(spec_for(ECG), n_packets=11, seed=2),
+    ]
+    report = Recorder(writer, sources, queue_capacity=2, tick_seconds=0.005).run()
+
+    assert_accounted(report)
+    assert report.streams[EEG].written == 13
+    assert report.streams[ECG].written == 11
+    assert all(r.dropped == 0 for r in report.streams.values())
+    assert report.ok
+
+    finalize(writer, outcome=RecordingOutcome.COMPLETED, data_root=data_root)
+    package = open_package(writer.paths)
+    for stream_id, expected in ((EEG, 13), (ECG, 11)):
+        assert len(list(package.stream(stream_id).packets())) == expected

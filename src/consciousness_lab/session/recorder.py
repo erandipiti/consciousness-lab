@@ -46,6 +46,24 @@ atomic step in :class:`_Handoff`, not two operations against a queue:
 A producer waiting to submit when the barrier drops is *refused*, loudly: its
 packet was never accepted, and its stream closes ``FAILED`` saying so.
 
+**Ownership (CL-003-R1).** Keeping that promise on a fatal write needs one more
+thing: at every instant, an accepted packet must be in exactly one place, and
+every place must be reachable from the fatal path. There are four:
+
+    _Handoff queue  ->  stream.pending  ->  stream.in_flight  ->  written
+
+``in_flight`` exists precisely because the third place used to be a local
+variable inside ``_commit``: the batch whose write just failed was invisible to
+the accounting, so a session could lose a whole chunk and still report
+``dropped == 0``. Entering a fatal path now walks all three unwritten places,
+counts them, and clears them — so the count is exactly once — and the identity
+
+    submitted == written + dropped
+
+holds on every path. It is *checked* rather than used to derive anything: a
+count inferred by subtraction would agree with itself no matter which packets
+actually reached the disk.
+
 **Deliberately out of scope**, because no other repository record puts them in
 CL-003: device adapters, BLE or serial transport, reconstructed timing, cross-
 device alignment, any analysis, and any hardware claim. The recorder is defined
@@ -197,7 +215,13 @@ class StreamReport:
     """
 
     stream_id: str
+    #: Packets accepted off the hand-off by the fan-in thread.
     packets: int
+    #: Packets whose ``submit()`` returned. Differs from ``packets`` only when
+    #: some were still queued when recording ended.
+    submitted: int
+    #: Packets that reached disk inside a committed chunk.
+    written: int
     samples: int
     observations: int
     chunks: int
@@ -213,7 +237,10 @@ class StreamReport:
     #: Packets refused at the shutdown barrier. They were never accepted, so no
     #: acquired data was lost silently — the stream closes FAILED saying so.
     refused: int = 0
-    #: Packets accepted but not written because a fatal error ended the session.
+    #: Packets accepted but never made durable, because a fatal error ended the
+    #: session first: the queued tail, the in-flight batch whose write failed,
+    #: and every stream's pending accumulator. Counted exactly once, never
+    #: silent — ``submitted == written + dropped`` always.
     dropped: int = 0
 
 
@@ -229,6 +256,27 @@ class RecorderReport:
     streams: dict[str, StreamReport]
     #: The diagnosed fatal error that closed the session, if one did.
     fatal: str | None = None
+
+    @property
+    def accounted(self) -> bool:
+        """Is every submitted packet either durable or explicitly counted lost?
+
+        The R1 contract as one boolean. False means a packet was acquired and
+        the recorder cannot say what became of it, which is the failure this
+        whole ticket exists to make impossible.
+        """
+        return all(
+            report.submitted == report.written + report.dropped for report in self.streams.values()
+        )
+
+    @property
+    def unaccounted(self) -> dict[str, int]:
+        """Per stream, submitted minus (written + dropped). Empty when sound."""
+        return {
+            stream_id: report.submitted - report.written - report.dropped
+            for stream_id, report in self.streams.items()
+            if report.submitted != report.written + report.dropped
+        }
 
     @property
     def ok(self) -> bool:
@@ -255,6 +303,11 @@ class _StreamState:
 
     stream_id: str
     pending: PendingChunk = field(default_factory=PendingChunk)
+    #: The batch handed to ``commit_chunk`` and not yet known to be durable.
+    #: Its own slot, not a local in ``_commit``: a local would vanish with the
+    #: stack frame of a failed write, taking a whole chunk of acquired packets
+    #: out of the accounting with it.
+    in_flight: PendingChunk | None = None
     #: Host monotonic time the current chunk began accumulating, for
     #: ``chunk_max_seconds``. A durability cadence measured on the host clock —
     #: never device time, which would let a device's timebase decide how our
@@ -264,6 +317,8 @@ class _StreamState:
     samples: int = 0
     observations: int = 0
     chunks: int = 0
+    #: Packets that reached disk inside a committed chunk.
+    written: int = 0
     consumed: int = 0
     #: Packets that were accepted but could not be written, because a diagnosed
     #: fatal error ended the session first. Never silent: it reaches the report.
@@ -470,7 +525,11 @@ class Recorder:
         self._lock = threading.Lock()
         self._finished: dict[str, tuple[str, str]] = {}
         self._sinks: dict[str, _Sink] = {}
-        self._threads: list[threading.Thread] = []
+        #: (thread, stream_id) pairs. Paired at creation rather than matched by
+        #: position against ``_sources`` later: a positional zip is a coupling
+        #: between two lists that nothing enforces, and it made an internal
+        #: helper explode when the lists legitimately differed in length.
+        self._threads: list[tuple[threading.Thread, str]] = []
         self._streams: dict[str, _StreamState] = {
             stream_id: _StreamState(stream_id=stream_id) for stream_id in ids
         }
@@ -493,6 +552,8 @@ class Recorder:
             streams[stream_id] = StreamReport(
                 stream_id=stream_id,
                 packets=state.packets,
+                submitted=sink.submitted if sink is not None else 0,
+                written=state.written,
                 samples=state.samples,
                 observations=state.observations,
                 chunks=state.chunks,
@@ -533,7 +594,7 @@ class Recorder:
                 # alive after the operator has been told the session is over.
                 daemon=True,
             )
-            self._threads.append(thread)
+            self._threads.append((thread, source.descriptor.stream_id))
             thread.start()
 
         try:
@@ -618,7 +679,11 @@ class Recorder:
             # Unreachable by contract: a stream is closed only once its
             # producer has finished and every packet it submitted has been
             # consumed. If it happens anyway, data was acquired that cannot be
-            # written, and that must fail loudly rather than vanish.
+            # written, and that must fail loudly rather than vanish. This packet
+            # is held by nothing but this frame, so it is counted here — the one
+            # unwritten packet _account_unwritten cannot reach.
+            state.packets += 1
+            state.dropped += 1
             self._fail(
                 f"packet arrived for {stream_id} after it was closed; acquired data "
                 "cannot be written and must not be discarded silently",
@@ -665,23 +730,29 @@ class Recorder:
         if not state.pending.packets:
             state.started_ns = None
             return
-        pending = state.pending
-        # Swapped out before the write so a failed commit can never be retried
-        # into a second chunk carrying the same packets.
+        # Ownership moves pending -> in_flight here, and stays there until the
+        # write is KNOWN to have succeeded. Swapping out before the write is
+        # what stops a failed commit being retried into a second chunk carrying
+        # the same packets; holding it in the stream rather than in a local is
+        # what keeps a failed batch visible to the fatal accounting (D39).
+        state.in_flight = state.pending
         state.pending = PendingChunk()
         state.started_ns = None
         try:
-            self._writer.commit_chunk(state.stream_id, pending)
+            self._writer.commit_chunk(state.stream_id, state.in_flight)
         except FatalWriteError as exc:
             # commit_chunk already closed the session CLEAN / TECHNICAL_FAILURE
             # and durably closed every stream. Nothing more may be written.
+            # in_flight is left set on purpose: _account_unwritten owns it now.
             self._enter_fatal(str(exc))
             return
         # Any commit failure at all is fatal; see the module docstring.
         except Exception as exc:
             self._fail(f"{type(exc).__name__}: {exc}", stream_id=state.stream_id)
             return
+        state.written += len(state.in_flight.packets)
         state.chunks += 1
+        state.in_flight = None
 
     # -------------------------------------------------------------- closures
 
@@ -747,11 +818,22 @@ class Recorder:
         """Stop the sources, write everything they queued, close every stream."""
         self._stop.set()
         deadline = time.monotonic() + self._join_timeout_seconds
-        for thread in self._threads:
+        for thread, _stream_id in self._threads:
             thread.join(timeout=max(0.0, deadline - time.monotonic()))
-        for thread, source in zip(self._threads, self._sources, strict=True):
+        for thread, stream_id in self._threads:
             if thread.is_alive():
-                self._streams[source.descriptor.stream_id].unstopped = True
+                self._streams[stream_id].unstopped = True
+
+        if self._fatal is not None:
+            # The session is already CLOSED / TECHNICAL_FAILURE. Writing
+            # anything else into it would append to a terminal package. The
+            # failing path already accounted for every unwritten packet; this
+            # call is idempotent and only guards a fatal that somehow skipped
+            # it. Lost to a DIAGNOSED failure, and counted, not invisible.
+            self._account_unwritten()
+            for state in self._streams.values():
+                state.closed = True
+            return
 
         # THE BARRIER (CL-003-R1). One atomic step: after it returns, no
         # producer can make another packet visible, and ``remaining`` is exactly
@@ -760,19 +842,12 @@ class Recorder:
         # window — is woken and refused, so nothing can arrive behind us.
         remaining = self._lower_barrier()
 
-        if self._fatal is not None:
-            # The session is already CLOSED / TECHNICAL_FAILURE. Writing
-            # anything else into it would append to a terminal package. These
-            # packets are lost to a DIAGNOSED failure, and they are counted so
-            # the report says so rather than the loss being invisible.
-            for stream_id, _packet in remaining:
-                self._streams[stream_id].dropped += 1
-            for state in self._streams.values():
-                state.closed = True
-            return
-
         for index, (stream_id, packet) in enumerate(remaining):
             if self._fatal is not None:
+                # A commit failed while writing this tail. Everything the
+                # streams still held was accounted for inside that failure; this
+                # slice is held only by this local list, so it is counted here
+                # and nowhere else.
                 for lost_id, _packet in remaining[index:]:
                     self._streams[lost_id].dropped += 1
                 for state in self._streams.values():
@@ -799,17 +874,42 @@ class Recorder:
         """Stop accepting packets for good. Idempotent; returns what was queued."""
         return self._handoff.close()
 
-    def _abandon_queued(self) -> None:
-        """Lower the barrier on a fatal path and count what can never be written."""
+    def _account_unwritten(self) -> None:
+        """Count every accepted-but-not-durable packet, exactly once (D39).
+
+        Ownership, not arithmetic. An accepted packet is in exactly one of three
+        unwritten places, and this walks all three:
+
+        1. the **queued tail** — still in the hand-off, never consumed;
+        2. each stream's **in-flight batch** — handed to ``commit_chunk``, whose
+           write failed. This is the one that used to be a local variable and
+           therefore vanished from the count along with a whole chunk;
+        3. each stream's **pending accumulator** — accepted on some other stream
+           and not yet cut into a chunk when the session died.
+
+        Counting and clearing happen together, which is what makes it exactly
+        once: a second call finds nothing left to own. Deriving the number from
+        ``submitted - written`` instead would be self-consistent whatever
+        actually reached the disk, which is why the identity is asserted rather
+        than used as the source.
+        """
         for stream_id, _packet in self._lower_barrier():
             self._streams[stream_id].dropped += 1
+        for state in self._streams.values():
+            if state.in_flight is not None:
+                state.dropped += len(state.in_flight.packets)
+                state.in_flight = None
+            if state.pending.packets:
+                state.dropped += len(state.pending.packets)
+                state.pending = PendingChunk()
+            state.started_ns = None
 
     def _enter_fatal(self, message: str) -> None:
         """Record a fatal error whose closure the writer has already performed."""
         if self._fatal is None:
             self._fatal = message
         self._stop.set()
-        self._abandon_queued()
+        self._account_unwritten()
 
     def _fail(self, message: str, *, stream_id: str | None = None) -> None:
         """Close the session CLEAN / TECHNICAL_FAILURE, then stop everything."""
@@ -817,7 +917,7 @@ class Recorder:
             return
         self._fatal = message
         self._stop.set()
-        self._abandon_queued()
+        self._account_unwritten()
         with contextlib.suppress(OSError):
             self._writer.fail_technical(message, stream_id=stream_id)
 

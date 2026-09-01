@@ -9,6 +9,42 @@ Versioning policy is unresolved — see `docs/OPERATIONS.md`.
 
 ## [Unreleased]
 
+### Fixed — CL-003-R1-R2: account for every accepted-but-unwritten packet
+
+Review of the CL-003-R1 barrier found the new `dropped` accounting incomplete on
+a fatal write. The batch handed to `commit_chunk` lived in a local inside
+`_commit()`, so when that write failed it vanished with the stack frame; packets
+accepted onto *other* streams sat unseen in their pending accumulators. Only the
+queued tail was counted, so a session could lose two whole chunks of acquired
+data and still report `dropped == 0` — contradicting D38's guarantee that every
+submitted packet is either durable or explicitly surfaced.
+
+Reproduced before the fix: 5 packets submitted on stream A (2 durable) reported
+`dropped == 1`; stream B with 3 accepted packets reported `dropped == 0`. Five
+acquired packets unaccounted for.
+
+- **One ownership path** (`DECISIONS.md` D39). An accepted packet is in exactly
+  one of `_Handoff` → `pending` → `in_flight` → written. `in_flight` is now a
+  field on the stream rather than a local, so a failed batch stays reachable.
+  `_account_unwritten()` walks all three unwritten places, counting **and
+  clearing** them, which is what makes the count exactly once.
+- **`submitted == written + dropped` on every path**, exposed as
+  `RecorderReport.accounted` / `.unaccounted` and as new `submitted` and
+  `written` fields per stream. It is *checked* against the independent ownership
+  count, never used to derive it: a count inferred by subtraction agrees with
+  itself whatever actually reached the disk.
+- A packet arriving for an already-closed stream — unreachable by contract — is
+  counted too, since it is held by nothing the accounting can walk.
+- Producer threads are now paired with their stream id at creation instead of
+  matched by position against the source list.
+
+**4 new tests** (452 → 456): the two-stream regression the review asked for
+(A's commit fails while B holds accepted packets in `pending` and a tail remains
+queued, asserting all three are counted), an over-count guard proving repeated
+accounting is idempotent, the identity end to end through `run()` with real
+threads, and the same identity on a clean session. No Session Package v2
+behavior changed.
+
 ### Fixed — CL-003-R1: the fan-in shutdown barrier
 
 Review of CL-003 found that teardown could race an in-flight `queue.put`. A
