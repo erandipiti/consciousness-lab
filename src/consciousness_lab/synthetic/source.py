@@ -5,12 +5,16 @@ seed always yields byte-identical raw tables. It generates no scientific signal
 and encodes no physiological meaning: the values are a reproducible pattern, and
 nothing downstream may read them as measurements of anything.
 
-**This is not CL-003.** There is no asynchrony, no device fan-in, no scheduling
-and no back-pressure here — only enough to write valid chunks.
+`SyntheticSource` itself is synchronous and knows nothing about asynchrony,
+device fan-in, scheduling or back-pressure: it only produces valid rows.
+`SyntheticStreamSource` at the bottom of this module adapts it to the CL-003
+recorder's source contract, which is where those four properties live.
 """
 
 import random
 import struct
+import threading
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -28,6 +32,7 @@ from consciousness_lab.session.model import (
     SampleLayout,
     StreamDescriptor,
 )
+from consciousness_lab.session.recorder import PacketSink, SourceDisconnectedError, SourcePacket
 from consciousness_lab.storage.chunk_writer import PendingChunk
 
 MONOTONIC_CLOCK_ID = "CLOCK_MONOTONIC"
@@ -217,3 +222,68 @@ def _observation(
         "provenance": ObservationProvenance.LIBRARY_PROVIDED.value,
         "status": ClaimStatus.ASSUMED.value,
     }
+
+
+@dataclass
+class SyntheticStreamSource:
+    """Adapts :class:`SyntheticSource` to the CL-003 recorder source contract.
+
+    Deliberately thin. The recorder is what is under test; this only has to be
+    a well-behaved source: it produces a fixed number of packets, honours the
+    stop signal between packets, and hands each packet over one at a time so
+    the recorder — not the source — decides where chunk boundaries fall.
+
+    ``fail_after`` and ``disconnect_after`` exist so the abnormal termination
+    paths can be exercised without a device. They simulate nothing about real
+    hardware and prove nothing about it (``AGENTS.md`` §7).
+    """
+
+    spec: SyntheticStreamSpec
+    n_packets: int
+    seed: int = 0
+    #: Raise ``RuntimeError`` after this many packets, to exercise FAILED.
+    fail_after: int | None = None
+    #: Raise ``SourceDisconnectedError`` after this many packets, to exercise
+    #: DISCONNECTED.
+    disconnect_after: int | None = None
+    #: Called after each packet is submitted. A test seam for interleaving; it
+    #: is never used to fabricate timing.
+    after_packet: Callable[[], None] | None = None
+    _source: SyntheticSource = field(init=False)
+
+    def __post_init__(self) -> None:
+        self._source = SyntheticSource(self.spec, seed=self.seed)
+
+    @property
+    def descriptor(self) -> StreamDescriptor:
+        return build_descriptor(self.spec)
+
+    def run(self, sink: PacketSink, stop: threading.Event) -> None:
+        for produced in range(self.n_packets):
+            if stop.is_set():
+                return
+            if self.fail_after is not None and produced >= self.fail_after:
+                raise RuntimeError("synthetic source failure")
+            if self.disconnect_after is not None and produced >= self.disconnect_after:
+                raise SourceDisconnectedError("synthetic device went away")
+            sink.submit(as_source_packet(self._source.next_chunk(1)))
+            if self.after_packet is not None:
+                self.after_packet()
+
+
+def as_source_packet(chunk: PendingChunk) -> SourcePacket:
+    """Split a one-packet :class:`PendingChunk` into a recorder packet.
+
+    The rows are passed through unchanged — in particular the host arrival
+    times the generator produced, which the recorder must never re-stamp
+    (``AGENTS.md`` §4).
+    """
+    if len(chunk.packets) != 1:
+        raise ValueError("a source packet carries exactly one packet row")
+    payload = chunk.payloads[0][1] if chunk.payloads else None
+    return SourcePacket(
+        packet=chunk.packets[0],
+        samples=list(chunk.samples),
+        observations=list(chunk.observations),
+        payload=payload,
+    )

@@ -624,6 +624,93 @@ cross-checked against physical artifacts recovery reads anyway.
 
 ---
 
+# CL-003 — asynchronous multi-stream recorder
+
+**Decided (CL-003).** Engineering decisions only. None of the entries below is a
+scientific value, a threshold, or an operational definition of anything; those
+still require a named human (`AGENTS.md` §6) and none was supplied.
+
+## D35 — The recorder fans in to a single writer thread
+
+**Decided (CL-003).** Sources run concurrently, one thread each, and may only
+put packets on a bounded queue. Exactly one thread — the one that called
+`Recorder.run()` — ever calls `SessionWriter`. Descriptors are opened from that
+thread before any source thread starts.
+
+**Why.** `SessionWriter` was written synchronous and single-threaded and its
+docstring says so. Making it thread-safe would put locks around the chunk hash
+chain, `event_seq`, the lifecycle log and the schema set — four independent
+ordering guarantees, each of which becomes a correctness question under
+concurrency. Fanning in keeps every one of those guarantees exactly as CL-002B
+tested them, and moves all the concurrency to a layer where the worst failure is
+a stalled producer rather than a corrupt package.
+
+**Rejected.** A lock inside `SessionWriter` — spreads the concurrency question
+across every method that touches durable state, forever. One writer thread per
+stream — the events log, the lifecycle log and the schema set are shared, so it
+merely relocates the problem. An async event loop — a blocking device library
+call would stall every other stream, and the planned libraries (`brainflow`,
+`bleak` backends, `pyserial`) are not uniformly async.
+
+**Revisit if.** A verified device requires an ordering the queue cannot express.
+
+## D36 — Apparatus failure ends the session; device failure ends one stream
+
+**Decided (CL-003).** A chunk commit that fails for any reason closes the whole
+session `CLEAN / TECHNICAL_FAILURE` through the CL-002B path. A source that
+stops abnormally closes only its own stream, and the other streams keep
+recording. A stream closes `DISCONNECTED` **only** when the source raises
+`SourceDisconnectedError`; every other exception closes it `FAILED`.
+
+**Why.** The two failures have different blast radii. A failed commit can leave
+raw artifacts that no commit record names, and such a package can never be
+sealed — continuing to record into it would produce data that cannot be
+verified. A device going away costs one stream and nothing else; destroying the
+other recordings would discard good data over a fact the finalizer already
+evaluates. The `DISCONNECTED` / `FAILED` split is not inferred because "the
+device went away" and "our code raised" are different claims, and choosing
+between them without evidence would put an unverified hardware claim into
+immutable data (`AGENTS.md` §7).
+
+**Rejected.** Ending the session on any source failure — throws away good data
+from healthy devices. Treating a commit failure as a stream-level fault — leaves
+an unsealable package that keeps accepting writes. Inferring `DISCONNECTED` from
+a transport-shaped exception — a guess recorded as a device fact.
+
+**Constrains.** The recorder never chooses a `RecordingOutcome` and never calls
+`finalize()`. Whether a session with a failed stream is still completable is
+decided by the existing eight-condition predicate (D22), not here.
+
+## D37 — Recorder scheduling comes from `writer_config`; nothing new is persisted
+
+**Decided (CL-003).** Chunk boundaries and the periodic clock snapshot are
+driven by `run.json.writer_config` — `chunk_max_rows`, `chunk_max_seconds`,
+`clock_snapshot_interval_seconds` — which the approved schema already labels
+writer configuration and explicitly not a scientific parameter. `chunk_max_rows`
+is applied to **every** raw table, so no table in a chunk exceeds it. What the
+recorder observes about *itself* — how long a producer was blocked, whether a
+source stopped when asked — is returned in memory and persisted nowhere.
+
+**Why.** The scheduling policy already existed in the frozen schema and had no
+implementation, because nothing ran a loop. Reading it from there means CL-003
+introduces no policy value of its own. The spec says "rows" without naming a
+table; rather than pick one and call the choice a definition, the bound is
+applied to all of them, which satisfies the stated purpose — bounding how much
+in-flight data a crash can cost — under either reading. Back-pressure statistics
+are host-side engineering facts, not acquisition facts; persisting them would
+create a package authority with no approved decision behind it (D29), and where
+data was actually lost the device counter is the authority (`TIMING.md`).
+
+**Rejected.** New recorder constants for chunk size — the schema already carries
+them. A persisted recorder summary or a new event schema for back-pressure — a
+new persisted fact needs an approved decision, and this one has no reader yet.
+
+**Open.** Whether host-side back-pressure should eventually be recorded in the
+package, and in what representation, is a question for the ticket that has a
+consumer for it.
+
+---
+
 ## Awaiting a named human
 
 Recorded here so the gap is visible rather than implicit. Nothing in this list

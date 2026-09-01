@@ -9,6 +9,61 @@ Versioning policy is unresolved — see `docs/OPERATIONS.md`.
 
 ## [Unreleased]
 
+### Added — CL-003: asynchronous multi-stream recorder with fan-in orchestration
+
+**Scope recovered from the repository, not chosen.** Four records name CL-003 —
+`CHANGELOG.md` (CL-002B), `synthetic/source.py`, `synthetic/__init__.py` and
+`session/writer.py` — and between them define it by naming exactly what CL-002B
+left out: **asynchrony, device fan-in, scheduling, back-pressure**. Those four
+properties, and nothing else, are what this ticket implements.
+
+**`session/recorder.py`** — `Recorder` runs one thread per `StreamSource` and
+funnels every packet through a bounded queue into the calling thread, which is
+the only thread that ever touches `SessionWriter`. The writer's single-threaded
+promise is preserved rather than deleted (D35).
+
+- **Scheduling comes from the frozen schema, not from new constants.** Chunk
+  boundaries follow `run.json.writer_config.chunk_max_rows` /
+  `chunk_max_seconds`, and the periodic `CLOCK_SNAPSHOT` that v1 spec §10.3
+  requires — and which nothing implemented, because nothing ran a loop — now
+  follows `clock_snapshot_interval_seconds`. `chunk_max_rows` is applied to
+  every raw table, which is the safer reading of a field the spec leaves
+  untabled (D37).
+- **Back-pressure blocks, never drops.** A producer that outruns the writer
+  waits. Where the host could not keep up, the device counter is the authority
+  on loss (`TIMING.md`); the recorder fabricates no substitute.
+- **Host arrival times are never re-stamped.** Only the source can capture "the
+  moment the packet surfaced to our process"; a time taken after the packet
+  waited in a queue would silently be a different quantity (`AGENTS.md` §4).
+- **Apparatus failure ends the session; device failure ends one stream** (D36).
+  A failed chunk commit closes the session `CLEAN / TECHNICAL_FAILURE` through
+  the CL-002B path. A source that stops abnormally closes only its own stream —
+  `DISCONNECTED` only when the source raises `SourceDisconnectedError`, `FAILED`
+  otherwise — and the other streams keep recording. Packets that already
+  arrived are committed before the stream closes.
+- **No scientific decision is made.** The recorder has no session duration, no
+  minimum packet count, no quality notion and no Focus semantics. It never
+  chooses a `RecordingOutcome` and never calls `finalize()`.
+- **Nothing new is persisted.** Back-pressure and stream reports are returned in
+  memory. No new event schema, no new package authority, no new file (D29).
+
+**`synthetic/source.py`** — `SyntheticStreamSource` adapts the existing
+deterministic generator to the recorder's source contract, plus
+`as_source_packet()`. The generator itself is unchanged.
+
+**Session Package v2 was not reopened.** No schema field, enum value, event
+name, event meaning, decision record D27–D34 or frozen document was changed.
+`WriterConfig` was read for the first time; it was not modified.
+
+**25 new tests** (421 → 446), covering fan-in onto exactly one writer thread,
+host-arrival immutability, both chunk-cut rules, the periodic snapshot,
+back-pressure under a one-slot queue, per-stream and session-level failure,
+operator stop, byte-level determinism, and every refusal.
+
+**Out of scope, unchanged:** device adapters, BLE/serial transport,
+reconstructed timing, cross-device alignment, analysis. No hardware fact was
+promoted from assumed to verified; no device has been connected.
+
 ### Fixed — CL-002B-R2-R2: pre-seal control consistency
 
 Human review of `cc5baf3` closed the five R1 findings and raised two more. Both

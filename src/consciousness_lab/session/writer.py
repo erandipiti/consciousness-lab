@@ -1,9 +1,13 @@
 """Session writer: the operator-facing handle that ties the pieces together.
 
-This is deliberately synchronous and single-threaded. The generic asynchronous
-multi-stream recorder with fan-in orchestration is **CL-003**, not this ticket.
-What lives here is only enough to exercise Session Package v2 end to end:
-declare streams, commit chunks, record events, close streams durably, finalize.
+This is deliberately synchronous and single-threaded, and it stays that way.
+The generic asynchronous multi-stream recorder with fan-in orchestration is
+**CL-003** (`consciousness_lab.session.recorder`); it sits *above* this class
+and funnels every stream into a single thread, so nothing here needs a lock.
+Concurrency that reaches this file is a defect in the caller.
+
+What lives here is declaring streams, committing chunks, recording events,
+closing streams durably, and finalizing.
 """
 
 import contextlib

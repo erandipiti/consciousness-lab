@@ -114,6 +114,53 @@ package = open_package(allocated.paths)  # verifies before handing out any raw d
 matters: the latter reads the cache as-is and may be stale, and the package is
 always the authority.
 
+## Recording several streams at once (CL-003)
+
+`SessionWriter` is single-threaded on purpose. To record several devices
+concurrently, drive it with the recorder, which runs each source on its own
+thread and funnels everything into the calling thread — the only thread that
+ever touches the writer.
+
+```python
+from consciousness_lab.session.recorder import Recorder
+from consciousness_lab.session.model import WriterConfig
+from consciousness_lab.synthetic.source import SyntheticStreamSource
+
+writer = SessionWriter.open(allocated.paths)
+writer.start_recording(
+    Run(
+        sealed_at=reading,
+        required_streams=["synthetic.eeg"],
+        optional_streams=["synthetic.ecg"],
+        # Scheduling contract: chunk_max_rows / chunk_max_seconds decide chunk
+        # boundaries, clock_snapshot_interval_seconds the periodic snapshot.
+        # Writer configuration only — never analysis epoching.
+        writer_config=WriterConfig(),
+    )
+)
+
+sources = [
+    SyntheticStreamSource(eeg_spec, n_packets=1000),
+    SyntheticStreamSource(ecg_spec, n_packets=1000),
+]
+recorder = Recorder(writer, sources)
+# Blocks until every source is exhausted or request_stop() is called.
+# Raises RecorderFatalError if the recording apparatus failed.
+report = recorder.run()
+
+finalize(writer, outcome=RecordingOutcome.COMPLETED, data_root=root)
+```
+
+The recorder never decides what a session *was*: it does not choose a
+`RecordingOutcome` and does not call `finalize()`. `report` says what it
+observed — packets and chunks per stream, how each stream closed, and how long
+back-pressure made each producer wait. None of that is written into the package.
+
+A source that stops abnormally closes only its own stream (`DISCONNECTED` if it
+raised `SourceDisconnectedError`, `FAILED` otherwise); the others keep
+recording. A failed chunk commit closes the whole session
+`CLEAN / TECHNICAL_FAILURE` — see `DECISIONS.md` D36.
+
 ## Change hygiene
 
 - One CL ticket per change.
