@@ -6,6 +6,7 @@ scheduling from ``run.json.writer_config``, back-pressure that never drops, and
 honest termination on every path.
 """
 
+import queue
 import threading
 import time
 from pathlib import Path
@@ -20,6 +21,7 @@ from consciousness_lab.session.model import (
     RecordingOutcome,
     Run,
     StreamCloseStatus,
+    StreamDescriptor,
     WriterConfig,
 )
 from consciousness_lab.session.recorder import (
@@ -27,7 +29,10 @@ from consciousness_lab.session.recorder import (
     Recorder,
     RecorderError,
     RecorderFatalError,
+    RecorderReport,
     SourcePacket,
+    _Handoff,
+    _HandoffClosedError,
 )
 from consciousness_lab.session.writer import SessionWriter
 from consciousness_lab.storage.chunk_writer import ChunkWriter
@@ -39,6 +44,7 @@ from consciousness_lab.synthetic.source import (
     SyntheticStreamSource,
     SyntheticStreamSpec,
     as_source_packet,
+    build_descriptor,
 )
 from tests.conftest import now_reading
 
@@ -562,3 +568,215 @@ def test_a_slow_writer_does_not_change_what_is_recorded(data_root: DataRoot) -> 
 
     assert report.streams[EEG].packets == 21
     assert report.streams[EEG].blocked_ns > 0
+
+
+# ------------------------------------------------ CL-003-R1: the shutdown barrier
+
+
+def handoff_packet(seq: int) -> SourcePacket:
+    """The smallest well-formed packet; only its identity matters here."""
+    return SourcePacket(packet={"packet_seq": seq})
+
+
+def seqs_of(items: list[tuple[str, SourcePacket]]) -> list[int]:
+    return [int(packet.packet["packet_seq"]) for _stream_id, packet in items]
+
+
+class BlockedProducer:
+    """A thread parked inside ``_Handoff.put`` on a full hand-off."""
+
+    def __init__(self, handoff: _Handoff, item: tuple[str, SourcePacket]) -> None:
+        self.handoff = handoff
+        self.item = item
+        self.entered = threading.Event()
+        self.accepted: bool | None = None
+        self.refused = False
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def _run(self) -> None:
+        self.entered.set()
+        try:
+            self.accepted = self.handoff.put(self.item, 5.0)
+        except _HandoffClosedError:
+            self.refused = True
+
+    def start(self) -> None:
+        self.thread.start()
+        assert self.entered.wait(timeout=5.0)
+        # Let the thread actually reach the wait inside put(). The assertions
+        # below hold either way — parked in wait(), or about to re-enter put() —
+        # because the barrier refuses in both cases.
+        time.sleep(0.05)
+
+
+def test_the_barrier_refuses_a_producer_that_is_already_blocked_in_submit() -> None:
+    """CL-003-R1. The exact race: blocked in put(), teardown frees a slot.
+
+    Under a plain queue this producer's packet is accepted *after* the final
+    drain, and is then never written and never reported. The barrier makes
+    acceptance and shutdown one atomic step, so the packet is refused instead.
+    """
+    handoff = _Handoff(1)
+    assert handoff.put(("s", handoff_packet(0)), 1.0) is True
+
+    producer = BlockedProducer(handoff, ("s", handoff_packet(1)))
+    producer.start()
+
+    remaining = handoff.close()
+    producer.thread.join(timeout=5.0)
+
+    assert not producer.thread.is_alive()
+    assert producer.refused, "a producer blocked at teardown must be refused, not accepted"
+    assert producer.accepted is None
+    # Exactly what was accepted before the barrier, and nothing else.
+    assert seqs_of(remaining) == [0]
+    assert handoff.empty()
+    assert handoff.closed
+
+
+def test_the_barrier_is_idempotent_and_hands_queued_packets_over_once() -> None:
+    handoff = _Handoff(4)
+    for seq in range(3):
+        assert handoff.put(("s", handoff_packet(seq)), 1.0) is True
+    first = handoff.close()
+    second = handoff.close()
+
+    assert seqs_of(first) == [0, 1, 2]
+    assert second == [], "a second close must not hand the same packets over again"
+    with pytest.raises(_HandoffClosedError):
+        handoff.put(("s", handoff_packet(99)), 1.0)
+
+
+def test_nothing_can_be_consumed_from_a_closed_empty_handoff() -> None:
+    handoff = _Handoff(2)
+    handoff.close()
+    with pytest.raises(queue.Empty):
+        handoff.get(0.05)
+
+
+class StopIgnoringSource:
+    """A source that never notices ``stop``.
+
+    Not a strawman: a vendor BLE or serial library can sit inside a blocking
+    read that nothing in our process can interrupt. With a one-slot hand-off and
+    a fan-in that has stopped consuming, this producer is *guaranteed* to be
+    blocked in submission when teardown runs — which is exactly the window
+    CL-003-R1 is about.
+
+    ``budget`` is a safety net, not part of the scenario: with a one-slot
+    hand-off and a fan-in that has stopped, this producer blocks within two
+    submissions and cannot generate more. Exceeding the budget means the fan-in
+    never stopped, so the test fails loudly instead of filling the disk.
+    """
+
+    def __init__(self, spec: SyntheticStreamSpec, budget: int = 5000) -> None:
+        self.spec = spec
+        self.budget = budget
+        self._source = SyntheticSource(spec, seed=3)
+        #: packet_seq values for which submit() RETURNED. The invariant under
+        #: test is that every one of these is on disk.
+        self.accepted: list[int] = []
+        self.first = threading.Event()
+
+    @property
+    def descriptor(self) -> StreamDescriptor:
+        return build_descriptor(self.spec)
+
+    def run(self, sink: PacketSink, stop: threading.Event) -> None:
+        while True:  # deliberately never consults `stop`
+            if len(self.accepted) >= self.budget:
+                raise AssertionError(
+                    f"the fan-in was still consuming after {self.budget} packets; "
+                    "request_stop() did not bound the recording"
+                )
+            packet = as_source_packet(self._source.next_chunk(1))
+            sink.submit(packet)
+            self.accepted.append(int(packet.packet["packet_seq"]))
+            self.first.set()
+
+
+def run_until_stopped(recorder: Recorder, source: StopIgnoringSource) -> RecorderReport:
+    """Start the recorder and ask it to stop as soon as it is really recording."""
+
+    def stop_once_recording() -> None:
+        source.first.wait(timeout=5.0)
+        recorder.request_stop()
+
+    stopper = threading.Thread(target=stop_once_recording, daemon=True)
+    stopper.start()
+    try:
+        return recorder.run()
+    finally:
+        stopper.join(timeout=5.0)
+
+
+def test_no_packet_can_appear_after_the_final_drain(data_root: DataRoot) -> None:
+    """CL-003-R1's invariant, end to end, through the join-timeout path.
+
+    Every packet whose ``submit()`` returned is written to the package. A
+    producer still trying to submit at teardown is refused — loudly, as a stream
+    failure — and can never make a packet visible behind the final drain.
+    """
+    writer = open_writer(data_root, required=(EEG,), config=WriterConfig(chunk_max_rows=8))
+    source = StopIgnoringSource(spec_for(EEG))
+    recorder = Recorder(
+        writer, [source], queue_capacity=1, tick_seconds=0.005, join_timeout_seconds=0.05
+    )
+    report = run_until_stopped(recorder, source)
+
+    # The barrier is down and holds nothing: nothing can arrive behind us.
+    assert recorder._handoff.closed
+    assert recorder._handoff.empty()
+
+    # The producer was still submitting at teardown and was refused, not dropped.
+    assert report.streams[EEG].refused >= 1
+    assert report.streams[EEG].close_status is StreamCloseStatus.FAILED
+    assert not report.ok
+
+    finalize(writer, outcome=RecordingOutcome.ABORTED, data_root=data_root)
+    on_disk = [int(row["packet_seq"]) for row in open_package(writer.paths).stream(EEG).packets()]
+
+    accepted = list(source.accepted)
+    assert accepted, "the test proves nothing if the source never submitted anything"
+    assert set(accepted) <= set(on_disk), (
+        "a packet whose submit() returned was not written: "
+        f"missing {sorted(set(accepted) - set(on_disk))}"
+    )
+    # And nothing was invented in the other direction either.
+    assert set(on_disk) <= set(accepted)
+
+
+def test_a_refused_packet_is_never_reported_as_a_clean_stream(data_root: DataRoot) -> None:
+    """A stream that lost acquired data at the barrier must not read as CLEAN."""
+    writer = open_writer(data_root, required=(EEG,))
+    source = StopIgnoringSource(spec_for(EEG))
+    recorder = Recorder(
+        writer, [source], queue_capacity=1, tick_seconds=0.005, join_timeout_seconds=0.05
+    )
+    report = run_until_stopped(recorder, source)
+
+    assert report.streams[EEG].close_status is not StreamCloseStatus.CLEAN
+    assert report.streams[EEG].refused > 0
+
+    # Fail-closed survives: a required stream that did not close CLEAN cannot be
+    # sealed COMPLETED, whatever the recorder thought.
+    with pytest.raises(Exception, match="closed"):
+        finalize(writer, outcome=RecordingOutcome.COMPLETED, data_root=data_root)
+
+
+def test_request_stop_terminates_even_when_a_source_ignores_it(data_root: DataRoot) -> None:
+    """An operator stop must always return. A wedged source cannot hang the host.
+
+    Before CL-003-R1 the fan-in loop only ended when every stream had closed, so
+    a source that never noticed ``stop`` made ``run()`` unreturnable.
+    """
+    writer = open_writer(data_root, required=(EEG,))
+    source = StopIgnoringSource(spec_for(EEG))
+    recorder = Recorder(
+        writer, [source], queue_capacity=1, tick_seconds=0.005, join_timeout_seconds=0.05
+    )
+    started = time.monotonic()
+    run_until_stopped(recorder, source)
+    # The grace period plus the join window, with generous slack for a loaded
+    # machine. The point is that it terminates at all, not the exact number.
+    assert time.monotonic() - started < 10.0

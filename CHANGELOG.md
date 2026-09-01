@@ -9,6 +9,38 @@ Versioning policy is unresolved — see `docs/OPERATIONS.md`.
 
 ## [Unreleased]
 
+### Fixed — CL-003-R1: the fan-in shutdown barrier
+
+Review of CL-003 found that teardown could race an in-flight `queue.put`. A
+producer already blocked inside `put` could be accepted *after* teardown set
+`_abandoned` and after its single final drain, leaving an acquired packet in the
+queue: never written, never reported. That breaks CL-003's central guarantee
+that back-pressure blocks and acquired packets are never silently dropped.
+
+Both defects were reproduced against the pre-fix code before anything changed.
+
+- **`_Handoff` replaces the queue-plus-flag** (`DECISIONS.md` D38). Acceptance
+  and the shutdown decision happen under one lock, and `close()` lowers the
+  barrier and takes everything still queued in the same hold — so the list it
+  returns is provably every packet that was accepted and not yet consumed, with
+  no window on either side. A producer waiting inside `put` is woken and
+  **refused**; its packet was never accepted, so "submitted" still implies
+  "written".
+- **A refusal is never reported as a clean stream.** The stream closes `FAILED`
+  with the refused count, and `RecorderReport.ok` requires zero refused and zero
+  dropped. Packets that a *diagnosed* fatal error prevents from being written
+  are counted as `dropped` rather than vanishing.
+- **`request_stop()` now always terminates.** The fan-in previously ended only
+  when every stream had closed, so a source that never noticed `stop` — a vendor
+  SDK inside a blocking read — made `run()` unreturnable. It now stops on a
+  wall-clock grace period; real time deliberately, so an injected scheduling
+  clock cannot defer a safety timer.
+
+**6 new tests** (446 → 452), including the deterministic barrier regression:
+a producer is forced to be blocked in submission across the join-timeout path,
+and the test proves both that it is refused and that every packet whose
+`submit()` returned is on disk. No Session Package v2 behavior changed.
+
 ### Added — CL-003: asynchronous multi-stream recorder with fan-in orchestration
 
 **Scope recovered from the repository, not chosen.** Four records name CL-003 —
