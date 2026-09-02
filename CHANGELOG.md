@@ -182,6 +182,67 @@ operator stop, byte-level determinism, and every refusal.
 **Out of scope, unchanged:** device adapters, BLE/serial transport,
 reconstructed timing, cross-device alignment, analysis. No hardware fact was
 promoted from assumed to verified; no device has been connected.
+### Fixed — CL-002B-R2-R3: write-side conformance
+
+A second scoped Codex review of `8bad8bb`, deliberately aimed at the **write**
+side rather than the verifier — the blind spot the first review's scope left
+open, and where every one of the R1/R2 human findings had landed. It returned
+**NO-GO** with seven findings; all seven were reproduced before anything changed.
+No frozen document, decision record, relation, recovery semantic or scientific
+assumption was touched.
+
+The unifying defect: hardening the verifier does not stop a *writer* from making
+an irreversible durable claim first. A verifier finding is recoverable — you
+learn the package is bad. A bad write is not: raw data is immutable, so the
+false claim is now permanent acquisition data.
+
+- **A chunk could be committed after its stream closed.** `close_stream` writes
+  an immutable closure record; a later `commit_chunk` made that record false,
+  and the package still sealed and verified COMPLETED. Closure is now terminal
+  for a stream exactly as CLOSED is for a session: the commit is refused, not
+  the record.
+- **The writer committed chunks the verifier would reject.** `commit()` checked
+  only emptiness, payload count and observation semantics — non-increasing
+  `packet_seq`, missing dense sample keys, dangling references, duplicate sparse
+  triples and mismatched payload frames all reached immutable raw. Every chunk
+  is now reconciled against the **physical bytes just written**, by
+  `stream_state.reconcile_chunk` — the same function verification uses, not a
+  writer-side copy that could drift — plus the chain-level ordering rule a
+  single chunk cannot see. Failed artifacts stay on disk as orphans, which is
+  exactly what a crash at that point leaves.
+- **Terminal `CLOSED / CLEAN / COMPLETED` was appended before raw conformance
+  was checked.** Committing one bad chunk produced a permanent COMPLETED claim
+  over a package that could never verify and could never be closed any other
+  way. The full preflight now runs *before* the terminal record, and again
+  before the manifest, because the appends change what is being sealed.
+- **`lifecycle.jsonl` and `events/events.jsonl` were hashed into the manifest
+  without being verified.** A record whose own `record_sha256` did not verify
+  was sealed anyway, manufacturing a package that condition 3 then rejected.
+  Both are now checked with the verifier's own `verify_jsonl_region` before any
+  digest is written.
+- **A sealed or terminally closed package still accepted writes.**
+  `emit_event`, `commit_chunk`, `open_stream` and `start_recording` all now go
+  through `_assert_writable`, which reads the **durable** state — so a second
+  writer or a resumed process is stopped by the same rule, not by a flag.
+- **Publishing a write-once file could leave a trap.** `atomic_write_new`
+  published by hard-linking a named temporary and then unlinking it; a crash
+  between the two left `manifest.sha256` *and* `manifest.sha256.tmp` as the same
+  inode — accepted by condition 1, rejected by condition 6, classified SEALED by
+  recovery, and clearable by nothing. Publishing now uses an anonymous
+  (`O_TMPFILE`) file where the filesystem supports it, so there is no name to
+  clean up; where it does not, `recovery.publish_residue` recognises the
+  leftover by device+inode identity and `resume_finalization` clears it. Only
+  provably redundant residue is touched — a genuine half-written file is
+  evidence and is left exactly where it is.
+- **`close_unclean` could trap a package permanently.** A crash leaving an
+  orphan artifact produces a package no valid v2 seal can ever cover; writing
+  the terminal record over it made that permanent, since CLOSED cannot be
+  re-closed and the package cannot be resumed. It now reports
+  `sealing_blockers` and refuses by default, with `force=True` to record the
+  terminal fact as a deliberate decision rather than a side effect. An ordinary
+  crash with no blockers closes and seals exactly as before.
+
+**Tests: 421 → 442**, in `tests/test_write_side_conformance.py`.
 
 ### Fixed — CL-002B-R2-R2: pre-seal control consistency
 

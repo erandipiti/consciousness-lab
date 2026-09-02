@@ -38,6 +38,8 @@ from consciousness_lab.session.model import (
     Allocation,
     ClockReading,
     ClosureCondition,
+    EventRecord,
+    LifecycleRecord,
     LifecycleState,
     Manifest,
     RecordingOutcome,
@@ -71,6 +73,24 @@ class FinalizationError(RuntimeError):
 class FinalizationResult:
     manifest: Manifest
     manifest_sha256: str
+
+
+def _assert_logs_verify(paths: PackagePaths, when: str) -> None:
+    """``lifecycle.jsonl`` and ``events/events.jsonl`` satisfy §4.1, §9.3 and D34.
+
+    The same ``verify_jsonl_region`` condition 3 applies: one complete canonical
+    object per line, canonical on disk, model-valid, and each record verifying
+    its own ``record_sha256``. Hashing a log that fails any of these into the
+    manifest would seal a package the verifier then rejects.
+    """
+    for path, model, label in (
+        (paths.lifecycle, LifecycleRecord, "lifecycle.jsonl"),
+        (paths.events, EventRecord, "events/events.jsonl"),
+    ):
+        raw = path.read_bytes() if path.is_file() else b""
+        error = package_layout.verify_jsonl_region(raw, model, require_record_hash=True)
+        if error is not None:
+            raise FinalizationError(f"{label} {error} ({when})")
 
 
 def _control_authorities(writer: SessionWriter) -> tuple[Allocation, Run]:
@@ -330,6 +350,16 @@ def finalize(
     if outcome is RecordingOutcome.COMPLETED:
         _assert_completable(writer, run, closure_condition, preflight)
 
+    # Everything the manifest will attest to is checked BEFORE the terminal
+    # lifecycle record, not after. That record is immutable: writing
+    # CLOSED / CLEAN / COMPLETED and only then discovering the raw tree does not
+    # conform leaves a permanent claim that was never true, over a package that
+    # can no longer be closed any other way. Steps 8-9 re-run after the appends,
+    # because the appends themselves change what is being sealed.
+    preflight = read_all_physical_streams(writer.paths)
+    _assert_streams_on_disk(writer, preflight)
+    _assert_logs_verify(writer.paths, "before the terminal record")
+
     # Steps 3, 4 — lifecycle, so the sealed prefix is complete before hashing.
     if writer.lifecycle.state is LifecycleState.ALLOCATED:
         writer.lifecycle.append(LifecycleState.FINALIZING)
@@ -349,6 +379,10 @@ def finalize(
     if not events_path.exists():
         atomic_write(events_path, b"")
     events_bytes = events_path.read_bytes()
+    # The bytes about to be hashed into the manifest must be bytes the verifier
+    # accepts. Hashing an unverifiable log produces a sealed package that cannot
+    # verify, which is strictly worse than an unsealed one that honestly cannot.
+    _assert_logs_verify(writer.paths, "before sealing")
 
     # Step 6 — the schemas the sealed events actually reference travel with the
     # package. The set must equal those ids exactly, so it is derived from the

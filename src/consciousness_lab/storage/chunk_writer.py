@@ -124,6 +124,10 @@ class ChunkWriter:
             )
         self._next_chunk_id = 0
         self._prev_hash = canonical_json.ZERO_HASH
+        #: Last packet_seq committed to this stream, for the chain-level
+        #: ordering rule that per-chunk validation cannot see.
+        self._last_packet_seq: int | None = None
+        self._pending_last_packet_seq: int | None = None
         self._committed: list[ChunkCommit] = []
         #: Canonical bytes of each record as written, so the finalizer can
         #: compare what the writer committed against what is on disk by RECORD
@@ -199,6 +203,21 @@ class ChunkWriter:
         artifact_sha256["samples"] = sha256_file(samples_path)
         self._fire(fault, "samples_written")
 
+        # Nothing is committed until the artifacts just written satisfy the same
+        # rules the verifier will apply to them. Checked against the PHYSICAL
+        # bytes, by the same reconciler verification uses, so there is one
+        # definition of a conforming chunk rather than a writer-side copy that
+        # can drift from it.
+        #
+        # The artifacts stay on disk if this fails. They are orphans — files
+        # with no commit record — which is exactly what a crash at this point
+        # leaves, and recovery already reports that shape without adopting it.
+        problem = self._conformance_error(chunk_id, artifact_sha256)
+        if problem is not None:
+            raise ChunkWriteError(
+                f"chunk {chunk_id} does not conform and was not committed: {problem}"
+            )
+
         record = ChunkCommit(
             chunk_id=chunk_id,
             prev_record_sha256=self._prev_hash,
@@ -216,9 +235,61 @@ class ChunkWriter:
 
         self._prev_hash = digest
         self._next_chunk_id += 1
+        self._last_packet_seq = self._pending_last_packet_seq
         self._committed.append(record)
         self._committed_canonical[chunk_id] = canonical
         return record
+
+    def _conformance_error(self, chunk_id: int, artifact_sha256: dict[str, str]) -> str | None:
+        """Why the artifacts just written are not a conforming chunk, or ``None``.
+
+        Imported here rather than at module scope: ``stream_state`` reads chunk
+        records, which this module writes, so a top-level import would be
+        circular. The point of reusing it is that a chunk cannot be committed
+        under rules different from the ones it will later be judged by.
+        """
+        from consciousness_lab.storage.stream_state import (
+            ChunkRecordOnDisk,
+            reconcile_chunk,
+        )
+
+        probe = ChunkCommit(
+            chunk_id=chunk_id,
+            prev_record_sha256=self._prev_hash,
+            artifact_sha256=artifact_sha256,
+        )
+        record = ChunkRecordOnDisk(
+            model=probe,
+            canonical_bytes=canonical_json.canonicalize(probe.model_dump(mode="json")),
+            payloads_key_present="payloads" in artifact_sha256,
+        )
+        chunk = reconcile_chunk(self.paths.root, record, self.descriptor)
+        problems = (
+            list(chunk.artifact_errors)
+            + list(chunk.schema_errors)
+            + list(chunk.row_semantics_errors)
+            + list(chunk.reference_errors)
+            + list(chunk.payload_errors)
+        )
+        if chunk.packet_error is not None:
+            problems.append(chunk.packet_error)
+        # Chain-level ordering: packet_seq is strictly increasing for the whole
+        # stream, so this chunk must begin after the previous one ended. Per
+        # chunk validation cannot see that, and the verifier checks it later.
+        first = chunk.physical_first_packet_seq
+        if (
+            self._last_packet_seq is not None
+            and first is not None
+            and first <= self._last_packet_seq
+        ):
+            problems.append(
+                f"begins at packet {first}, which does not follow the previous chunk "
+                f"ending at {self._last_packet_seq}"
+            )
+        if problems:
+            return "; ".join(problems)
+        self._pending_last_packet_seq = chunk.physical_last_packet_seq
+        return None
 
     @staticmethod
     def _fire(fault: FaultHook | None, stage: str) -> None:

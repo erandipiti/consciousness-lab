@@ -626,10 +626,15 @@ def _read_packet_facts(path: Path) -> tuple[dict[int, int] | None, str | None]:
     return {int(r["packet_seq"]): int(r["n_samples"]) for r in rows}, None
 
 
-def _reconcile_chunk(
+def reconcile_chunk(
     stream_root: Path, record: ChunkRecordOnDisk, descriptor: StreamDescriptor | None
 ) -> PhysicalChunk:
-    """Reconcile a commit record against every physical fact it names."""
+    """Reconcile a commit record against every physical fact it names.
+
+    Public because the writer calls it too, on the artifacts it has just
+    written and before it commits them: a chunk must not be committed under
+    rules different from the ones it will later be judged by.
+    """
     artifact_errors = _check_artifacts(stream_root, record, descriptor)
     schema_errors = _check_schemas(stream_root, record, descriptor)
     row_errors = _check_observation_semantics(stream_root, record)
@@ -754,7 +759,7 @@ def read_physical_stream(paths: PackagePaths, stream_id: str) -> PhysicalStreamS
     chunks_index_present = stream_paths.chunks_index.is_file()
     if directory_exists:
         records, chain_error = read_chunk_chain(stream_paths.chunks_index)
-    chunks = tuple(_reconcile_chunk(stream_paths.root, record, descriptor) for record in records)
+    chunks = tuple(reconcile_chunk(stream_paths.root, record, descriptor) for record in records)
 
     close_status, close_error = read_stream_close(stream_paths.stream_close)
     unexpected, orphans = _scan_stream_files(stream_paths.root, chunks, descriptor)
@@ -830,4 +835,5 @@ __all__ = [
     "read_packet_range",
     "read_physical_stream",
     "read_stream_close",
+    "reconcile_chunk",
 ]

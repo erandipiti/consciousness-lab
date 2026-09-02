@@ -21,6 +21,7 @@ upgraded to ``COMPLETED``, and lifecycle history is never rewritten.
 
 from dataclasses import dataclass, field
 from enum import StrEnum
+from pathlib import Path
 
 from consciousness_lab.session import annotations as annotations_mod
 from consciousness_lab.session.lifecycle import (
@@ -46,6 +47,7 @@ from consciousness_lab.session.model import (
 from consciousness_lab.session.writer import EVENT_SCHEMAS, write_stream_close
 from consciousness_lab.storage import canonical_json, package_layout
 from consciousness_lab.storage.checksums import (
+    TMP_SUFFIX,
     atomic_write,
     atomic_write_new,
     find_incomplete,
@@ -62,8 +64,10 @@ __all__ = [
     "ResumeError",
     "StructuralState",
     "close_unclean",
+    "publish_residue",
     "resume_finalization",
     "scan",
+    "sealing_blockers",
 ]
 
 from consciousness_lab.storage.verifier import Finding, verify_package
@@ -79,6 +83,35 @@ class StructuralState(StrEnum):
     UNREADABLE = "unreadable"
 
 
+def publish_residue(paths: PackagePaths) -> list[Path]:
+    """Temporary files that are provably an interrupted publish, nothing more.
+
+    Where an anonymous publish is unavailable, a write-once file is published by
+    hard-linking a named temporary and then unlinking it. A crash between those
+    two leaves ``X`` and ``X.tmp`` as the **same inode** — the same bytes, twice
+    named. Condition 6 rejects the leftover and condition 1 accepts the file, so
+    the package looks sealed and can never verify.
+
+    Only residue that is provably redundant is reported: the published file must
+    exist, and the two names must share a device and inode. Anything else is a
+    genuine incomplete write and is left exactly where it is, because a
+    half-written file is information about what happened.
+    """
+    found: list[Path] = []
+    if not paths.root.is_dir():
+        return found
+    for candidate in sorted(paths.root.rglob(f"*{TMP_SUFFIX}")):
+        if not candidate.is_file() or candidate.is_symlink():
+            continue
+        published = candidate.with_name(candidate.name[: -len(TMP_SUFFIX)])
+        if not published.is_file() or published.is_symlink():
+            continue
+        left, right = candidate.stat(), published.stat()
+        if (left.st_dev, left.st_ino) == (right.st_dev, right.st_ino):
+            found.append(candidate)
+    return found
+
+
 class ResumeError(RuntimeError):
     """An interrupted finalization could not be resumed. Nothing was written."""
 
@@ -90,7 +123,14 @@ class RecoveryReport:
     session_id: str
     state: StructuralState
     incomplete_files: list[str] = field(default_factory=list)
+    #: Leftovers from an interrupted publish: the same bytes, under a second
+    #: name. Redundant by construction, and clearable — unlike an incomplete
+    #: write, which is evidence.
+    publish_residue: list[str] = field(default_factory=list)
     orphan_files: list[str] = field(default_factory=list)
+    #: Why this package could not be sealed even after closure. Non-empty means
+    #: a terminal record would trap it.
+    sealing_blockers: list[str] = field(default_factory=list)
     unclosed_streams: list[str] = field(default_factory=list)
     can_close_unclean: bool = False
     can_resume_finalization: bool = False
@@ -107,7 +147,13 @@ def scan(paths: PackagePaths) -> RecoveryReport:
             notes=["allocation.json is absent; this directory is not a session package"],
         )
 
-    incomplete = [p.relative_to(paths.root).as_posix() for p in find_incomplete(paths.root)]
+    residue = publish_residue(paths)
+    residue_names = {p.relative_to(paths.root).as_posix() for p in residue}
+    incomplete = [
+        rel
+        for rel in (p.relative_to(paths.root).as_posix() for p in find_incomplete(paths.root))
+        if rel not in residue_names
+    ]
     verification = verify_package(paths)
     orphans = [
         issue.path or "" for issue in verification.issues if issue.finding is Finding.ORPHAN_FILE
@@ -158,10 +204,16 @@ def scan(paths: PackagePaths) -> RecoveryReport:
             else "finalization was interrupted before the terminal lifecycle record"
         )
 
+    if residue_names:
+        notes.append(
+            f"{len(residue_names)} leftover(s) from an interrupted publish; the same bytes "
+            "under a second name, clearable by resuming"
+        )
     return RecoveryReport(
         session_id=session_id,
         state=state,
         incomplete_files=incomplete,
+        publish_residue=sorted(residue_names),
         orphan_files=[o for o in orphans if o],
         unclosed_streams=unclosed,
         # A CLOSED session is terminal: it is resumed, never re-closed.
@@ -172,8 +224,14 @@ def scan(paths: PackagePaths) -> RecoveryReport:
             StructuralState.INTERRUPTED_RECORDING,
             StructuralState.INTERRUPTED_FINALIZATION,
         },
-        can_resume_finalization=(
-            closed_terminal and state is StructuralState.INTERRUPTED_FINALIZATION
+        can_resume_finalization=closed_terminal
+        and (
+            state is StructuralState.INTERRUPTED_FINALIZATION
+            # A sealed package whose ONLY defect is publish residue is stuck
+            # otherwise: condition 6 rejects it and nothing else can clear the
+            # leftover. Completing that publish is the same kind of act as
+            # completing an interrupted seal.
+            or (state is StructuralState.SEALED and bool(residue_names))
         ),
         notes=notes,
     )
@@ -197,7 +255,36 @@ def _close_orphaned_streams(paths: PackagePaths, actor: str) -> list[str]:
     return written
 
 
-def close_unclean(paths: PackagePaths, *, actor: str = "recovery") -> RecoveryReport:
+def sealing_blockers(paths: PackagePaths) -> list[str]:
+    """What would stop this package being sealed, other than a missing manifest.
+
+    A crash can leave raw state a valid v2 package can never contain — an
+    orphan artifact, a torn chunk chain, an incomplete write. Such a package
+    cannot be sealed at all, so appending a terminal lifecycle record over it
+    traps it: CLOSED is terminal, so it can never be closed again, and it can
+    never be resumed either.
+    """
+    blockers: list[str] = []
+    residue = {p.relative_to(paths.root).as_posix() for p in publish_residue(paths)}
+    for path in find_incomplete(paths.root):
+        rel = path.relative_to(paths.root).as_posix()
+        if rel not in residue:
+            blockers.append(f"incomplete write marker {rel}")
+    for stream_id, state in sorted(read_all_physical_streams(paths).items()):
+        if state.chain_error is not None:
+            blockers.append(f"{stream_id}: {state.chain_error}")
+        blockers.extend(f"{stream_id}: orphan {name}" for name in state.orphan_artifacts)
+        blockers.extend(f"{stream_id}: unexpected {name}" for name in state.unexpected_files)
+        blockers.extend(f"{stream_id}: {error}" for error in state.order_errors)
+        for chunk in state.chunks:
+            if not chunk.intact:
+                blockers.append(f"{stream_id}: chunk {chunk.chunk_id} does not conform")
+    return blockers
+
+
+def close_unclean(
+    paths: PackagePaths, *, actor: str = "recovery", force: bool = False
+) -> RecoveryReport:
     """Close a crashed session as RECOVERED_UNCLEAN / UNCLASSIFIED.
 
     It never guesses between an operator abort and a power failure: those are
@@ -207,10 +294,31 @@ def close_unclean(paths: PackagePaths, *, actor: str = "recovery") -> RecoveryRe
     Per-stream closure is written **first**, so the durable closure records
     exist before the terminal lifecycle record that depends on them — the same
     ordering finalization uses, for the same reason.
+
+    **Refuses by default when the package could never be sealed afterwards.**
+    A terminal record over an unsealable package is a one-way door: CLOSED
+    cannot be re-closed and the package cannot be resumed, so it is stuck with
+    no manifest forever. The blockers are reported instead, and ``force=True``
+    records the terminal fact anyway — which is sometimes the right call, but it
+    should be a decision rather than a side effect.
     """
     report = scan(paths)
     if not report.can_close_unclean:
         return report
+    blockers = sealing_blockers(paths)
+    if blockers and not force:
+        report.notes.append(
+            f"refusing to write a terminal record: {len(blockers)} blocker(s) would leave this "
+            f"package permanently unsealable — {blockers[:3]}; pass force=True to record the "
+            "terminal fact anyway"
+        )
+        report.sealing_blockers = blockers
+        return report
+    if blockers:
+        report.sealing_blockers = blockers
+        report.notes.append(
+            f"forced: {len(blockers)} blocker(s) remain and the package cannot be sealed"
+        )
     written = _close_orphaned_streams(paths, actor)
     log = LifecycleLog(paths.lifecycle)
     if log.state in (LifecycleState.ALLOCATED, LifecycleState.RECORDING):
@@ -240,6 +348,17 @@ def resume_finalization(paths: PackagePaths) -> Manifest:
     nothing: recovery does not guess, and it never rewrites history.
     """
     report = scan(paths)
+    for leftover in publish_residue(paths):
+        # Removing a second name for bytes that are already durably published
+        # removes no information. Nothing else in recovery deletes anything.
+        leftover.unlink()
+    if report.publish_residue and paths.manifest_sha256.is_file():
+        report = scan(paths)
+        if report.state is StructuralState.SEALED:
+            manifest = package_layout.read_manifest(paths.manifest)
+            if manifest is None:
+                raise ResumeError("manifest.json could not be parsed after clearing residue")
+            return manifest
     if not report.can_resume_finalization:
         raise ResumeError(
             f"{paths.root.name} is {report.state.value}; only an interrupted finalization "

@@ -14,6 +14,11 @@ PART_SUFFIX = ".part"
 TMP_SUFFIX = ".tmp"
 INCOMPLETE_SUFFIXES = (PART_SUFFIX, TMP_SUFFIX, ".open")
 
+#: Linux lets a file be created with no directory entry at all, so a write-once
+#: publish can be atomic with no temporary name to clean up afterwards. Absent
+#: elsewhere, in which case the named-temporary fallback below is used.
+_O_TMPFILE: int | None = getattr(os, "O_TMPFILE", None)
+
 
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -62,6 +67,39 @@ def atomic_write_new(path: Path, data: bytes) -> None:
     if path.exists():
         raise ImmutableFileError(f"{path} already exists and is immutable once written")
     path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Publish from a file that has NO NAME until it is linked into place. A
+    # named temporary would have to be unlinked afterwards, and a crash in that
+    # window leaves both the published file and a `.tmp` beside it — which
+    # condition 6 rejects and condition 1 accepts, producing a package that
+    # looks sealed and can never verify. An anonymous file cannot leave residue
+    # because there is nothing to clean up.
+    if _O_TMPFILE is not None:
+        try:
+            fd = os.open(path.parent, os.O_WRONLY | _O_TMPFILE, 0o644)
+        except OSError:
+            fd = None  # the filesystem does not support it
+        if fd is not None:
+            try:
+                os.write(fd, data)
+                os.fsync(fd)
+                os.link(f"/proc/self/fd/{fd}", path, follow_symlinks=True)
+            except FileExistsError as exc:
+                os.close(fd)
+                raise ImmutableFileError(f"{path} was created concurrently") from exc
+            except OSError:
+                # Some filesystems refuse to link out of /proc (EXDEV under
+                # overlayfs, for instance). Nothing was published: the file
+                # still has no name, so closing it discards it cleanly.
+                os.close(fd)
+            else:
+                os.close(fd)
+                fsync_dir(path.parent)
+                return
+
+    # Fallback where O_TMPFILE is unavailable. The residue window exists here,
+    # so recovery knows how to recognise and clear it (see
+    # `recovery.publish_residue`).
     tmp = path.with_name(path.name + TMP_SUFFIX)
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     try:

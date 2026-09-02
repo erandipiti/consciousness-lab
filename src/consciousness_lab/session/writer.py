@@ -158,6 +158,28 @@ class SessionWriter:
     _used_schemas: set[str] = field(default_factory=set)
     _failed: bool = False
 
+    def _assert_writable(self, what: str) -> None:
+        """Refuse any mutation once the package is sealed or terminally closed.
+
+        A sealed package is immutable; a CLOSED lifecycle is terminal. Writing
+        after either produces a package the verifier rejects — and the write
+        lands in immutable acquisition data, so there is nothing to undo. This
+        reads the DURABLE state, not a flag, because a second writer or a
+        resumed process must be stopped by the same rule.
+        """
+        if self.paths.manifest.exists() or self.paths.manifest_sha256.exists():
+            raise SealedPackageError(
+                f"{self.paths.root.name} is sealed; {what} would mutate a finalized package"
+            )
+        if self.lifecycle.state is LifecycleState.CLOSED:
+            raise SealedPackageError(
+                f"{self.paths.root.name} is CLOSED, which is terminal; {what} is refused"
+            )
+        if self.lifecycle.state is LifecycleState.FINALIZING:
+            raise SealedPackageError(
+                f"{self.paths.root.name} is FINALIZING; {what} would race the seal"
+            )
+
     @classmethod
     def open(cls, paths: PackagePaths) -> "SessionWriter":
         """Open an unsealed package for writing.
@@ -178,6 +200,7 @@ class SessionWriter:
 
     def start_recording(self, run: Run) -> None:
         """Seal ``run.json`` and enter RECORDING. Sealed once, never rewritten."""
+        self._assert_writable("starting recording")
         if self.run is not None or self.paths.run.exists():
             raise SealedPackageError("run.json is sealed once and cannot be rewritten")
         atomic_write_new(
@@ -191,6 +214,7 @@ class SessionWriter:
 
     def open_stream(self, descriptor: StreamDescriptor) -> OpenStream:
         """Seal a stream descriptor and open its chunk writer."""
+        self._assert_writable(f"opening stream {descriptor.stream_id}")
         if descriptor.stream_id in self.streams:
             raise SealedPackageError(f"stream {descriptor.stream_id} is already open")
         stream_paths = self.paths.stream(descriptor.stream_id)
@@ -223,8 +247,17 @@ class SessionWriter:
         ``CLEAN / TECHNICAL_FAILURE`` with the error recorded, never
         ``UNCLASSIFIED`` (spec 12.3, D16).
         """
+        self._assert_writable(f"committing a chunk to {stream_id}")
+        stream = self.streams[stream_id]
+        # Closure is terminal for a stream, exactly as CLOSED is for a session.
+        # Committing after it would make the durable close record false, and
+        # that record is immutable — so the commit is refused, not the record.
+        if stream.closed or self.paths.stream(stream_id).stream_close.exists():
+            raise SealedPackageError(
+                f"stream {stream_id} has a durable stream_close.json; it accepts no more chunks"
+            )
         try:
-            self.streams[stream_id].writer.commit(pending, fault=fault)
+            stream.writer.commit(pending, fault=fault)
         except OSError as exc:
             self.fail_technical(f"{type(exc).__name__}: {exc}", stream_id=stream_id)
             raise FatalWriteError(
@@ -323,6 +356,7 @@ class SessionWriter:
         payload: dict[str, Any] | None = None,
         raw_ref: RawRef | None = None,
     ) -> EventRecord:
+        self._assert_writable(f"emitting event {name}")
         if payload_schema not in EVENT_SCHEMAS:
             raise KeyError(f"unknown event payload schema {payload_schema}")
         _validate_payload(payload_schema, payload or {})
