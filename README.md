@@ -1,5 +1,9 @@
 # Consciousness Lab
 
+> **Picking this up?** Read [`docs/HANDOFF.md`](docs/HANDOFF.md) first: it states
+> where the project actually is, what is frozen, the ticket queue, and which
+> questions only a named human may answer.
+
 Research platform for **Study 001**. This repository holds the acquisition,
 session-handling and analysis code for the study, plus the documentation that
 defines how that code is allowed to behave.

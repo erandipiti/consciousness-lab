@@ -182,6 +182,25 @@ operator stop, byte-level determinism, and every refusal.
 **Out of scope, unchanged:** device adapters, BLE/serial transport,
 reconstructed timing, cross-device alignment, analysis. No hardware fact was
 promoted from assumed to verified; no device has been connected.
+### Added — `docs/HANDOFF.md`
+
+State of the repository and the ticket queue for whoever picks the work up next.
+Records the baseline (`67c76f9`), what is frozen and must not be reopened, the
+`StreamSource` contract a device adapter satisfies, and a ticket sequence
+CL-004 → CL-008 whose scope is recovered from existing repository text rather
+than chosen.
+
+The ordering decision it records: **CL-004 is a characterisation harness, not an
+adapter.** `HARDWARE.md`'s five open questions are measurements, not decisions,
+and every adapter design depends on their answers — writing an adapter first
+means guessing them and then encoding the guess into immutable data.
+
+It also splits `DECISIONS.md` §"Awaiting a named human" into what the arrival of
+physical devices makes answerable (the `HARDWARE.md` status table, and
+`required_streams` — the one item that gates a working `Finalizer`) and what it
+does not touch (Phase 0, every scientific threshold, consent and retention
+policy, withdrawal versus raw immutability).
+
 ### Fixed — CL-002B-R2-R3: write-side conformance
 
 A second scoped Codex review of `8bad8bb`, deliberately aimed at the **write**
