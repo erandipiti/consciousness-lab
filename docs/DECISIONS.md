@@ -810,6 +810,48 @@ bridge.
 
 ---
 
+# CL-004 — hardware verification
+
+## D40 — Verification observes; it never concludes, and it is not a layer
+
+**Decided (CL-004).** `consciousness_lab.verification` records what a device
+does and stops there. An `Observation` carries `what`, `value` and `how` — there
+is deliberately no field for what it means. It is not one of `ARCHITECTURE.md`'s
+five layers, takes no data anywhere, and nothing in the data path may import it.
+Its reports are written to `data/verification/`, never `data/sessions/`, and
+carry `verified: false`.
+
+**Why.** The distance between "the `timestamp` column increased monotonically
+across 1,183 packets" and "the device provides a device clock" is the distance
+between evidence and an unverifiable claim. `HARDWARE.md` already warns that
+*BrainFlow producing a timestamp column does not establish that the timestamp
+came from the device*: a library can synthesise on the host what looks like a
+device fact. If the harness could name a quantity, that is precisely where the
+wrong name would enter the record — and a mislabelled timebase is not
+recoverable from the recorded data afterwards.
+
+Keeping it out of the layer model matters for the same reason. A diagnostic that
+lives inside the data path invites an adapter to import it "just for the
+descriptions", and then the thing that was supposed to check the system is part
+of the system it checks.
+
+**Rejected.** Writing the device adapters first and verifying afterwards — that
+bakes in assumptions the device can contradict on day one, and every one of
+`HARDWARE.md`'s five open questions gates a design choice in the adapter.
+Letting the harness emit a `HardwareClaim` with `status=verified` — promotion is
+a human act under `AGENTS.md` §7, and code that could do it would eventually do
+it by accident.
+
+**Constrains.** A passing `hardware`-marked test verifies nothing; it says a code
+path ran. The `hardware` marker is excluded from the default run, and a test
+asserts that exclusion rather than trusting it.
+
+**Open, and untouched by this ticket.** Whether Linux/BlueZ is a supported host
+platform; whether the study needs a hardware synchronisation path between
+devices. Both are answered by measurement, and neither has been measured.
+
+---
+
 ## Awaiting a named human
 
 Recorded here so the gap is visible rather than implicit. Nothing in this list

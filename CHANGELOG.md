@@ -9,6 +9,49 @@ Versioning policy is unresolved — see `docs/OPERATIONS.md`.
 
 ## [Unreleased]
 
+### Added — CL-004: hardware verification harness
+
+Hardware is in hand. It does not unlock writing device adapters — it unlocks
+**verification**. Every row in `HARDWARE.md` still reads *pending verification*,
+its log is empty, and all five of its open questions gate a design choice in the
+adapter that would otherwise be guessed.
+
+**`verification/`** — a diagnostic that sits beside the system, not inside it
+(`DECISIONS.md` D40). Not a sixth layer, takes no data anywhere, and nothing in
+the data path may import it.
+
+- **It observes and does not conclude.** An `Observation` is `what`, `value`,
+  `how` — there is no field for what it means, and a test asserts that. Series
+  are *described* (monotonic, its steps, where it went backwards) and never
+  named, because `HARDWARE.md` warns that a BrainFlow timestamp column does not
+  establish that the timestamp came from the device.
+- **`AGENTS.md` §7 is structural, not a convention.** A run without its purpose,
+  method, host, library versions and — for a device — firmware cannot be
+  written at all. Nothing reaches disk before that check. Failure modes are
+  required too: a run that saw nothing and reports no failure is refused,
+  because silence records that nobody looked.
+- **Verification is not a session.** Reports go to `data/verification/`, never
+  `data/sessions/`, and writing one produces no package. Putting a device on to
+  see whether it streams is not a study recording.
+- **Promotion stays human.** Reports carry `verified: false`. No code path can
+  move a `HARDWARE.md` row.
+- **`consciousness-lab probe env | scan | muse | polar`**, with `--purpose`,
+  `--method` and `--firmware` required and undefaulted.
+- **`hardware` pytest marker**, excluded by default so no default run opens a
+  Bluetooth radio; a test asserts the exclusion rather than trusting it. A
+  passing hardware test says a code path ran, not that a device behaves.
+
+**First real finding, from `probe env` on the intended host:** mimisbrunnr has
+the radio (Intel `8087:0026`, `btusb`, `hci0`) and D-Bus, but **BlueZ is not
+installed** — no `bluetoothd`, no `bluetoothctl`, no `bluetooth.service`. No BLE
+device is reachable there until it is. Recorded in `HARDWARE.md` as a **host**
+observation; no device row moved.
+
+**19 new tests** (461 → 480, plus 1 deselected). No device adapter, no
+transport, no reconstructed timing, no analysis. Session Package v2, D27–D34 and
+the CL-003 recorder are untouched. The QT Py is deliberately out of scope: no
+firmware exists and the marker mechanism is undesigned.
+
 ### Fixed — CL-003-R3: chunk_max_rows is a packet-boundary bound, and D37 said otherwise
 
 Final CL-003 verification found a contract mismatch. D37 and `_should_cut()`
