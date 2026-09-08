@@ -172,6 +172,22 @@ class VerificationRun:
         """Record a failure mode. §7 requires these; they are not noise."""
         self.failures.append(detail)
 
+    def absorb(self, child: "VerificationRun", prefix: str) -> None:
+        """Fold a sub-run's observations and failures in under a prefix.
+
+        Multi-phase probes — reconnect cycles, two devices held at once — are
+        several bounded captures whose whole value is being COMPARABLE. Keeping
+        them in one report under prefixed names is what lets a reader put cycle
+        0 beside cycle 1, or the Muse beside the Polar, without cross-referencing
+        files. The prefix is the only thing added: no phase is summarised, and
+        no difference between phases is computed, because "the counter reset on
+        reconnect" is exactly the conclusion this package does not draw.
+        """
+        for observation in child.observations:
+            self.observe(f"[{prefix}] {observation.what}", observation.value, observation.how)
+        for failure in child.failures:
+            self.fail(f"[{prefix}] {failure}")
+
     def _missing(self) -> list[str]:
         missing = [
             name

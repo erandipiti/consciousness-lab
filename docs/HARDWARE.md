@@ -81,7 +81,31 @@ uv run consciousness-lab probe env   --purpose "..."            # host only, no 
 uv run consciousness-lab probe scan  --purpose "..."            # what the host can see
 uv run consciousness-lab probe muse  --purpose "..." --firmware "..." --method "..."
 uv run consciousness-lab probe polar --purpose "..." --firmware "..." --method "..." --address "..."
+
+# what a reconnect does: two windows around a real disconnection, side by side
+uv run consciousness-lab probe reconnect  --device muse  --purpose "..." --firmware "..." --method "..."
+
+# two peripherals on one adapter, which HARDWARE.md calls unmeasured
+uv run consciousness-lab probe concurrent --polar-address "..." --purpose "..." --firmware "..." --method "..."
 ```
+
+`reconnect` records cycle 0 and cycle 1 under prefixed names and **computes no
+difference between them**. Whether a counter reset or a timebase restarted is
+what you conclude from seeing both series; a wrong conclusion baked into the
+probe would be invisible.
+
+`concurrent` holds both devices at once and records what each one did. It does
+**not** compare against a solo run: run each device alone first, then both, and
+read the three reports. Deciding that something "degraded" is a judgement, and
+the probe does not make it.
+
+The Polar capture runs two paths, because they fail for different reasons and
+the difference is itself evidence: raw GATT notifications from every notifiable
+characteristic (nothing decoded, so nothing can be misdecoded), and the PMD
+streams that need a control-point handshake, through polar-python. Stream
+parameters there come from the device's own `request_stream_settings` response —
+never from a number chosen in our code, which would be inventing a device
+parameter.
 
 `--purpose`, `--method` and (for a device) `--firmware` have no defaults and the
 run refuses to be written without them, because they are part of what a

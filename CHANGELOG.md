@@ -47,7 +47,28 @@ installed** — no `bluetoothd`, no `bluetoothctl`, no `bluetooth.service`. No B
 device is reachable there until it is. Recorded in `HARDWARE.md` as a **host**
 observation; no device row moved.
 
-**19 new tests** (461 → 480, plus 1 deselected). No device adapter, no
+**Corrected during review (CL-004-R1).** The first head shipped a measurement
+surface that could not answer two of this ticket's own acceptance questions:
+
+- `capture_polar()` connected, listed services and polled the host clock — it
+  never subscribed to a characteristic, so it produced no evidence about
+  delivered data at all, and built a `notifications` list it never filled. It
+  now runs two paths: raw GATT notifications from every notifiable
+  characteristic (undecoded, so nothing can be misdecoded), and the PMD streams
+  that need a control-point handshake, via polar-python with parameters taken
+  from the **device's own** `request_stream_settings` response rather than a
+  number chosen here.
+- There was no reconnect probe and no concurrent-peripheral probe, though both
+  are `HARDWARE.md` open questions this ticket exists to measure. `probe
+  reconnect` captures two windows around a real disconnection and puts them
+  side by side, computing no difference; `probe concurrent` holds both devices
+  on one adapter and records what each did, comparing against nothing.
+
+Both stay evidence-only, and tests assert the silence: the reconnect report
+contains no word that reads as a verdict, and the concurrent report never says
+anything degraded.
+
+**28 new tests** (461 → 489, plus 1 deselected). No device adapter, no
 transport, no reconstructed timing, no analysis. Session Package v2, D27–D34 and
 the CL-003 recorder are untouched. The QT Py is deliberately out of scope: no
 firmware exists and the marker mechanism is undesigned.

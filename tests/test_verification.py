@@ -6,7 +6,9 @@ in this file asserts that exclusion is real rather than assumed.
 """
 
 import json
+from collections.abc import Callable
 from pathlib import Path
+from typing import ClassVar
 
 import pytest
 from typer.testing import CliRunner
@@ -197,6 +199,242 @@ def test_the_probe_group_is_wired_into_the_console_script() -> None:
     assert result.exit_code == 0
     for command in ("env", "scan", "muse", "polar"):
         assert command in result.stdout
+
+
+# ------------------------------- CL-004-R1: the measurement surface is complete
+
+
+def test_reconnect_puts_both_windows_side_by_side_and_compares_nothing() -> None:
+    """The open question is what a reconnect does. The probe must not answer it.
+
+    Cycle 0 and cycle 1 are recorded under prefixed names and no difference
+    between them is computed. "The counter reset on reconnect" is a conclusion a
+    human draws from seeing both series; baked in here it would be invisible and
+    unfalsifiable.
+    """
+    from consciousness_lab.verification import devices
+
+    seen: list[float] = []
+
+    def fake_capture(child: VerificationRun) -> None:
+        # Both windows start from zero — a counter that restarted, which is the
+        # very thing a reader is meant to notice and the probe must stay silent
+        # about.
+        seen.append(0.0)
+        child.observe("row 0", describe_series([0.0, 1.0, 2.0]), "fake")
+
+    run = VerificationRun(subject="muse-s-athena", purpose="p", method="m", device_firmware="1")
+    devices.capture_reconnect(run, fake_capture, cycles=2, gap_seconds=0.0)
+
+    labels = [o.what for o in run.observations]
+    assert "[cycle 0] row 0" in labels
+    assert "[cycle 1] row 0" in labels
+    assert any("gap before cycle 1" in label for label in labels)
+    # Nothing that reads as a verdict about the reconnect.
+    joined = " ".join(labels).lower()
+    assert "reset" not in joined and "changed" not in joined and "same" not in joined
+
+
+def test_a_failing_cycle_is_recorded_rather_than_ending_the_run() -> None:
+    from consciousness_lab.verification import devices
+
+    calls: list[int] = []
+
+    def flaky(child: VerificationRun) -> None:
+        calls.append(1)
+        if len(calls) == 1:
+            child.fail("the device never advertised")
+        else:
+            child.observe("row 0", describe_series([1.0, 2.0]), "fake")
+
+    run = VerificationRun(subject="polar-h10", purpose="p", method="m", device_firmware="1")
+    devices.capture_reconnect(run, flaky, cycles=2, gap_seconds=0.0)
+    assert run.failures == ["[cycle 0] the device never advertised"]
+    assert any(o.what == "[cycle 1] row 0" for o in run.observations)
+
+
+def test_concurrent_holds_both_and_names_each_without_judging_either() -> None:
+    """HARDWARE.md calls two peripherals on one adapter unmeasured. This measures.
+
+    It records what each device did while the other was connected, and does NOT
+    compare against a solo run — that comparison is the operator reading three
+    reports.
+    """
+    from consciousness_lab.verification import devices
+
+    def good(child: VerificationRun) -> None:
+        child.observe("arrivals", describe_series([0.0, 1.0, 2.0]), "fake")
+
+    def broken(child: VerificationRun) -> None:
+        raise RuntimeError("adapter refused the second connection")
+
+    run = VerificationRun(subject="both", purpose="p", method="m", device_firmware="1")
+    devices.capture_concurrent(run, {"muse-s-athena": good, "polar-h10": broken})
+
+    labels = [o.what for o in run.observations]
+    assert "[muse-s-athena] arrivals" in labels
+    assert any("peripherals held at the same time" in label for label in labels)
+    # A thread that blew up becomes a recorded failure, not a lost capture.
+    assert any("polar-h10" in f and "adapter refused" in f for f in run.failures)
+    assert any("degraded" not in o.what.lower() for o in run.observations)
+
+
+def test_absorb_carries_failures_and_never_summarises_a_phase() -> None:
+    parent = VerificationRun(subject="host", purpose="p", method="m")
+    child = VerificationRun(subject="host", purpose="c", method="m")
+    child.observe("a series", {"n": 3}, "fake")
+    child.fail("something went wrong")
+    parent.absorb(child, "phase 1")
+
+    assert [o.what for o in parent.observations] == ["[phase 1] a series"]
+    assert parent.observations[0].value == {"n": 3}, "the value is carried through untouched"
+    assert parent.failures == ["[phase 1] something went wrong"]
+
+
+def test_the_polar_capture_refuses_without_an_address() -> None:
+    """'Nothing was found' and 'the wrong thing was connected' must stay distinct."""
+    from consciousness_lab.verification import devices
+
+    run = VerificationRun(subject="polar-h10", purpose="p", method="m", device_firmware="1")
+    devices.capture_polar(run, 1.0, address="")
+    assert run.observations == []
+    assert any("discovery is a separate step" in f for f in run.failures)
+
+
+def test_the_polar_capture_subscribes_to_every_notifiable_characteristic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The GATT path must actually stream, not just enumerate and poll a clock.
+
+    Regression for the CL-004 review finding: the first version connected,
+    listed services, and appended host times without ever subscribing to
+    anything, so it could produce no evidence about delivered data at all.
+    """
+    from consciousness_lab.verification import devices
+
+    subscribed: list[str] = []
+
+    class FakeCharacteristic:
+        def __init__(self, uuid: str, properties: list[str]) -> None:
+            self.uuid, self.properties = uuid, properties
+
+    class FakeService:
+        uuid = "0000180d-0000-1000-8000-00805f9b34fb"
+        characteristics: ClassVar[list[FakeCharacteristic]] = [
+            FakeCharacteristic("00002a37-0000-1000-8000-00805f9b34fb", ["notify"]),
+            FakeCharacteristic("00002a38-0000-1000-8000-00805f9b34fb", ["read"]),
+        ]
+
+    class FakeClient:
+        def __init__(self, address: str) -> None:
+            self.services = [FakeService()]
+
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+        async def start_notify(
+            self, characteristic: FakeCharacteristic, callback: Callable[..., None]
+        ) -> None:
+            subscribed.append(characteristic.uuid)
+            callback(characteristic, bytearray(b"\x10\x50\x0a"))
+            callback(characteristic, bytearray(b"\x10\x51\x0b"))
+
+        async def stop_notify(self, uuid: object) -> None:
+            return None
+
+    import bleak
+
+    monkeypatch.setattr(bleak, "BleakClient", FakeClient)
+    run = VerificationRun(subject="polar-h10", purpose="p", method="m", device_firmware="1")
+    devices._capture_polar_gatt(run, 0.01, "AA:BB:CC:DD:EE:FF")
+
+    assert subscribed == ["00002a37-0000-1000-8000-00805f9b34fb"], "notify only, not read"
+    labels = [o.what for o in run.observations]
+    assert any("host arrival times of notifications" in label for label in labels)
+    assert any("payload lengths" in label for label in labels)
+    raw = next(o for o in run.observations if "raw notification payloads" in o.what)
+    assert raw.value == ["10500a", "10510b"], "raw bytes, undecoded"
+    assert not any("heart" in label.lower() or "bpm" in label.lower() for label in labels)
+
+
+def test_silence_on_every_characteristic_is_recorded_as_a_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from consciousness_lab.verification import devices
+
+    class Silent:
+        uuid = "svc"
+        characteristics: ClassVar[list[object]] = []
+
+    class FakeClient:
+        def __init__(self, address: str) -> None:
+            self.services = [Silent()]
+
+        async def __aenter__(self) -> "FakeClient":
+            return self
+
+        async def __aexit__(self, *exc: object) -> None:
+            return None
+
+    import bleak
+
+    monkeypatch.setattr(bleak, "BleakClient", FakeClient)
+    run = VerificationRun(subject="polar-h10", purpose="p", method="m", device_firmware="1")
+    devices._capture_polar_gatt(run, 0.01, "AA:BB:CC:DD:EE:FF")
+    assert any("no notification arrived" in f for f in run.failures)
+    assert any("control-point handshake" in f for f in run.failures)
+
+
+def test_the_reconnect_and_concurrent_commands_are_wired(tmp_path: Path) -> None:
+    result = runner.invoke(app, ["probe", "--help"])
+    assert result.exit_code == 0
+    for command in ("reconnect", "concurrent"):
+        assert command in result.stdout
+    # An unknown device name is refused rather than silently defaulted.
+    bad = runner.invoke(
+        app,
+        [
+            "probe",
+            "reconnect",
+            "--purpose",
+            "p",
+            "--firmware",
+            "1",
+            "--method",
+            "m",
+            "--device",
+            "eeg-cap",
+            "--root",
+            str(tmp_path),
+        ],
+    )
+    assert bad.exit_code != 0
+    assert not list(tmp_path.rglob("*.json"))
+
+
+def test_polar_reconnect_requires_an_address(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "probe",
+            "reconnect",
+            "--purpose",
+            "p",
+            "--firmware",
+            "1",
+            "--method",
+            "m",
+            "--device",
+            "polar",
+            "--root",
+            str(tmp_path),
+        ],
+    )
+    assert result.exit_code != 0
+    assert not list(tmp_path.rglob("*.json"))
 
 
 # ------------------------------------------------- hardware tests are excluded
