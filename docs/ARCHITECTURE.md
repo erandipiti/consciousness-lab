@@ -18,6 +18,11 @@ hold code:
 | `acquisition` | **empty.** No device adapter, no BLE, no serial. The recorder consumes an abstract source (`session/recorder.py`), which a future adapter satisfies structurally without importing upward. |
 | `core` | **not created.** Its shared types have not been needed yet; the ticket that needs them creates it. |
 
+`consciousness_lab.verification` is **not a sixth layer.** It is a diagnostic
+that sits beside the system: it records what a device does so the rows in
+`HARDWARE.md` can stop saying *pending verification*. It takes no data anywhere,
+it is not an acquisition adapter, and **nothing in the data path may import it**.
+
 The one structural rule below has not moved and is not negotiable.
 
 ---

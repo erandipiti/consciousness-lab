@@ -9,6 +9,70 @@ Versioning policy is unresolved — see `docs/OPERATIONS.md`.
 
 ## [Unreleased]
 
+### Added — CL-004: hardware verification harness
+
+Hardware is in hand. It does not unlock writing device adapters — it unlocks
+**verification**. Every row in `HARDWARE.md` still reads *pending verification*,
+its log is empty, and all five of its open questions gate a design choice in the
+adapter that would otherwise be guessed.
+
+**`verification/`** — a diagnostic that sits beside the system, not inside it
+(`DECISIONS.md` D40). Not a sixth layer, takes no data anywhere, and nothing in
+the data path may import it.
+
+- **It observes and does not conclude.** An `Observation` is `what`, `value`,
+  `how` — there is no field for what it means, and a test asserts that. Series
+  are *described* (monotonic, its steps, where it went backwards) and never
+  named, because `HARDWARE.md` warns that a BrainFlow timestamp column does not
+  establish that the timestamp came from the device.
+- **`AGENTS.md` §7 is structural, not a convention.** A run without its purpose,
+  method, host, library versions and — for a device — firmware cannot be
+  written at all. Nothing reaches disk before that check. Failure modes are
+  required too: a run that saw nothing and reports no failure is refused,
+  because silence records that nobody looked.
+- **Verification is not a session.** Reports go to `data/verification/`, never
+  `data/sessions/`, and writing one produces no package. Putting a device on to
+  see whether it streams is not a study recording.
+- **Promotion stays human.** Reports carry `verified: false`. No code path can
+  move a `HARDWARE.md` row.
+- **`consciousness-lab probe env | scan | muse | polar`**, with `--purpose`,
+  `--method` and `--firmware` required and undefaulted.
+- **`hardware` pytest marker**, excluded by default so no default run opens a
+  Bluetooth radio; a test asserts the exclusion rather than trusting it. A
+  passing hardware test says a code path ran, not that a device behaves.
+
+**First real finding, from `probe env` on the intended host:** mimisbrunnr has
+the radio (Intel `8087:0026`, `btusb`, `hci0`) and D-Bus, but **BlueZ is not
+installed** — no `bluetoothd`, no `bluetoothctl`, no `bluetooth.service`. No BLE
+device is reachable there until it is. Recorded in `HARDWARE.md` as a **host**
+observation; no device row moved.
+
+**Corrected during review (CL-004-R1).** The first head shipped a measurement
+surface that could not answer two of this ticket's own acceptance questions:
+
+- `capture_polar()` connected, listed services and polled the host clock — it
+  never subscribed to a characteristic, so it produced no evidence about
+  delivered data at all, and built a `notifications` list it never filled. It
+  now runs two paths: raw GATT notifications from every notifiable
+  characteristic (undecoded, so nothing can be misdecoded), and the PMD streams
+  that need a control-point handshake, via polar-python with parameters taken
+  from the **device's own** `request_stream_settings` response rather than a
+  number chosen here.
+- There was no reconnect probe and no concurrent-peripheral probe, though both
+  are `HARDWARE.md` open questions this ticket exists to measure. `probe
+  reconnect` captures two windows around a real disconnection and puts them
+  side by side, computing no difference; `probe concurrent` holds both devices
+  on one adapter and records what each did, comparing against nothing.
+
+Both stay evidence-only, and tests assert the silence: the reconnect report
+contains no word that reads as a verdict, and the concurrent report never says
+anything degraded.
+
+**28 new tests** (461 → 489, plus 1 deselected). No device adapter, no
+transport, no reconstructed timing, no analysis. Session Package v2, D27–D34 and
+the CL-003 recorder are untouched. The QT Py is deliberately out of scope: no
+firmware exists and the marker mechanism is undesigned.
+
 ### Fixed — CL-003-R3: chunk_max_rows is a packet-boundary bound, and D37 said otherwise
 
 Final CL-003 verification found a contract mismatch. D37 and `_should_cut()`

@@ -74,6 +74,12 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra --strict-markers --strict-config"
+# `not hardware` by default (AGENTS.md §8). A default run must never try to open
+# a Bluetooth radio: CI has none, and a developer machine may have a device
+# attached that is mid-session. Run them deliberately with `-m hardware`.
+addopts = "-ra --strict-markers --strict-config -m 'not hardware'"
+markers = [
+    "hardware: needs a physical device attached. Excluded by default, and passing does NOT verify device behaviour — verification is a dated human observation in docs/HARDWARE.md (AGENTS.md §7, §8).",
+]
 asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"

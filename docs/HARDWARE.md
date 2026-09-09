@@ -68,6 +68,71 @@ These are unverified and are recorded so they can be checked, not relied on.
   post-hoc alignment sufficient? Undecided, and it depends on measurements that
   have not been taken.
 
+## Producing the evidence (CL-004)
+
+The harness in `consciousness_lab.verification` records what a device actually
+does. It **observes and does not conclude**: it describes the columns and
+timings that arrived, and never says which of them is a clock, a counter or a
+channel. That naming is what you do when you read the report and write an entry
+below.
+
+```bash
+uv run consciousness-lab probe env   --purpose "..."            # host only, no device
+uv run consciousness-lab probe scan  --purpose "..."            # what the host can see
+uv run consciousness-lab probe muse  --purpose "..." --firmware "..." --method "..."
+uv run consciousness-lab probe polar --purpose "..." --firmware "..." --method "..." --address "..."
+
+# what a reconnect does: two windows around a real disconnection, side by side
+uv run consciousness-lab probe reconnect  --device muse  --purpose "..." --firmware "..." --method "..."
+
+# two peripherals on one adapter, which HARDWARE.md calls unmeasured
+uv run consciousness-lab probe concurrent --polar-address "..." --purpose "..." --firmware "..." --method "..."
+```
+
+`reconnect` records cycle 0 and cycle 1 under prefixed names and **computes no
+difference between them**. Whether a counter reset or a timebase restarted is
+what you conclude from seeing both series; a wrong conclusion baked into the
+probe would be invisible.
+
+`concurrent` holds both devices at once and records what each one did. It does
+**not** compare against a solo run: run each device alone first, then both, and
+read the three reports. Deciding that something "degraded" is a judgement, and
+the probe does not make it.
+
+The Polar capture runs two paths, because they fail for different reasons and
+the difference is itself evidence: raw GATT notifications from every notifiable
+characteristic (nothing decoded, so nothing can be misdecoded), and the PMD
+streams that need a control-point handshake, through polar-python. Stream
+parameters there come from the device's own `request_stream_settings` response —
+never from a number chosen in our code, which would be inventing a device
+parameter.
+
+`--purpose`, `--method` and (for a device) `--firmware` have no defaults and the
+run refuses to be written without them, because they are part of what a
+verification *is* under `AGENTS.md` §7.
+
+Reports land in `data/verification/`, never in `data/sessions/`. **A verification
+run is not a recording session**: putting a device on to see whether it streams
+produces no session package, and its output must not become study data.
+
+Run `probe scan` before blaming a device. A host with no Bluetooth stack and a
+device that is switched off look identical from inside a library that simply
+times out, and confusing the two costs a bench session.
+
+### Host readiness — observed, not a device verification
+
+**2026-09-08, mimisbrunnr (Linux 7.0.0-29-generic).** `probe env` reported: a
+Bluetooth radio is present and bound to the kernel (Intel `8087:0026`, driver
+`btusb`, `hci0` visible), D-Bus is active, and **BlueZ is not installed** — no
+`bluetoothd` on disk, no `bluetoothctl`, and no `bluetooth.service`. `brainflow`,
+`bleak`, `polar_python` and `pyserial` all import in the locked environment.
+
+Consequence: no BLE device can be reached from this host until BlueZ is
+installed, regardless of what the device does. This is a **host** observation.
+It verifies nothing about any device, and no row in the table above moves.
+
+---
+
 ## Recording a verification
 
 When a device is tested, add a dated subsection below, update its row in the
