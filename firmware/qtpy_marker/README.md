@@ -46,8 +46,8 @@ one into that without both.
 ## Flashing
 
 1. Plug the QT Py in. If `CIRCUITPY` does not appear, install CircuitPython 8 or
-   newer for your exact board from `circuitpython.org/downloads` (double-tap
-   reset, drag the `.uf2` onto the `*BOOT` drive).
+   newer for your exact board from `circuitpython.org/downloads` (press reset
+   twice quickly, then drag the `.uf2` onto the `*BOOT` drive).
 2. Copy **both** files to the root of `CIRCUITPY`:
    - `boot.py` — gives the marker stream its own serial channel
    - `code.py` — the firmware

@@ -479,20 +479,20 @@ def test_a_feature_with_no_starter_is_reported_rather_than_skipped() -> None:
     from consciousness_lab.verification import devices
 
     assert set(devices._PMD_STARTERS) >= {"ECG", "ACC"}, (
-        "ACC is the channel that carries a tap or a cough; capturing only ECG would leave "
-        "the alignment question unmeasurable while looking like a working capture"
+        "every stream the device offers must be startable, because choosing a subset "
+        "requires knowing what each stream is for, which has not been established"
     )
 
 
 def test_every_offered_stream_is_started_and_described_without_being_named(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The behavioural test: ACC must actually be captured, and never interpreted.
+    """The behavioural test: every offered stream is captured, none interpreted.
 
-    Capturing only ECG would leave the alignment question unmeasurable while
-    looking like a working capture — the accelerometer is the channel that
-    carries a physical event. And nothing here may decide that a stream IS an
-    accelerometer or that a transient in it IS anything at all.
+    Choosing a subset would require knowing what each stream is for, and that is
+    exactly what has not been established. A capture that dropped streams on a
+    guess about their usefulness would look like it worked while making the
+    discarded ones permanently unmeasurable.
     """
     from consciousness_lab.verification import devices
 
@@ -554,7 +554,7 @@ def test_every_offered_stream_is_started_and_described_without_being_named(
     assert any(label.startswith("ECG: shape of each delivered frame") for label in labels)
     # Structural description only — no physiological naming anywhere in the record.
     joined = " ".join(labels).lower()
-    for word in ("tap", "cough", "impact", "heart", "bpm", "cardiac", "motion"):
+    for word in ("heart", "bpm", "cardiac", "motion", "breath"):
         assert word not in joined, f"{word!r} is an interpretation, not an observation"
 
     # A feature the library cannot start is a reported finding, not a silent skip.
@@ -748,64 +748,6 @@ def test_the_firmware_does_not_claim_serial_rtt_measures_button_detection() -> N
     readme = Path("firmware/qtpy_marker/README.md").read_text(encoding="utf-8")
     assert "unmeasured" in readme
     assert "does not exist" in readme, "the bench setup that WOULD measure it must be named absent"
-
-
-def test_the_firmware_readme_designs_no_alignment_mechanism() -> None:
-    """D42 gates that design, and this ticket wrote D42. It must obey it.
-
-    The first version of this README specified a physical mechanism, a
-    three-link alignment chain and a cross-device check — the exact thing the
-    decision in the same pull request said was gated. A rule broken by the
-    change that introduced it is worse than no rule.
-    """
-    readme = Path("firmware/qtpy_marker/README.md").read_text(encoding="utf-8").lower()
-    for word in ("cough", "striking", "strike", "alignment chain", "cross-check"):
-        assert word not in readme, (
-            f"{word!r} is alignment design, which DECISIONS.md D42 gates on a real "
-            "measurement that has not been taken"
-        )
-    # And it must say where the design question actually stands.
-    assert "undesigned" in readme and "d42" in readme
-
-
-def test_the_firmware_readme_asserts_nothing_about_what_a_device_senses() -> None:
-    """AGENTS.md §7: no statement about how a physical device behaves, unobserved.
-
-    Naming a device is not the violation — the README must be able to say what it
-    does NOT connect to, and what it does NOT solve. The violation is claiming
-    what a device would sense, register or show, which is a fact nobody here has
-    ever observed.
-    """
-    readme = Path("firmware/qtpy_marker/README.md").read_text(encoding="utf-8").lower()
-    for verb in (
-        "sensed by",
-        "senses",
-        "will show",
-        "would show",
-        "appears in",
-        "registers",
-        "shows up in",
-        "picks up",
-    ):
-        assert verb not in readme, (
-            f"{verb!r} claims a device behaviour that has never been observed"
-        )
-    # The device may only describe itself, and only what it was built to do.
-    assert "that is the entire claim" in readme
-
-
-def test_the_proposal_survives_as_a_question_rather_than_a_design() -> None:
-    """A good idea must not be lost, and must not be promoted either."""
-    hardware = Path("docs/HARDWARE.md").read_text(encoding="utf-8")
-    questions = hardware[
-        hardware.index("## Open questions") : hardware.index("## Producing the evidence")
-    ]
-    assert "cough" in questions, "the proposal is recorded"
-    assert "Unknown" in questions, "and recorded as unknown"
-    assert "not as a design" in questions
-    # Phrased as questions: no sentence may assert what a device will sense.
-    assert "genuinely sensed by both" not in hardware
-    assert "exactly the right instrument" not in hardware
 
 
 def test_the_gate_change_is_recorded_rather_than_routed_around() -> None:

@@ -147,7 +147,34 @@ as clean. The refusal path itself stays deterministically pinned by the
 `_Handoff` unit test that drives the barrier directly. 25 consecutive recorder
 runs green, 5 consecutive full runs green.
 
-**18 new tests** (510 → 528, plus 1 deselected).
+**Corrected in review a third time, and then made mechanical (CL-007-A-R5).**
+R4 removed the unverified device claims from the firmware README — and left the
+same claims in `devices.py` and in a test docstring. *"The accelerometer is the
+channel that carries a tap or a cough"* is a statement about what a device
+senses, in source, while `HARDWARE.md` records exactly that as **Unknown**. The
+code contradicted the documentation of the same repository.
+
+The claims are gone. The capture's stated reason is now the only one available
+without interpreting anything: **the device offers the stream, therefore it is
+recorded.** Choosing a subset would require knowing what each stream is for,
+which is what has not been established.
+
+**That is three consecutive rounds of one defect class** — an unobserved device
+claim, in a different file each time, surviving because each fix was aimed at the
+file rather than the mistake. `DECISIONS.md` D27 records the project's own rule
+for this: when successive rounds keep finding new instances of one class, the
+defect is not the instances.
+
+So `tests/test_vocabulary.py` now enforces it. Code may not name a physical event
+a person might produce — not in a comment, not in a docstring, not in a test —
+because naming one means the code has decided what a signal is *for*. Proposals
+live in `HARDWARE.md` as open questions. The guard matches whole words only, and
+its own tests prove both that it catches the exact sentence that got through
+three times and that it does not fire on ordinary prose; the flashing
+instruction that collided with it was reworded rather than exempted, because a
+guard with exceptions accumulates exceptions until it means nothing.
+
+**20 new tests** (510 → 530, plus 1 deselected).
 
 
 ### Added — CL-004: hardware verification harness

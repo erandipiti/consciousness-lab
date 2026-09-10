@@ -343,16 +343,16 @@ def _settings_to_kwargs(settings: Any, wanted: set[str]) -> tuple[dict[str, int]
 def _capture_polar_pmd(run: VerificationRun, seconds: float, address: str) -> None:
     """Start every stream the device offers that this library can start.
 
-    Not ECG alone. A cardiac stream says nothing about when a physical event
-    happened, and the accelerometer is the channel that carries a tap or a
-    cough — the events an operator would use to put two devices on one timeline.
-    Capturing only ECG would leave the alignment question unmeasurable while
-    looking like a working capture, which is the failure mode this whole package
-    is built to avoid.
+    Every one, not a chosen subset. Deciding in advance which streams are worth
+    recording would require knowing what each is for, and what any of these
+    streams is good for is exactly what has not been established — `HARDWARE.md`
+    records it as open. A capture that quietly dropped streams on a guess about
+    their usefulness would look like it worked while making the discarded ones
+    permanently unmeasurable.
 
-    Nothing here decides that any stream IS an accelerometer, or that a
-    transient in it IS a tap. It starts what the device offers and describes
-    what arrives.
+    So the rule is the only one available without interpreting anything: **the
+    device offers it, therefore it is recorded.** Nothing here decides what any
+    stream is, what a value in it means, or what it might later be good for.
     """
     try:
         import asyncio
