@@ -729,9 +729,14 @@ def test_no_packet_can_appear_after_the_final_drain(data_root: DataRoot) -> None
     assert recorder._handoff.closed
     assert recorder._handoff.empty()
 
-    # The producer was still submitting at teardown and was refused, not dropped.
-    assert report.streams[EEG].refused >= 1
-    assert report.streams[EEG].close_status is StreamCloseStatus.FAILED
+    # The producer ended abnormally and the report says so. Whether it was
+    # REFUSED at the barrier or simply never stopped depends on where its thread
+    # happened to be when the join window expired — asserting one of those two
+    # would be asserting a schedule, not a guarantee. The guarantee is that it
+    # cannot end up looking clean, and that is what is checked.
+    stream = report.streams[EEG]
+    assert stream.refused >= 1 or stream.unstopped, "an abnormal end must be recorded"
+    assert stream.close_status is StreamCloseStatus.FAILED
     assert not report.ok
 
     finalize(writer, outcome=RecordingOutcome.ABORTED, data_root=data_root)
@@ -756,8 +761,14 @@ def test_a_refused_packet_is_never_reported_as_a_clean_stream(data_root: DataRoo
     )
     report = run_until_stopped(recorder, source)
 
-    assert report.streams[EEG].close_status is not StreamCloseStatus.CLEAN
-    assert report.streams[EEG].refused > 0
+    stream = report.streams[EEG]
+    assert stream.close_status is not StreamCloseStatus.CLEAN
+    # Refused-at-the-barrier and never-stopped are two ways for the same thing to
+    # be true; which one happens is a matter of thread scheduling. The invariant
+    # is that neither can be reported as clean. The refusal path itself is pinned
+    # deterministically by test_the_barrier_refuses_a_producer_that_is_already_
+    # blocked_in_submit, which drives _Handoff directly.
+    assert stream.refused > 0 or stream.unstopped
 
     # Fail-closed survives: a required stream that did not close CLEAN cannot be
     # sealed COMPLETED, whatever the recorder thought.

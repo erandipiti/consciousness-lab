@@ -850,6 +850,65 @@ asserts that exclusion rather than trusting it.
 platform; whether the study needs a hardware synchronisation path between
 devices. Both are answered by measurement, and neither has been measured.
 
+## D41 — The Mac records; mimisbrunnr stores and processes
+
+**Decided by Erandi, 2026-09-10.** The recording host is the Mac. `mimisbrunnr`
+keeps its role as the place data is stored and analysed, and stops being the
+intended bench machine.
+
+**Why.** Sessions need to happen in more than one environment, and `mimisbrunnr`
+is a desktop. The split costs nothing structurally: `SESSION_FORMAT.md` Q8 makes
+the whole `sessions/<id>/` directory the canonical unit, independently
+interpretable, with the registry rebuildable by scanning packages — so moving a
+recorded session between hosts is what the format was designed for, not a
+workaround.
+
+**What this changes about verification.** `HARDWARE.md` asks which host platforms
+are supported, and the answer only ever holds for the host it was measured on.
+Every device row must therefore be verified **on the Mac**. The BlueZ finding
+recorded on `mimisbrunnr` on 2026-09-08 stays a fact about that machine and
+transfers to nothing.
+
+**Rejected.** WSL, on architecture rather than preference: WSL2 is a VM with no
+path to the host Bluetooth adapter, and reaching one needs a USB dongle passed
+through `usbipd-win` plus a custom kernel built with the Bluetooth modules the
+shipped kernel omits. That would also make it the least-tested of the three BLE
+stacks, in a study whose hardware document already warns that stacks differ
+substantially and that `bleak` abstracts them imperfectly.
+
+**Revisit if.** macOS turns out not to sustain both peripherals on one adapter —
+which is measured by `probe concurrent`, not assumed here.
+
+## D42 — The instrument may precede the measurement; the design may not
+
+**Decided by Erandi, 2026-09-10.** `HANDOFF.md` gated CL-007 on CL-004 having
+measured serial round-trip latency and its variability. That gate is split:
+building the **instrument** that produces the measurement — firmware that
+answers a ping, and the probe that times it — is a prerequisite for the
+measurement. Designing the **marker mechanism**, its electrical interface, or how
+a mark is placed on a BLE stream's timeline stays gated on a real measurement
+existing.
+
+**Why.** The gate could not be satisfied as written. `probe serial` measures a
+round trip by sending `P <token>` and awaiting `R <token>`; without firmware that
+replies there is nothing to time, so "CL-004 measures serial RTT" presupposed the
+very thing CL-007 was forbidden to build. A gate that cannot open is not a
+safeguard, it is a stall — and routing around it silently, which is what the
+first CL-007-A head did, is worse than either.
+
+**What did NOT move.** The alignment question. `TIMING.md` still calls placing a
+mark on the BLE timeline the hardest timing question in the study and still calls
+it open, and nothing in CL-007-A answers it. No physical measurement has been
+taken: the firmware has never been flashed and the probe has never seen a board.
+
+**Rejected.** Deleting the gate — it is right about the thing that matters, and
+the original wording is kept in `HANDOFF.md` above the amendment. Leaving it
+unamended and shipping the firmware anyway — that is exactly the silent
+route-around a reviewer caught, and `AGENTS.md` §2 forbids it.
+
+**Revisit if.** A bench measurement contradicts the assumption that a
+marker-referenced strike is sharp enough to be worth having at all.
+
 ---
 
 ## Awaiting a named human

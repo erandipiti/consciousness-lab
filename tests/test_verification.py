@@ -437,6 +437,496 @@ def test_polar_reconnect_requires_an_address(tmp_path: Path) -> None:
     assert not list(tmp_path.rglob("*.json"))
 
 
+# --------------------- CL-007-A-R1: every stream the device offers, not just ECG
+
+
+class FakeSetting:
+    def __init__(self, kind: str, values: list[int]) -> None:
+        self.type, self.array_length = kind, values
+
+
+class FakeSettings:
+    def __init__(self, feature: str, settings: list[FakeSetting]) -> None:
+        self.measurement_type, self.settings, self.error_code = feature, settings, "OK"
+
+
+def test_settings_come_from_the_device_and_gaps_are_reported_not_filled() -> None:
+    """Choosing a sample rate ourselves would be inventing a device parameter."""
+    from consciousness_lab.verification.devices import _settings_to_kwargs
+
+    settings = FakeSettings(
+        "ACC",
+        [
+            FakeSetting("SAMPLE_RATE", [52, 104]),
+            FakeSetting("RESOLUTION", [16]),
+            FakeSetting("RANGE", [8]),
+        ],
+    )
+    kwargs, unresolved = _settings_to_kwargs(settings, {"sample_rate", "resolution", "range"})
+    assert kwargs == {"sample_rate": 52, "resolution": 16, "range": 8}
+    assert unresolved == []
+
+    partial, missing = _settings_to_kwargs(
+        FakeSettings("ECG", [FakeSetting("SAMPLE_RATE", [130])]),
+        {"sample_rate", "resolution"},
+    )
+    assert partial == {"sample_rate": 130}
+    assert missing == ["resolution"], "a gap is reported, never filled with something plausible"
+
+
+def test_a_feature_with_no_starter_is_reported_rather_than_skipped() -> None:
+    """'The library cannot start this' is a finding about the library."""
+    from consciousness_lab.verification import devices
+
+    assert set(devices._PMD_STARTERS) >= {"ECG", "ACC"}, (
+        "every stream the device offers must be startable, because choosing a subset "
+        "requires knowing what each stream is for, which has not been established"
+    )
+
+
+def test_every_offered_stream_is_started_and_described_without_being_named(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The behavioural test: every offered stream is captured, none interpreted.
+
+    Choosing a subset would require knowing what each stream is for, and that is
+    exactly what has not been established. A capture that dropped streams on a
+    guess about their usefulness would look like it worked while making the
+    discarded ones permanently unmeasurable.
+    """
+    from consciousness_lab.verification import devices
+
+    started: list[str] = []
+
+    class FakeFrame:
+        def __init__(self, timestamp: int, n: int) -> None:
+            self.timestamp, self.data = timestamp, list(range(n))
+
+    class FakePolarDevice:
+        def __init__(self, address: str) -> None:
+            self.address = address
+
+        async def connect(self) -> None:
+            return None
+
+        async def disconnect(self) -> None:
+            return None
+
+        async def get_available_features(self) -> list[str]:
+            return ["ECG", "ACC", "PPI"]  # PPI has no starter in the library
+
+        async def request_stream_settings(self, feature: str) -> FakeSettings:
+            common = [FakeSetting("SAMPLE_RATE", [130]), FakeSetting("RESOLUTION", [14])]
+            if feature == "ACC":
+                common.append(FakeSetting("RANGE", [8]))
+            return FakeSettings(feature, common)
+
+        async def start_ecg_stream(
+            self, ecg_callback: Callable[..., None], sample_rate: int, resolution: int
+        ) -> None:
+            started.append("ECG")
+            ecg_callback(FakeFrame(1000, 5))
+
+        async def start_acc_stream(
+            self,
+            acc_callback: Callable[..., None],
+            sample_rate: int,
+            resolution: int,
+            range: int,
+            channels: int | None = None,
+        ) -> None:
+            started.append("ACC")
+            acc_callback(FakeFrame(2000, 3))
+
+    import polar_python
+
+    monkeypatch.setattr(polar_python, "PolarDevice", FakePolarDevice)
+    run = VerificationRun(subject="polar-h10", purpose="p", method="m", device_firmware="1")
+    devices._capture_polar_pmd(run, 0.01, "AA:BB:CC:DD:EE:FF")
+
+    assert sorted(started) == ["ACC", "ECG"], "the accelerometer must be captured too"
+    used = next(o for o in run.observations if "streams started" in o.what)
+    assert used.value["ACC"] == {"sample_rate": 130, "resolution": 14, "range": 8}
+    assert "none chosen here" in used.how
+
+    labels = [o.what for o in run.observations]
+    assert any(label.startswith("ACC: host arrival times") for label in labels)
+    assert any(label.startswith("ECG: shape of each delivered frame") for label in labels)
+    # Structural description only — no physiological naming anywhere in the record.
+    joined = " ".join(labels).lower()
+    for word in ("heart", "bpm", "cardiac", "motion", "breath"):
+        assert word not in joined, f"{word!r} is an interpretation, not an observation"
+
+    # A feature the library cannot start is a reported finding, not a silent skip.
+    assert any("PPI" in f and "no way to start it" in f for f in run.failures)
+
+
+# ------------------------------------ CL-004-R2: the marker channel's round trip
+
+
+class FakeSerialLink:
+    """A QT Py that answers pings, with a mark and a heartbeat mixed in."""
+
+    def __init__(self, port: str, baudrate: int, timeout: float) -> None:
+        self.port, self.baudrate = port, baudrate
+        self.closed = False
+        self._outbox: list[bytes] = [b"B qtpy-marker/1 rp2040 1\n"]
+        self._token: str | None = None
+        self._replies = 0
+
+    def write(self, payload: bytes) -> None:
+        line = payload.decode("ascii").strip()
+        if line.startswith("P "):
+            self._token = line[2:].strip()
+
+    def flush(self) -> None:
+        return None
+
+    def readline(self) -> bytes:
+        if self._outbox:
+            return self._outbox.pop(0)
+        if self._token is None:
+            return b""
+        token, self._token = self._token, None
+        self._replies += 1
+        if self._replies == 2:
+            self._outbox.append(b"M 0 123456789\n")
+        if self._replies == 3:
+            self._outbox.append(b"H 0 987654321\n")
+        return f"R {token} {1000 * self._replies}\n".encode("ascii")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_the_serial_probe_measures_the_spread_not_just_the_mean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate HANDOFF.md puts on CL-007 is latency AND ITS VARIABILITY."""
+    import serial as pyserial
+
+    from consciousness_lab.verification import devices
+
+    monkeypatch.setattr(pyserial, "Serial", FakeSerialLink)
+    run = VerificationRun(
+        subject="qtpy-marker", purpose="p", method="m", device_firmware="qtpy-marker/1"
+    )
+    devices.capture_serial(run, "/dev/ttyACM0", seconds=5.0, pings=5)
+
+    round_trip = next(o for o in run.observations if "round-trip time" in o.what)
+    described = round_trip.value
+    # The spread is what the ticket is gated on, so it must be in the record.
+    for key in ("min", "max", "step_min", "n"):
+        assert key in described
+    assert "SPREAD" in round_trip.how
+
+
+def test_unanswered_pings_are_counted_rather_than_quietly_excluded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A latency figure over only the replies that arrived flatters the link."""
+    import serial as pyserial
+
+    from consciousness_lab.verification import devices
+
+    monkeypatch.setattr(pyserial, "Serial", FakeSerialLink)
+    run = VerificationRun(
+        subject="qtpy-marker", purpose="p", method="m", device_firmware="qtpy-marker/1"
+    )
+    devices.capture_serial(run, "/dev/ttyACM0", seconds=5.0, pings=4)
+    lost = next(o for o in run.observations if "unanswered" in o.what)
+    assert set(lost.value) == {"lost", "attempted"}
+
+
+def test_marks_keep_device_time_and_host_arrival_apart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TIMING.md rule 2: never overwrite a captured quantity with a derived one.
+
+    The device's own clock value and the host's arrival time are two different
+    quantities. The probe records both and derives neither from the other — no
+    offset, no drift, no "corrected" time.
+    """
+    import serial as pyserial
+
+    from consciousness_lab.verification import devices
+
+    monkeypatch.setattr(pyserial, "Serial", FakeSerialLink)
+    run = VerificationRun(
+        subject="qtpy-marker", purpose="p", method="m", device_firmware="qtpy-marker/1"
+    )
+    devices.capture_serial(run, "/dev/ttyACM0", seconds=5.0, pings=5)
+
+    marks = next(o for o in run.observations if o.what.startswith("marks that arrived"))
+    assert marks.value[0]["line"] == "M 0 123456789", "the device line is kept verbatim"
+    assert "host_arrival_ns" in marks.value[0]
+    labels = " ".join(o.what for o in run.observations).lower()
+    assert "offset" not in labels and "drift" not in labels and "corrected" not in labels
+
+
+def test_a_port_that_will_not_open_is_a_recorded_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import serial as pyserial
+
+    from consciousness_lab.verification import devices
+
+    def refuse(port: str, baudrate: int, timeout: float) -> None:
+        raise OSError(2, "No such file or directory")
+
+    monkeypatch.setattr(pyserial, "Serial", refuse)
+    run = VerificationRun(
+        subject="qtpy-marker", purpose="p", method="m", device_firmware="qtpy-marker/1"
+    )
+    devices.capture_serial(run, "/dev/nope", seconds=1.0, pings=2)
+    assert run.observations == []
+    assert any("could not open /dev/nope" in f for f in run.failures)
+
+
+def test_silence_names_the_two_likely_causes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A dead channel and a board without boot.py look identical; say both."""
+    from consciousness_lab.verification import devices
+
+    class Silent(FakeSerialLink):
+        def readline(self) -> bytes:
+            return b""
+
+    import serial as pyserial
+
+    monkeypatch.setattr(pyserial, "Serial", Silent)
+    run = VerificationRun(
+        subject="qtpy-marker", purpose="p", method="m", device_firmware="qtpy-marker/1"
+    )
+    devices.capture_serial(run, "/dev/ttyACM0", seconds=0.5, pings=2)
+    failure = next(f for f in run.failures if "no ping was answered" in f)
+    assert "marker firmware" in failure and "boot.py" in failure
+
+
+def test_the_edge_is_observed_before_it_is_timestamped() -> None:
+    """A mark must not be able to precede the observation that produced it.
+
+    Sampling the clock and THEN reading the GPIO biases every mark early by the
+    pin-read interval. It is small, but systematic rather than noise — the kind
+    of error that survives averaging and never announces itself. Asserted against
+    the source because CircuitPython cannot run here.
+    """
+    source = Path("firmware/qtpy_marker/code.py").read_text(encoding="utf-8")
+    # The LAST `while True:` is the polling loop. An earlier one is the
+    # fail-closed idle loop, which is allowed to sleep and must, so that a
+    # misconfigured board does not spin a core forever.
+    body = source.rsplit("while True:", 1)[1]
+
+    read_at = body.index("is_down = not button.value")
+    edge_at = body.index("edge_ns = time.monotonic_ns()")
+    assert read_at < edge_at, "the pin must be read before the clock is sampled"
+
+    # The edge timestamp is taken INSIDE the transition branch, not before it.
+    transition_at = body.index("if is_down and not was_down:")
+    assert transition_at < edge_at, "the timestamp must live inside the transition path"
+
+    # And the debounce decision comes after the timestamp exists.
+    debounce_at = body.index("DEBOUNCE_MS")
+    assert edge_at < debounce_at, "debounce must not precede the timestamp"
+
+    # The mark carries the edge clock, never the loop's housekeeping one.
+    mark_line = next(line for line in body.splitlines() if 'emit(f"M ' in line)
+    assert "edge_ns" in mark_line and "{now}" not in mark_line
+
+    assert "time.sleep" not in body, "a sleep in the poll loop widens detection jitter"
+    idle = source.split("while True:", 1)[1][: source.split("while True:", 1)[1].find("\n\n")]
+    assert "time.sleep" in idle, (
+        "the fail-closed idle loop must sleep; spinning a core because boot.py is "
+        "missing helps nobody"
+    )
+
+
+def test_the_marker_stream_never_falls_back_to_the_console() -> None:
+    """Fail closed. A record indistinguishable from console noise still looks like data.
+
+    The firmware used to fall back to `usb_cdc.console` when the dedicated data
+    channel was missing, so that a misconfigured board "still said something" —
+    which put marker records into the same stream as tracebacks, in exactly the
+    misconfiguration `boot.py` exists to prevent. Checked with `ast` rather than
+    by string search: what matters is that no assignment makes the console the
+    stream that marks are written to.
+    """
+    import ast
+
+    tree = ast.parse(Path("firmware/qtpy_marker/code.py").read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        names = {t.id for t in node.targets if isinstance(t, ast.Name)}
+        if "serial" not in names:
+            continue
+        source = ast.unparse(node.value)
+        assert "console" not in source, (
+            f"the marker stream must never become the console: {ast.unparse(node)}"
+        )
+    body = Path("firmware/qtpy_marker/code.py").read_text(encoding="utf-8")
+    assert "FATAL" in body, "the operator must be told why nothing is being acquired"
+    assert "POWER-CYCLE" in body, "and what to do, since boot.py only runs at reset"
+
+
+def test_a_switch_held_at_boot_cannot_synthesise_a_mark() -> None:
+    """Every M must correspond to a transition that was actually observed.
+
+    `was_down = False` meant a switch already held when the loop starts satisfies
+    `is_down and not was_down` on the very first sample, emitting an M for a
+    high->low transition nobody saw. A record whose stated meaning is false is
+    the one thing this device must not produce.
+
+    Asserted structurally: the initial value must come from reading the pin, not
+    from a literal.
+    """
+    import ast
+
+    tree = ast.parse(Path("firmware/qtpy_marker/code.py").read_text(encoding="utf-8"))
+    initialisers = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "was_down" for t in node.targets)
+    ]
+    assert initialisers, "was_down must be initialised somewhere"
+    first = ast.unparse(initialisers[0].value)
+    assert not isinstance(initialisers[0].value, ast.Constant), (
+        f"was_down starts from a literal ({first}), so a switch held at boot emits a "
+        "mark for a transition nobody observed"
+    )
+    assert "button.value" in first, f"it must be armed from the pin's actual state: {first}"
+
+
+def test_the_edge_rule_would_not_fire_on_a_switch_held_at_boot() -> None:
+    """The rule itself, exercised. The firmware cannot run here; its logic can.
+
+    Mirrors `is_down and not was_down` against the two startup states, so the
+    regression is behavioural and not only structural.
+    """
+
+    def marks(samples: list[bool], armed_from_pin: bool) -> int:
+        was_down = samples[0] if armed_from_pin else False
+        emitted = 0
+        for is_down in samples:
+            if is_down and not was_down:
+                emitted += 1
+            was_down = is_down
+        return emitted
+
+    held_then_released_then_pressed = [True, True, False, False, True]
+    assert marks(held_then_released_then_pressed, armed_from_pin=True) == 1, (
+        "one real press after the release; the boot state is not a transition"
+    )
+    assert marks(held_then_released_then_pressed, armed_from_pin=False) == 2, (
+        "the old initialisation invents a mark at boot — this is what regressed"
+    )
+    released_at_boot = [False, False, True, False, True]
+    assert marks(released_at_boot, armed_from_pin=True) == 2, "normal presses still count"
+
+
+def test_the_marker_files_do_not_discuss_detection_at_all() -> None:
+    """After the strip, behaviour is HARDWARE.md's job and only its job.
+
+    The earlier version of this test required the marker files to *deny*, in
+    prose, that `probe serial` measures button detection. That denial was itself
+    prose about behaviour, and prose about behaviour in these files is what
+    eleven review rounds kept finding wrong. So the files no longer discuss it;
+    the statement lives where statements about devices belong.
+    """
+    for path in ("firmware/qtpy_marker/code.py", "firmware/qtpy_marker/README.md"):
+        text = Path(path).read_text(encoding="utf-8")
+        assert "probe serial" not in text, f"{path} discusses a measurement it cannot make"
+        assert "HARDWARE.md" in text, f"{path} must point at where behaviour is recorded"
+
+
+def test_the_strip_relocated_the_knowledge_rather_than_deleting_it() -> None:
+    """A strip that loses what was known is not a cleanup, it is a regression.
+
+    Everything the marker files used to assert has to still be written down
+    somewhere — and somewhere that marks it Unknown, which is exactly what
+    HARDWARE.md is for.
+    """
+    hardware = Path("docs/HARDWARE.md").read_text(encoding="utf-8")
+    marker = hardware[hardware.index("**QT Py marker channel.**") :]
+    marker = marker[: marker.index("\n- **")]
+    for fact in (
+        "never been flashed",
+        "Serial round-trip latency",
+        "unmeasured",
+        "clock resolution",
+        "polls",
+    ):
+        assert fact in marker, f"the strip lost {fact!r} instead of relocating it"
+
+
+def test_the_gate_change_is_recorded_rather_than_routed_around() -> None:
+    """AGENTS.md §2: a repository gate is not stepped over quietly."""
+    handoff = Path("docs/HANDOFF.md").read_text(encoding="utf-8")
+    assert "Gate amended" in handoff
+    assert "D42" in handoff
+    # The original wording is preserved above the amendment, not edited away.
+    assert "Do not start it before CL-004 has measured serial round-trip latency" in handoff
+    # And the amendment is explicit that nothing has actually been measured.
+    assert "No physical measurement has been taken" in handoff
+
+    decisions = Path("docs/DECISIONS.md").read_text(encoding="utf-8")
+    assert "## D42" in decisions
+    assert "Decided by Erandi" in decisions.split("## D42")[1][:400], "authorisation is attributed"
+
+
+def test_the_firmware_makes_no_electrical_contact_with_a_participant() -> None:
+    """A switch to a GPIO and ground, and nothing driven anywhere.
+
+    SAFETY.md S6 forbids inventing electrical limits; the way to obey it is to
+    build something with no electrical interface to a person at all.
+    """
+    source = Path("firmware/qtpy_marker/code.py").read_text(encoding="utf-8")
+    assert "Direction.OUTPUT" not in source, "nothing may be driven out"
+    assert "analogio" not in source and "AnalogOut" not in source
+    assert "digitalio.Direction.INPUT" in source
+
+
+# --------------------------------------------- the Mac bootstrap is honest
+
+
+def test_the_bootstrap_script_is_valid_bash_and_idempotent_by_construction() -> None:
+    """It runs on a machine that is not this one, so it gets checked here.
+
+    A broken bootstrap is discovered at the bench, which is the most expensive
+    place to discover anything.
+    """
+    import subprocess
+
+    script = Path("scripts/bootstrap-mac.sh")
+    assert script.is_file() and script.stat().st_mode & 0o111, "must be executable"
+    syntax = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
+    assert syntax.returncode == 0, syntax.stderr
+
+    source = script.read_text(encoding="utf-8")
+    # Re-runnable: it must not assume a fresh machine.
+    assert "already inside the checkout" in source
+    assert "if command -v uv" in source, "an existing uv must not be reinstalled"
+    # It ends by producing evidence rather than by declaring success.
+    assert "probe env" in source
+
+
+def test_the_bootstrap_does_not_pretend_to_grant_bluetooth_permission() -> None:
+    """Only a human clicking in System Settings can, and saying otherwise wastes a session."""
+    source = Path("scripts/bootstrap-mac.sh").read_text(encoding="utf-8")
+    assert "cannot do" in source
+    assert "Privacy & Security" in source
+    assert "looks switched off" in source, "the symptom must be named, not just the fix"
+
+
+def test_the_bench_runbook_orders_solo_probes_before_the_concurrent_one() -> None:
+    """Step 7 has nothing to compare against unless 4 and 5 ran alone first."""
+    doc = Path("docs/HARDWARE.md").read_text(encoding="utf-8")
+    bench = doc[doc.index("### A bench session, in order") :]
+    for earlier, later in (("probe scan", "probe polar"), ("probe muse", "probe concurrent")):
+        assert bench.index(earlier) < bench.index(later), f"{earlier} must precede {later}"
+    assert "must run **alone** before step 7" in bench
+
+
 # ------------------------------------------------- hardware tests are excluded
 
 

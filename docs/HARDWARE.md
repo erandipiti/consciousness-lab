@@ -15,7 +15,7 @@ Planned devices for Study 001, and the verification status of each.
 |---|---|---|---|---|
 | Muse S Athena | EEG (and whatever else the device exposes) | BLE | `brainflow` | **Pending verification** — never connected |
 | Polar H10 | Cardiac | BLE | `polar-python` (over `bleak`) | **Pending verification** — never connected |
-| Adafruit QT Py | Marker / synchronisation channel | USB serial | `pyserial` | **Pending verification** — no firmware written |
+| Adafruit QT Py | Marker / synchronisation channel | USB serial | `pyserial` | **Pending verification** — firmware written (CL-007-A), never flashed |
 
 ## What "verified" means here
 
@@ -49,10 +49,20 @@ These are unverified and are recorded so they can be checked, not relied on.
   Its maintenance status, its coverage of the device's data streams, and the
   fidelity with which it exposes device-side timing are all unverified. Whether
   the study needs streams this library does not expose is an open question.
-- **QT Py marker channel.** No firmware exists in `firmware/`. The marker
-  mechanism, its electrical interface, and how a marker is placed on a common
-  timeline with the BLE streams are undesigned. Serial round-trip latency and
-  its variability are unmeasured.
+- **QT Py marker channel.** Firmware now exists in `firmware/qtpy_marker/`
+  (CL-007-A) and **has never been flashed to a board**. Nothing about it has been
+  observed: not that it runs, not that it enumerates as a serial device, not that
+  it emits a single line. Serial round-trip latency and its variability remain
+  unmeasured, and so does the gap between a switch closing and the firmware
+  observing it — the firmware polls, so a mark is the time an edge was *seen*,
+  never the edge itself, and no bench setup exists that would measure the
+  difference. The board's clock resolution is unmeasured too: the firmware
+  prints nanoseconds, which is a fact about the format and not about the clock.
+
+  The marker mechanism, its electrical interface, and how a marker is placed on
+  a common timeline with the BLE streams remain **undesigned and gated**
+  (`DECISIONS.md` D42). Code existing is not a device behaving: this row stays
+  *Pending verification* until someone connects the unit and observes it.
 - **BLE generally.** Concurrent connections to two BLE peripherals from one
   host adapter, and the effect of that on packet-arrival jitter, are unmeasured.
   Assume nothing about co-existence until it is tested.
@@ -67,6 +77,21 @@ These are unverified and are recorded so they can be checked, not relied on.
 - Does the study require a hardware synchronisation path between devices, or is
   post-hoc alignment sufficient? Undecided, and it depends on measurements that
   have not been taken.
+- **Does striking a device produce a transient in its accelerometer, and is that
+  transient sharp enough to time?** Unknown for both the Athena and the H10.
+- **Does one cough produce a transient in the accelerometers of a head-worn and a
+  chest-worn device at once, and do those two transients share an identifiable
+  feature to align on?** Unknown. It is not an impulse — it has a build-up and a
+  duration, neither of them measured here — so even if both devices register it,
+  which instant either one marks is a separate unknown.
+
+  These two arise from a proposal by Erandi (2026-09-10): strike the forehead
+  with the marker's button so one physical event is both a mark and a mechanical
+  shock, and use a cough as a cross-device check. **It is recorded here as
+  questions, not as a design.** Whether any of it works is what `probe muse`,
+  `probe polar` and `probe concurrent` would show, and none has been run.
+  Designing an alignment mechanism on the strength of it is gated by
+  `DECISIONS.md` D42.
 
 ## Producing the evidence (CL-004)
 
@@ -87,6 +112,10 @@ uv run consciousness-lab probe reconnect  --device muse  --purpose "..." --firmw
 
 # two peripherals on one adapter, which HARDWARE.md calls unmeasured
 uv run consciousness-lab probe concurrent --polar-address "..." --purpose "..." --firmware "..." --method "..."
+
+# the marker channel's round trip AND ITS SPREAD — the gate CL-007 sits behind.
+# Bench only: no BLE, no participant.
+uv run consciousness-lab probe serial --port /dev/cu.usbmodem101 --purpose "..." --firmware "qtpy-marker/1" --method "..."
 ```
 
 `reconnect` records cycle 0 and cycle 1 under prefixed names and **computes no
@@ -118,6 +147,85 @@ produces no session package, and its output must not become study data.
 Run `probe scan` before blaming a device. A host with no Bluetooth stack and a
 device that is switched off look identical from inside a library that simply
 times out, and confusing the two costs a bench session.
+
+### Setting up the recording host (macOS)
+
+The Mac is the recording host (`DECISIONS.md` D41). Three lines, then a script
+that does the rest and checks its own work:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+git clone https://github.com/erandipiti/consciousness-lab.git
+cd consciousness-lab && ./scripts/bootstrap-mac.sh
+```
+
+`bootstrap-mac.sh` is idempotent, installs nothing silently, and finishes by
+running `probe env` — so the first thing that happens on the machine is evidence
+about it rather than an assumption. The lock is already resolved for macOS
+(`bleak` pulls `pyobjc-framework-corebluetooth` under a `sys_platform ==
+'darwin'` marker), so `uv sync --locked` needs no special handling.
+
+**The one thing no script can do, and it looks exactly like broken hardware.**
+CoreBluetooth grants Bluetooth access to the *application*, and a terminal does
+not have it by default. Without it every scan returns nothing and every device
+looks switched off.
+
+> System Settings → Privacy & Security → Bluetooth → enable your terminal,
+> then **quit and reopen** the terminal — a new tab is not enough.
+
+That is why `probe scan` exists and why it comes before every device probe: a
+host with no permission and a device with a flat battery are indistinguishable
+from inside a library that simply times out.
+
+Serial ports are `/dev/cu.usbmodem*` on macOS, not `/dev/ttyACM*`.
+
+### A bench session, in order
+
+The order is not arbitrary. Each step either produces evidence the next one
+needs, or separates a host problem from a device problem before you can waste an
+hour confusing them.
+
+| # | command | what it settles |
+|---|---|---|
+| 1 | `probe env` | is this host capable at all — before any device is blamed |
+| 2 | `probe scan` | does the host *see* anything; gets you the H10's address |
+| 3 | `probe serial --port /dev/cu.usbmodem*` | the marker's round trip and its spread. No BLE, no participant — do it while the others charge |
+| 4 | `probe muse` | what the Athena actually delivers, alone |
+| 5 | `probe polar --address <from step 2>` | what the H10 actually delivers, alone |
+| 6 | `probe reconnect --device muse` | what a reconnect does to counters and timebase |
+| 7 | `probe concurrent --polar-address <…>` | whether one adapter sustains both |
+
+Steps 4 and 5 must run **alone** before step 7, or step 7 has nothing to be
+compared against — and the comparison is the operator's, not the probe's.
+
+Every command needs `--purpose` and `--method` in your own words, and a device
+command needs `--firmware`. They have no defaults and the run refuses to be
+written without them: they are part of what a verification *is* (`AGENTS.md`
+§7), and a report missing its provenance is worse than no report because it
+still looks like evidence.
+
+**When something fails, read the failure before re-running.** A failure is a
+recorded finding, not an error to retry past. "No notification arrived" and "the
+scan saw nothing" mean different things and point at different halves of the
+system.
+
+### Getting the evidence back to mimisbrunnr
+
+```bash
+rsync -av data/verification/ mimisbrunnr:~/projects/consciousness-lab/data/verification/
+rsync -av data/sessions/     mimisbrunnr:~/projects/consciousness-lab/data/sessions/
+```
+
+Copying whole directories is not a workaround. `SESSION_FORMAT.md` Q8 makes the
+entire `sessions/<id>/` directory the canonical, independently interpretable
+unit, with the registry rebuildable by scanning packages — moving a session
+between hosts is what the format was built for. Rebuild the index after:
+
+```bash
+uv run python -c "from consciousness_lab.session import registry; \
+from consciousness_lab.storage.paths import DataRoot; \
+from pathlib import Path; registry.rebuild(DataRoot(Path('data')))"
+```
 
 ### Host readiness — observed, not a device verification
 

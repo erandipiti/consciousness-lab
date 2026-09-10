@@ -9,6 +9,363 @@ Versioning policy is unresolved — see `docs/OPERATIONS.md`.
 
 ## [Unreleased]
 
+### Added — CL-007-A: QT Py marker firmware, the serial probe, and the recording host
+
+**`firmware/qtpy_marker/`** — CircuitPython for the marker channel: a switch that
+reports, over USB serial, the device-clock time at which its polling loop first
+*observed* the input go low. Not when the switch physically closed, which is
+earlier by an unmeasured amount. That is all it is, and the README says so:
+placing even that instant on a BLE stream's timeline is still the open question
+`TIMING.md` calls the hardest in the study.
+
+- The timestamp is taken on the **first edge**, before debouncing and before any
+  serial write. Debounce first and you have added an unmeasured delay to a
+  device whose whole purpose is knowing when. A test asserts the ordering
+  against the source, since CircuitPython cannot run here.
+- Device time and host arrival time are kept as **two quantities** and neither is
+  derived from the other (`TIMING.md` rule 2). Periodic heartbeats exist so the
+  offset between the clocks can be watched and its *drift* measured rather than
+  an offset taken once being assumed to hold.
+- `boot.py` gives marks their own USB serial channel, so a traceback on the
+  console can never land inside the data stream.
+- **No electrical contact with a participant**: a switch, a GPIO, and ground.
+  Nothing is driven anywhere, and tests assert there is no output pin and no
+  analog out. A version that injects into an EEG channel is a different device
+  and a different decision, needing the exact model, its ADC limits, and a named
+  human (`SAFETY.md` S6).
+
+**`probe serial`** — closes the gate `HANDOFF.md` puts on CL-007: round-trip
+latency **and its variability**. Token-matched, so a late reply cannot pass as a
+prompt one, and unanswered pings are counted rather than quietly excluded — a
+latency figure over only the replies that arrived flatters the link. It
+interprets nothing: no offset, no drift, no corrected time.
+
+This also closes a contradiction: CL-004's acceptance said the QT Py was out of
+scope, while `HANDOFF.md` gated CL-007 on CL-004 having measured serial latency.
+The probe is the measurement; it needs no marker design and no participant.
+
+**`DECISIONS.md` D41 — the Mac records, mimisbrunnr stores and processes.**
+Decided by Erandi. Session packages are designed to move between hosts
+(`SESSION_FORMAT.md` Q8), so the split costs nothing structurally. Consequence:
+every device row must be verified **on the Mac**, and the BlueZ finding recorded
+on mimisbrunnr transfers to nothing. WSL was rejected on architecture: WSL2 has
+no path to the host Bluetooth adapter without a passed-through dongle and a
+custom kernel.
+
+`HARDWARE.md` gains the macOS setup, including the CoreBluetooth permission that
+makes every device look switched off when a terminal does not hold it.
+
+**Corrected before review returned (CL-007-A-R1).** Two things:
+
+- **`capture_polar` started ECG and nothing else.** The accelerometer is the
+  channel that carries a physical event, so an ECG-only capture left the whole
+  alignment question unmeasurable while looking like a working capture — the
+  exact failure this package exists to prevent. It now starts every stream the
+  device offers that polar-python can start, with every parameter read from the
+  device's own settings response and gaps *reported* rather than filled in. A
+  feature the library cannot start is a recorded finding about the library.
+- **A settings-matching bug** meant no parameter was ever resolved: the device
+  labels a setting `SAMPLE_RATE` while the library's parameter is `sample_rate`,
+  and the comparison was case-sensitive, so it silently matched nothing and read
+  as "the device did not answer".
+
+The firmware README's section on striking was rewritten. The design was always
+that **the button is the striking face** — the impact presses the switch — and
+the previous text framed that as a correction rather than as the design. It now
+lays out the alignment chain honestly: two sharp, marker-timestamped legs from
+striking each device, with a cough as the independent cross-check that both
+sensed one physical event. A cough is a few hundred milliseconds with a
+build-up, so its instant is ambiguous; it is the right confirmation and the
+wrong ruler.
+
+**The Mac, prepared (D41).** `scripts/bootstrap-mac.sh` — idempotent, installs
+nothing silently, and finishes by running `probe env`, so the first thing that
+happens on that machine is evidence about it rather than an assumption. It is
+honest about the one thing it cannot do: CoreBluetooth grants Bluetooth access
+to the *application*, and without it every scan returns nothing and every device
+looks switched off. The script names the symptom, not just the fix.
+
+Checked rather than assumed: `uv.lock` already resolves for macOS — `bleak`
+pulls `pyobjc-framework-corebluetooth` under a `sys_platform == 'darwin'` marker
+and BrainFlow ships a `py3-none-any` wheel — so `uv sync --locked` needs no
+special handling on the Mac. That was the risk worth finding before a bench
+session, not during one.
+
+`HARDWARE.md` gains **a bench session in order**, because the order is not
+arbitrary: each step either produces evidence the next needs, or separates a
+host problem from a device problem before an hour is spent confusing them. The
+solo Muse and Polar probes must run before the concurrent one or there is
+nothing for it to be compared against — and the comparison is the operator's,
+not the probe's. Plus how to move evidence and sessions back to mimisbrunnr,
+which is what `SESSION_FORMAT.md` Q8 designed the package to allow.
+
+**Corrected in review (CL-007-A-R3).** Three findings, all correct:
+
+- **The clock was sampled before the GPIO was read**, so a mark could precede the
+  observation that produced it — biased early by the pin-read interval, and
+  systematic rather than noise, which is the kind of error that survives
+  averaging and never announces itself. The pin is now read first and the clock
+  sampled *inside* the transition. The test previously only proved the timestamp
+  preceded debounce; it now proves it follows the observation.
+- **The firmware and README claimed `probe serial` measures the polling loop's
+  detection jitter. It does not** — that probe times a ping reply and never
+  touches the button or the GPIO. Claiming a quantity is measured by something
+  that does not measure it is the exact failure this project exists to prevent,
+  and it was in code written to prevent it. The number is now stated as
+  unmeasured, with the bench setup that *would* establish it named and marked as
+  not existing.
+- **The CL-007 gate was routed around.** `HANDOFF.md` forbade starting CL-007
+  before CL-004 had measured serial round-trip latency, and this ticket shipped
+  firmware with no measurement taken. The gate is now amended on the record
+  (`DECISIONS.md` D42, authorised by Erandi), with the original wording preserved
+  above the amendment: it was **unsatisfiable as written**, because `probe
+  serial` needs a device that replies, so "CL-004 measures serial RTT"
+  presupposed the firmware CL-007 was forbidden to build. Only the *instrument*
+  half moved. The alignment design stays gated, and the amendment says plainly
+  that no physical measurement exists — the firmware has never been flashed.
+
+**Corrected in review again (CL-007-A-R4).** The firmware README designed the
+very thing D42 — written in this same change — says stays gated, and asserted
+device behaviour nobody has observed. A rule broken by the change that
+introduced it is worse than no rule.
+
+- The "striking with the button" section is **gone**: the physical mechanism, the
+  three-link alignment chain, and the cross-device check were alignment design.
+- With it went claims like *"a cough is genuinely sensed by both"* and *"exactly
+  the right instrument"* — statements about how devices and bodies behave, with
+  no observation behind them (`AGENTS.md` §7).
+- The README now says only what the device is, that relating a mark to any stream
+  is undesigned and gated, and where the open questions live.
+- **The proposal is not lost.** It is recorded in `HARDWARE.md` → Open questions
+  as two questions, attributed and marked Unknown, with a note that it is
+  recorded as questions and not as a design.
+
+**A flaky test on `main`, found and fixed.** `test_no_packet_can_appear_after_the
+_final_drain` and its sibling asserted `refused >= 1`, which is a matter of where
+a producer thread happened to be when the join window expired — a schedule, not a
+guarantee. They failed roughly half the time. Both now assert the actual
+invariant: an abnormal end is *recorded* one way or the other and can never read
+as clean. The refusal path itself stays deterministically pinned by the
+`_Handoff` unit test that drives the barrier directly. 25 consecutive recorder
+runs green, 5 consecutive full runs green.
+
+**Corrected in review a third time, and then made mechanical (CL-007-A-R5).**
+R4 removed the unverified device claims from the firmware README — and left the
+same claims in `devices.py` and in a test docstring. *"The accelerometer is the
+channel that carries a tap or a cough"* is a statement about what a device
+senses, in source, while `HARDWARE.md` records exactly that as **Unknown**. The
+code contradicted the documentation of the same repository.
+
+The claims are gone. The capture's stated reason is now the only one available
+without interpreting anything: **the device offers the stream, therefore it is
+recorded.** Choosing a subset would require knowing what each stream is for,
+which is what has not been established.
+
+**That is three consecutive rounds of one defect class** — an unobserved device
+claim, in a different file each time, surviving because each fix was aimed at the
+file rather than the mistake. `DECISIONS.md` D27 records the project's own rule
+for this: when successive rounds keep finding new instances of one class, the
+defect is not the instances.
+
+So `tests/test_vocabulary.py` now enforces it. Code may not name a physical event
+a person might produce — not in a comment, not in a docstring, not in a test —
+because naming one means the code has decided what a signal is *for*. Proposals
+live in `HARDWARE.md` as open questions. The guard matches whole words only, and
+its own tests prove both that it catches the exact sentence that got through
+three times and that it does not fire on ordinary prose; the flashing
+instruction that collided with it was reworded rather than exempted, because a
+guard with exceptions accumulates exceptions until it means nothing.
+
+**Corrected in review (CL-007-A-R6) — the authority documents contradicted the
+tree.** Adding firmware made four statements false and none of them was updated:
+`HARDWARE.md`'s status row still said *no firmware written*, its assumptions
+section still said *No firmware exists in `firmware/`*, `firmware/README.md`
+still said *Empty at CL-001*, and `HANDOFF.md`'s layer table still said the
+acquisition layer had no firmware. `HARDWARE.md` is the project's authority on
+what exists versus what is assumed versus what is verified; a change that
+invalidates one of its statements and leaves it standing turns the authority into
+a liar, quietly, because nothing fails.
+
+All four corrected to the truthful boundary, and the boundary is the point:
+**firmware exists and has never been flashed.** The QT Py row still reads
+*Pending verification*. Nothing about the firmware's behaviour has been observed
+— not that it runs, not that it enumerates as a serial device, not that it emits
+one line. Serial round-trip latency stays unmeasured, detection jitter stays
+unmeasured with no bench setup that would measure it, and the marker mechanism
+stays gated by D42. **Code existing is not a device behaving**, and the documents
+now say so in those words.
+
+`tests/test_documents_match_the_tree.py` makes it mechanical. Statements that can
+be checked against the filesystem are, in both directions — a document may not
+claim firmware is absent while it is present, nor present once it is gone — and
+the QT Py row is separately asserted to still read *Pending verification*, because
+the risk in updating a document to admit code exists is that it drifts toward
+sounding verified. The guard was tested by reintroducing the false statement and
+confirming it fails.
+
+This is the second time stale status statements needed a ticket: CL-003-R3 existed
+only to correct three that had been false since CL-002B.
+
+**Corrected in review (CL-007-A-R7) — two timing claims nobody had measured.**
+Same class as R3–R5, escaping through a guard that was too narrow: the vocabulary
+check catches code *naming a physical event*, and neither of these named one.
+
+- **The marker said it reports "exactly when it was pressed."** It polls. It can
+  only report the device-clock time at which the loop *first observed* the input
+  go low; the physical closure is earlier by an interval this same head records
+  as unmeasured. A claim contradicted by a document in the same commit, for the
+  second time in this PR. `M` is now described as the first **observed** high→low
+  transition, with the gap to the physical edge kept explicit in both the
+  firmware and its README.
+- **The boot banner hard-coded `ns_per_tick` to `1`.** `time.monotonic_ns()`
+  returning integer nanoseconds says nothing about the board's tick — a coarse
+  clock scaled into nanoseconds is indistinguishable from a fine one at this end.
+  The banner now reports `time_unit=ns resolution=unmeasured`: the representation
+  is knowable from here and is stated as fact, the resolution is not and says so.
+
+The guard is widened rather than the instances patched, which is the third time
+that has been the right move in this PR. `test_vocabulary.py` now also refuses
+absolute-precision phrasing in the marker files, requires them to say the mark is
+an *observation* and to keep the gap *unmeasured*, and forbids any per-tick number
+in the banner. Both new guards were verified by reintroducing the exact defect and
+confirming they fail.
+
+**Corrected in review (CL-007-A-R8) — R7's fix, undone three paragraphs later.**
+The README's opening correctly said `M` is the first *observed* transition, and a
+later section still said *"this firmware reports when its switch closed"*. Same
+defect, same file, same head. A second instance sat in this changelog.
+
+The deeper problem was the guard R7 added: it checked that the honest words were
+**present** somewhere in the file, which a contradiction elsewhere passes
+trivially. Presence is not absence.
+
+- The guard is now **sentence-level and wrap-proof**. A reporting verb paired with
+  the physical event, in a sentence that never says *observed*, fails. Whitespace
+  is normalised first, because the sentence that survived a whole review round did
+  so by being split across two lines — including one wrap introduced by the very
+  edit that was fixing it.
+- It reads **prose only**. A first version split `.py` files on periods, joined a
+  trailing comment to the next `def`, and invented a sentence nobody wrote;
+  comments and docstrings are extracted properly now.
+- `CHANGELOG.md` is deliberately outside its scope: a history that quotes a past
+  error while describing its fix is doing its job.
+
+Verified by reintroducing the exact two-line-wrapped sentence and confirming it
+fails.
+
+**Corrected in review (CL-007-A-R9) — source still enforced the rule this PR
+repealed.** `capture_serial`'s docstring said *"the marker firmware cannot be
+designed until serial round-trip latency and its variability are measured"*. D42,
+added in this same pull request, says the opposite: the **instrument** — firmware
+that answers a ping, and the probe that times it — is a prerequisite *for* the
+measurement and had to exist first; only the mechanism and its electrical
+interface stay gated. The repository was giving two incompatible instructions in
+one commit, and closing exactly that contradiction was in this ticket's objective.
+
+Both gate statements in `src/` now match D42. A sweep found the second one in
+`probe.py`, which said *mechanism* and was already correct but read ambiguously;
+it now names what is gated and what is not.
+
+The class is R6's — prose contradicting an authority — one level up: not a
+document against the tree, but source against a **decision**. So it is guarded
+the same way. A sentence in `src/` that asserts something is gated on a
+measurement, names the firmware or the probe, and does not name the mechanism,
+alignment or electrical interface, now fails. Verified by reintroducing the
+superseded wording.
+
+**Corrected in review (CL-007-A-R10) — a number nobody measured, and a quantity
+called something it is not.**
+
+- The firmware and its README said BLE arrives with *"tens to hundreds of
+  milliseconds"* of latency. No device has been connected, `HARDWARE.md` records
+  that timing as unmeasured, and there was no source: the number was there to
+  sound authoritative. Saying *unmeasured* in the same sentence does not license
+  it — **the number is the claim**. Removed, with the absence stated: no figure
+  appears because nobody has one. Sweeping first found a third instance the
+  review did not name, in `HARDWARE.md`'s own open question, which asserted how
+  long a cough lasts.
+- `capture_serial`'s docstring called the round-trip spread *device jitter* and
+  said it determines whether a mark is trustworthy. A round trip is host
+  scheduling plus USB plus firmware service time plus the return path, summed;
+  it is none of `TIMING.md`'s narrowly defined terms. The result now keeps the
+  only name it has earned — serial round-trip latency and its variability — and
+  says that deriving anything else from it would need a stated procedure and
+  evidence, neither of which exists.
+
+Both guarded. A **vague or ranged magnitude** in a claim surface now fails, on the
+line that a configuration value is always one exact number, so `every 10 s` stays
+legal while *"tens to hundreds"* cannot. And the serial probe may not rename what
+it measured. Both verified by reintroducing the exact defect.
+
+**Corrected in review (CL-007-A-R11).**
+
+- **Two semantic variants of the observed-vs-physical collapse.** `code.py` said
+  the device "records when the thing happened by its own clock" and that
+  debouncing after the timestamp keeps the mark "true to first contact". Both
+  name the physical event as the thing being timed, which the same file's
+  contract denies. The sentence guard missed them because it required a
+  reporting verb beside an edge word, and neither phrasing had that shape — the
+  defect is semantic, so a guard built on one phrasing catches one phrasing. The
+  verb and event-noun lists are widened accordingly.
+- **Universal claims about a board nobody has connected.** `code.py` said `A0`
+  exists on every QT Py variant and named a subset, and that current boards ship
+  CircuitPython 9.x; the README repeated the pin claim. A pinout is a device fact
+  like any other, and `HARDWARE.md` does not record which model this even is.
+  Both now say to read the pinout and the CircuitPython version off the board in
+  hand. A new guard refuses universal or version claims about hardware while
+  allowing instructions to go look.
+
+All three variants verified by reintroducing them and confirming the guards fail.
+
+**Corrected in review (CL-007-A-R12) — two integrity defects in the firmware
+itself, not in its prose.**
+
+- **The marker stream failed open.** When `usb_cdc.data` was unavailable the
+  firmware fell back to `usb_cdc.console` and emitted the whole protocol there —
+  in exactly the misconfiguration `boot.py` exists to prevent, putting marker
+  records in the same stream as tracebacks. A record indistinguishable from
+  console noise is worse than no record, because it still looks like data. It now
+  **fails closed**: nothing is acquired, the console gets one explanation naming
+  the fix and that `boot.py` runs only at reset, and the board idles.
+- **A mark could be synthesised at boot.** `was_down` started at `False`, so a
+  switch already held when the loop starts satisfied `is_down and not was_down`
+  on the first sample and emitted an `M` for a transition nobody observed — a
+  record whose stated meaning is false, which is the single thing this device
+  must not produce. It is now armed from the pin's actual state, so a held switch
+  is simply seen as down and the next mark waits for a real release and press.
+
+Both regressed structurally with `ast` — no assignment may make the console the
+marker stream, and `was_down` may not start from a literal — and the edge rule is
+also exercised behaviourally against boot-with-switch-held, which is the case that
+regressed. Both verified by reintroducing the original bug.
+
+**The strip (CL-007-A-R13), decided by Erandi.** Eleven of twelve review rounds
+found the same root cause: these files explained themselves in prose, and prose
+about an unconnected device is where the wrong claims kept coming from. Six
+guards had been added to police that prose. The proportionate answer was to stop
+having the prose.
+
+`firmware/qtpy_marker/` is now wiring, flashing steps, the wire protocol, and the
+comments that explain why the *code* is shaped as it is — 380 lines down to 226.
+**Every statement about how the device behaves lives in `docs/HARDWARE.md`**, the
+document built to mark what is verified, what is assumed and what is Unknown.
+
+Deliberately kept, because they are not behaviour claims: the safety property
+(no conductor between this device and a person, verifiable by inspection), and
+the code rationale that stops the next reader breaking an invariant — read the
+pin before the clock, debounce after the timestamp, arm from the pin's real
+state, fail closed without the data channel.
+
+The two guards that broke were replaced by **stronger** rules rather than
+relaxed: the marker files may not discuss detection at all and must point at
+`HARDWARE.md`, the README is size-bounded so the strip cannot silently undo
+itself, and a new test asserts the strip **relocated** the knowledge instead of
+deleting it — every fact the files used to assert must still be in `HARDWARE.md`,
+marked Unknown.
+
+**41 new tests** (510 → 551, plus 1 deselected).
+
+
 ### Added — CL-004: hardware verification harness
 
 Hardware is in hand. It does not unlock writing device adapters — it unlocks

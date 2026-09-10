@@ -294,10 +294,69 @@ def _capture_polar_gatt(run: VerificationRun, seconds: float, address: str) -> N
         )
 
 
+#: Feature name fragment -> the polar-python method that starts that stream.
+#: Only what the library actually exposes a starter for; anything else is
+#: recorded as unstartable rather than silently skipped.
+_PMD_STARTERS = {
+    "ECG": "start_ecg_stream",
+    "ACC": "start_acc_stream",
+    "GYRO": "start_gyro_stream",
+}
+
+
+def _settings_to_kwargs(settings: Any, wanted: set[str]) -> tuple[dict[str, int], list[str]]:
+    """Read a stream's parameters out of the DEVICE's own settings response.
+
+    Returns (kwargs, unresolved). Choosing a sample rate, resolution or range in
+    our code would be inventing a device parameter — the exact thing this
+    package exists not to do — so every value comes from what the device
+    answered, and anything it did not answer is reported unresolved rather than
+    filled in with something plausible.
+
+    The setting objects' attribute names vary by library version, so several are
+    tried and whatever is found is used; nothing is assumed about their shape.
+    """
+    found: dict[str, int] = {}
+    for setting in getattr(settings, "settings", None) or []:
+        label = str(getattr(setting, "type", "")).upper()
+        values: list[Any] = []
+        for attribute in ("array_length", "values", "value", "settings"):
+            candidate = getattr(setting, attribute, None)
+            if isinstance(candidate, (list, tuple)) and candidate:
+                values = list(candidate)
+                break
+            if isinstance(candidate, int):
+                values = [candidate]
+                break
+        if not values:
+            continue
+        # Case-insensitive: the device labels settings SAMPLE_RATE while the
+        # library's parameter is sample_rate, and comparing them as-is silently
+        # matches nothing — which reads as "the device did not answer".
+        flattened = label.replace("_", "").lower()
+        for key in wanted:
+            if key.replace("_", "").lower() in flattened:
+                found[key] = int(values[0])
+    return found, sorted(wanted - set(found))
+
+
 def _capture_polar_pmd(run: VerificationRun, seconds: float, address: str) -> None:
-    """The streams that need a control-point handshake, via polar-python."""
+    """Start every stream the device offers that this library can start.
+
+    Every one, not a chosen subset. Deciding in advance which streams are worth
+    recording would require knowing what each is for, and what any of these
+    streams is good for is exactly what has not been established — `HARDWARE.md`
+    records it as open. A capture that quietly dropped streams on a guess about
+    their usefulness would look like it worked while making the discarded ones
+    permanently unmeasurable.
+
+    So the rule is the only one available without interpreting anything: **the
+    device offers it, therefore it is recorded.** Nothing here decides what any
+    stream is, what a value in it means, or what it might later be good for.
+    """
     try:
         import asyncio
+        import inspect
 
         from polar_python import PolarDevice
     except Exception as exc:
@@ -305,60 +364,20 @@ def _capture_polar_pmd(run: VerificationRun, seconds: float, address: str) -> No
         return
 
     async def _stream() -> dict[str, Any]:
-        received: list[dict[str, Any]] = []
-        arrivals: list[float] = []
+        arrivals: dict[str, list[float]] = {}
+        frames: dict[str, list[dict[str, Any]]] = {}
         features: list[str] = []
         settings_seen: list[dict[str, Any]] = []
-        used: dict[str, Any] = {}
+        used: dict[str, dict[str, int]] = {}
+        problems: list[str] = []
 
-        device = PolarDevice(address)
-        await device.connect()
-        try:
-            available = await device.get_available_features()
-            features = [str(f) for f in available]
-            ecg = next((f for f in available if "ECG" in str(f).upper()), None)
-            if ecg is None:
-                return {
-                    "features": features,
-                    "settings": settings_seen,
-                    "received": received,
-                    "arrivals": arrivals,
-                    "used": used,
-                }
-
-            settings = await device.request_stream_settings(ecg)
-            settings_seen.append(
-                {
-                    "measurement_type": str(settings.measurement_type),
-                    "settings": [str(s) for s in (settings.settings or [])],
-                    "error_code": str(settings.error_code),
-                }
-            )
-
-            # Parameters come from the DEVICE's settings response. Choosing a
-            # sample rate here would be inventing a device parameter.
-            chosen: dict[str, int] = {}
-            for setting in settings.settings or []:
-                name = str(getattr(setting, "type", "")).upper()
-                values = list(
-                    getattr(setting, "array_length", []) or getattr(setting, "values", []) or []
-                )
-                if values:
-                    if "SAMPLE" in name and "RATE" in name:
-                        chosen["sample_rate"] = int(values[0])
-                    elif "RESOLUTION" in name:
-                        chosen["resolution"] = int(values[0])
-            if "sample_rate" not in chosen or "resolution" not in chosen:
-                raise RuntimeError(
-                    "the device's stream-settings response did not carry both a sample rate "
-                    f"and a resolution this run could read: {settings_seen[-1]}"
-                )
-            used = dict(chosen)
-
-            def on_ecg(data: Any) -> None:
-                arrivals.append(time.monotonic())
+        def make_callback(label: str) -> Any:
+            def on_data(data: Any) -> None:
+                arrivals.setdefault(label, []).append(time.monotonic())
                 payload = getattr(data, "data", None)
-                received.append(
+                if payload is None:
+                    payload = getattr(data, "samples", None)
+                frames.setdefault(label, []).append(
                     {
                         "type": type(data).__name__,
                         "device_timestamp": getattr(data, "timestamp", None),
@@ -366,24 +385,80 @@ def _capture_polar_pmd(run: VerificationRun, seconds: float, address: str) -> No
                     }
                 )
 
-            await device.start_ecg_stream(on_ecg, **chosen)
-            await asyncio.sleep(seconds)
+            return on_data
+
+        device = PolarDevice(address)
+        await device.connect()
+        try:
+            available = await device.get_available_features()
+            features = [str(f) for f in available]
+            for feature in available:
+                label = str(feature).upper()
+                starter_name = next((m for k, m in _PMD_STARTERS.items() if k in label), None)
+                if starter_name is None or not hasattr(device, starter_name):
+                    problems.append(
+                        f"{label}: the device offers this feature but polar-python exposes "
+                        "no way to start it"
+                    )
+                    continue
+                starter = getattr(device, starter_name)
+                try:
+                    settings = await device.request_stream_settings(feature)
+                except Exception as exc:
+                    problems.append(
+                        f"{label}: settings request failed: {type(exc).__name__}: {exc}"
+                    )
+                    continue
+                settings_seen.append(
+                    {
+                        "feature": label,
+                        "measurement_type": str(getattr(settings, "measurement_type", "")),
+                        "settings": [str(s) for s in (getattr(settings, "settings", None) or [])],
+                        "error_code": str(getattr(settings, "error_code", "")),
+                    }
+                )
+                # Ask the FUNCTION what it needs, rather than assuming which
+                # parameters a stream takes.
+                signature = inspect.signature(starter)
+                wanted = {
+                    name
+                    for name, parameter in signature.parameters.items()
+                    if name not in ("self",)
+                    and parameter.default is inspect.Parameter.empty
+                    and "callback" not in name
+                }
+                kwargs, unresolved = _settings_to_kwargs(settings, wanted)
+                if unresolved:
+                    problems.append(
+                        f"{label}: the device's settings response did not carry "
+                        f"{unresolved}; not started, because choosing those values here "
+                        "would be inventing a device parameter"
+                    )
+                    continue
+                try:
+                    await starter(make_callback(label), **kwargs)
+                    used[label] = kwargs
+                except Exception as exc:
+                    problems.append(f"{label}: start failed: {type(exc).__name__}: {exc}")
+            if used:
+                await asyncio.sleep(seconds)
         finally:
             with contextlib.suppress(Exception):
                 await device.disconnect()
         return {
             "features": features,
             "settings": settings_seen,
-            "received": received,
-            "arrivals": arrivals,
             "used": used,
+            "arrivals": arrivals,
+            "frames": frames,
+            "problems": problems,
         }
 
     try:
         result = asyncio.run(_stream())
     except Exception as exc:
         run.fail(
-            f"polar-python PMD stream failed: {type(exc).__name__}: {exc} — HARDWARE.md "
+            f"polar-python PMD session failed: {type(exc).__name__}: {exc} — HARDWARE.md "
             "records this library's coverage as unverified, so this is a finding about the "
             "library at least as much as about the device"
         )
@@ -397,48 +472,58 @@ def _capture_polar_pmd(run: VerificationRun, seconds: float, address: str) -> No
     run.observe(
         "stream settings the device returned",
         result["settings"],
-        "request_stream_settings(); the device's own response, unmodified",
+        "request_stream_settings() per feature; the device's own responses, unmodified",
     )
-    if result["used"]:
-        run.observe(
-            "stream parameters this run used",
-            result["used"],
-            "taken from the device's settings response, not chosen here",
-        )
-    if not result["received"]:
-        run.fail(f"the PMD stream started but delivered nothing in {seconds:g}s")
-        return
-    _record_arrival_shape(run, result["arrivals"], "host monotonic clock at each callback")
     run.observe(
-        "shape of each delivered frame",
-        result["received"][:200],
-        "type name, the device-supplied timestamp field verbatim, and how many "
-        "samples the frame carried; no value is decoded or named",
+        "streams started, and with what parameters",
+        result["used"],
+        "every parameter taken from the device's settings response, none chosen here",
     )
-    device_times = [
-        float(f["device_timestamp"])
-        for f in result["received"]
-        if isinstance(f.get("device_timestamp"), (int, float))
-    ]
-    if device_times:
+    for problem in result["problems"]:
+        run.fail(problem)
+    if not result["used"]:
+        run.fail(f"no PMD stream could be started in {seconds:g}s")
+        return
+
+    for label in sorted(result["used"]):
+        arrivals = result["arrivals"].get(label, [])
+        frames = result["frames"].get(label, [])
+        if not frames:
+            run.fail(f"{label}: the stream started but delivered nothing in {seconds:g}s")
+            continue
         run.observe(
-            "the timestamp field the frames carried, as a series",
-            describe_series(device_times),
-            "described only. Whether this is a device clock, a host-assigned value or "
-            "something else is NOT decided here (HARDWARE.md: a library producing a "
-            "timestamp does not establish where it came from)",
+            f"{label}: host arrival times of delivered frames",
+            describe_series(arrivals),
+            "monotonic host clock at each callback; a HOST arrival series, which "
+            "TIMING.md distinguishes from when a sample was acquired",
         )
-    sample_counts = [
-        float(f["sample_count"])
-        for f in result["received"]
-        if isinstance(f.get("sample_count"), int)
-    ]
-    if sample_counts:
         run.observe(
-            "samples per delivered frame",
-            describe_series(sample_counts),
-            "length of each frame's payload; not converted to a rate here",
+            f"{label}: shape of each delivered frame",
+            frames[:200],
+            "type name, the device-supplied timestamp verbatim, and the frame's "
+            "sample count; no value is decoded or named",
         )
+        device_times = [
+            float(f["device_timestamp"])
+            for f in frames
+            if isinstance(f.get("device_timestamp"), (int, float))
+        ]
+        if device_times:
+            run.observe(
+                f"{label}: the timestamp field the frames carried, as a series",
+                describe_series(device_times),
+                "described only. Whether this is a device clock, a host-assigned "
+                "value or something else is NOT decided here",
+            )
+        counts = [
+            float(f["sample_count"]) for f in frames if isinstance(f.get("sample_count"), int)
+        ]
+        if counts:
+            run.observe(
+                f"{label}: samples per delivered frame",
+                describe_series(counts),
+                "length of each frame's payload; not converted to a rate here",
+            )
 
 
 def capture_reconnect(
@@ -529,6 +614,153 @@ def _guarded(child: VerificationRun, capture: Callable[[VerificationRun], None])
         capture(child)
     except Exception as exc:
         child.fail(f"capture raised on its thread: {type(exc).__name__}: {exc}")
+
+
+def capture_serial(
+    run: VerificationRun,
+    port: str,
+    *,
+    seconds: float = DEFAULT_SECONDS,
+    pings: int = 200,
+    baudrate: int = 115200,
+) -> None:
+    """Measure the marker channel's round trip, and record what it emits.
+
+    This produces the measurement CL-007 is gated on. Per `DECISIONS.md` D42 the
+    gate falls on the marker MECHANISM — how a mark is placed on a stream's
+    timeline, and any electrical interface — not on the instrument: firmware
+    that answers a ping and this probe that times it are prerequisites FOR the
+    measurement, and had to exist before it could be taken at all.
+
+    What it produces is **serial round-trip latency and its variability**, and
+    that is all it may be called. The round trip contains host scheduling, the
+    USB transport, this firmware's service time and the return path, all summed;
+    it is not the device's own timing behaviour, and it is not the uncertainty of
+    a mark. `TIMING.md` defines its terms narrowly and forbids collapsing
+    distinct quantities into one, so deriving either of those from this number
+    would need a stated procedure and evidence. Neither exists.
+
+    The spread is reported rather than the mean alone, because a mean hides the
+    variability any such derivation would have to account for.
+
+    Sends ``P <token>`` and waits for ``R <token> <device_ns>``. The token means
+    a late reply cannot be mistaken for a prompt one, which a bare round-trip
+    timer would do silently.
+
+    Interprets nothing. It does not decide that the device clock is good, that
+    the spread is acceptable, or that a mark is aligned with anything.
+    """
+    try:
+        import serial as pyserial
+    except Exception as exc:
+        run.fail(f"pyserial could not be imported: {type(exc).__name__}: {exc}")
+        return
+
+    try:
+        link = pyserial.Serial(port, baudrate, timeout=0.5)
+    except Exception as exc:
+        run.fail(f"could not open {port}: {type(exc).__name__}: {exc}")
+        return
+
+    round_trips_ns: list[float] = []
+    device_times: list[float] = []
+    lost = 0
+    lines: list[str] = []
+    marks: list[dict[str, Any]] = []
+    heartbeats: list[dict[str, Any]] = []
+    banner: str | None = None
+
+    try:
+        deadline = time.monotonic() + seconds
+        for index in range(pings):
+            if time.monotonic() > deadline:
+                break
+            token = f"t{index}"
+            sent_ns = time.monotonic_ns()
+            link.write(f"P {token}\n".encode("ascii"))
+            link.flush()
+            matched = False
+            while time.monotonic_ns() - sent_ns < 500_000_000:
+                chunk = link.readline().decode("ascii", "replace").strip()
+                if not chunk:
+                    continue
+                if len(lines) < 200:
+                    lines.append(chunk)
+                if chunk.startswith("B "):
+                    banner = chunk
+                elif chunk.startswith("M "):
+                    marks.append({"line": chunk, "host_arrival_ns": time.monotonic_ns()})
+                elif chunk.startswith("H "):
+                    heartbeats.append({"line": chunk, "host_arrival_ns": time.monotonic_ns()})
+                elif chunk.startswith(f"R {token} "):
+                    round_trips_ns.append(float(time.monotonic_ns() - sent_ns))
+                    with contextlib.suppress(ValueError, IndexError):
+                        device_times.append(float(chunk.split()[2]))
+                    matched = True
+                    break
+            if not matched:
+                # A reply that never came, or came for a different token. Counted
+                # rather than quietly excluded: a latency figure computed only
+                # over the replies that arrived flatters the link.
+                lost += 1
+    except Exception as exc:
+        run.fail(f"serial exchange failed: {type(exc).__name__}: {exc}")
+    finally:
+        with contextlib.suppress(Exception):
+            link.close()
+
+    run.observe(
+        "serial port and settings used",
+        {"port": port, "baudrate": baudrate},
+        "opened with pyserial; the port name is a host fact, not a device one",
+    )
+    if banner:
+        run.observe(
+            "what the device said it is at boot",
+            banner,
+            "the device's own boot line, verbatim and unparsed",
+        )
+    if not round_trips_ns:
+        run.fail(
+            f"no ping was answered on {port} in {seconds:g}s; the device may not be running "
+            "the marker firmware, or boot.py may not have enabled the USB data channel"
+        )
+    else:
+        run.observe(
+            "round-trip time host->device->host, nanoseconds",
+            describe_series(round_trips_ns),
+            f"{len(round_trips_ns)} token-matched exchanges of 'P <token>' / 'R <token>'; "
+            "the SPREAD is the number CL-007 is gated on, not the mean",
+        )
+        run.observe(
+            "pings that went unanswered",
+            {"lost": lost, "attempted": lost + len(round_trips_ns)},
+            "counted, because a latency figure over only the replies that arrived "
+            "would flatter the link",
+        )
+    if device_times:
+        run.observe(
+            "the device clock values carried in the replies, as a series",
+            describe_series(device_times),
+            "described only; whether this board's clock is usable, and how it drifts "
+            "against the host's, is not decided here",
+        )
+    if marks:
+        run.observe(
+            "marks that arrived during the probe",
+            marks[:50],
+            "each device line verbatim beside the host monotonic time it arrived; "
+            "the two are kept separate and neither is derived from the other",
+        )
+    if heartbeats:
+        run.observe(
+            "heartbeats that arrived during the probe",
+            heartbeats[:50],
+            "device line and host arrival, so offset over time is readable from the "
+            "pair; drift is NOT computed here",
+        )
+    if lines:
+        run.observe("raw lines received", lines, "verbatim, unparsed")
 
 
 def scan_ble(run: VerificationRun, seconds: float = 10.0) -> None:
