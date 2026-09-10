@@ -750,6 +750,64 @@ def test_the_firmware_does_not_claim_serial_rtt_measures_button_detection() -> N
     assert "does not exist" in readme, "the bench setup that WOULD measure it must be named absent"
 
 
+def test_the_firmware_readme_designs_no_alignment_mechanism() -> None:
+    """D42 gates that design, and this ticket wrote D42. It must obey it.
+
+    The first version of this README specified a physical mechanism, a
+    three-link alignment chain and a cross-device check — the exact thing the
+    decision in the same pull request said was gated. A rule broken by the
+    change that introduced it is worse than no rule.
+    """
+    readme = Path("firmware/qtpy_marker/README.md").read_text(encoding="utf-8").lower()
+    for word in ("cough", "striking", "strike", "alignment chain", "cross-check"):
+        assert word not in readme, (
+            f"{word!r} is alignment design, which DECISIONS.md D42 gates on a real "
+            "measurement that has not been taken"
+        )
+    # And it must say where the design question actually stands.
+    assert "undesigned" in readme and "d42" in readme
+
+
+def test_the_firmware_readme_asserts_nothing_about_what_a_device_senses() -> None:
+    """AGENTS.md §7: no statement about how a physical device behaves, unobserved.
+
+    Naming a device is not the violation — the README must be able to say what it
+    does NOT connect to, and what it does NOT solve. The violation is claiming
+    what a device would sense, register or show, which is a fact nobody here has
+    ever observed.
+    """
+    readme = Path("firmware/qtpy_marker/README.md").read_text(encoding="utf-8").lower()
+    for verb in (
+        "sensed by",
+        "senses",
+        "will show",
+        "would show",
+        "appears in",
+        "registers",
+        "shows up in",
+        "picks up",
+    ):
+        assert verb not in readme, (
+            f"{verb!r} claims a device behaviour that has never been observed"
+        )
+    # The device may only describe itself, and only what it was built to do.
+    assert "that is the entire claim" in readme
+
+
+def test_the_proposal_survives_as_a_question_rather_than_a_design() -> None:
+    """A good idea must not be lost, and must not be promoted either."""
+    hardware = Path("docs/HARDWARE.md").read_text(encoding="utf-8")
+    questions = hardware[
+        hardware.index("## Open questions") : hardware.index("## Producing the evidence")
+    ]
+    assert "cough" in questions, "the proposal is recorded"
+    assert "Unknown" in questions, "and recorded as unknown"
+    assert "not as a design" in questions
+    # Phrased as questions: no sentence may assert what a device will sense.
+    assert "genuinely sensed by both" not in hardware
+    assert "exactly the right instrument" not in hardware
+
+
 def test_the_gate_change_is_recorded_rather_than_routed_around() -> None:
     """AGENTS.md §2: a repository gate is not stepped over quietly."""
     handoff = Path("docs/HANDOFF.md").read_text(encoding="utf-8")

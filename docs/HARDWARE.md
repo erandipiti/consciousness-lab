@@ -67,6 +67,21 @@ These are unverified and are recorded so they can be checked, not relied on.
 - Does the study require a hardware synchronisation path between devices, or is
   post-hoc alignment sufficient? Undecided, and it depends on measurements that
   have not been taken.
+- **Does striking a device produce a transient in its accelerometer, and is that
+  transient sharp enough to time?** Unknown for both the Athena and the H10.
+- **Does one cough produce a transient in the accelerometers of a head-worn and a
+  chest-worn device at once, and do those two transients share an identifiable
+  feature to align on?** Unknown. A cough lasts some hundreds of milliseconds
+  with a build-up, so even if both register it, which instant either one marks
+  is a separate unknown.
+
+  These two arise from a proposal by Erandi (2026-09-10): strike the forehead
+  with the marker's button so one physical event is both a mark and a mechanical
+  shock, and use a cough as a cross-device check. **It is recorded here as
+  questions, not as a design.** Whether any of it works is what `probe muse`,
+  `probe polar` and `probe concurrent` would show, and none has been run.
+  Designing an alignment mechanism on the strength of it is gated by
+  `DECISIONS.md` D42.
 
 ## Producing the evidence (CL-004)
 

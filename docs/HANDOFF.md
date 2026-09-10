@@ -162,6 +162,12 @@ and its variability.
 > be read as having opened the gate: the firmware has never been flashed, `probe
 > serial` has never been run against a board, and every timing number about this
 > device remains unknown.
+>
+> An untested proposal for the alignment mechanism exists — strike a device with
+> the marker's button, and use a cough as a cross-device check. It is recorded as
+> **open questions** in `HARDWARE.md`, deliberately not as a design, and this
+> ticket does not evaluate it. Doing so needs the bench evidence this gate is
+> about, plus the human-reserved decision on any protocol that rests on it.
 
 ### CL-008 — Multi-device session end to end
 

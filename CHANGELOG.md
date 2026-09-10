@@ -122,7 +122,32 @@ which is what `SESSION_FORMAT.md` Q8 designed the package to allow.
   half moved. The alignment design stays gated, and the amendment says plainly
   that no physical measurement exists — the firmware has never been flashed.
 
-**15 new tests** (510 → 525, plus 1 deselected).
+**Corrected in review again (CL-007-A-R4).** The firmware README designed the
+very thing D42 — written in this same change — says stays gated, and asserted
+device behaviour nobody has observed. A rule broken by the change that
+introduced it is worse than no rule.
+
+- The "striking with the button" section is **gone**: the physical mechanism, the
+  three-link alignment chain, and the cross-device check were alignment design.
+- With it went claims like *"a cough is genuinely sensed by both"* and *"exactly
+  the right instrument"* — statements about how devices and bodies behave, with
+  no observation behind them (`AGENTS.md` §7).
+- The README now says only what the device is, that relating a mark to any stream
+  is undesigned and gated, and where the open questions live.
+- **The proposal is not lost.** It is recorded in `HARDWARE.md` → Open questions
+  as two questions, attributed and marked Unknown, with a note that it is
+  recorded as questions and not as a design.
+
+**A flaky test on `main`, found and fixed.** `test_no_packet_can_appear_after_the
+_final_drain` and its sibling asserted `refused >= 1`, which is a matter of where
+a producer thread happened to be when the join window expired — a schedule, not a
+guarantee. They failed roughly half the time. Both now assert the actual
+invariant: an abnormal end is *recorded* one way or the other and can never read
+as clean. The refusal path itself stays deterministically pinned by the
+`_Handoff` unit test that drives the barrier directly. 25 consecutive recorder
+runs green, 5 consecutive full runs green.
+
+**18 new tests** (510 → 528, plus 1 deselected).
 
 
 ### Added — CL-004: hardware verification harness
