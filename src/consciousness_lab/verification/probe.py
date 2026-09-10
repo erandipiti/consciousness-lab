@@ -132,6 +132,38 @@ def muse(
 
 
 @app.command()
+def serial(
+    purpose: Annotated[str, typer.Option(help="What this run set out to establish.")],
+    port: Annotated[str, typer.Option(help="Serial port: /dev/ttyACM0, /dev/cu.usbmodem*, COM3.")],
+    firmware: Annotated[str, typer.Option(help="Marker firmware id, e.g. qtpy-marker/1.")],
+    method: Annotated[str, typer.Option(help="How you ran it: on the bench, cable, hub.")],
+    alias: Annotated[str, typer.Option(help="Study-local alias.")] = "marker-01",
+    seconds: Annotated[float, typer.Option()] = devices.DEFAULT_SECONDS,
+    pings: Annotated[int, typer.Option(help="How many round trips to attempt.")] = 200,
+    baudrate: Annotated[int, typer.Option()] = 115200,
+    root: Annotated[Path | None, typer.Option()] = None,
+) -> None:
+    """Measure the marker channel's round trip and its SPREAD, and record what it emits.
+
+    This is the gate HANDOFF.md puts on CL-007: the marker mechanism cannot be
+    designed until serial round-trip latency and its variability are measured.
+    The spread is the number that matters — a mean says nothing about whether a
+    given mark can be trusted.
+
+    Needs no BLE and no participant. Bench only.
+    """
+    run = VerificationRun(
+        subject="qtpy-marker",
+        purpose=purpose,
+        method=method,
+        device_firmware=firmware,
+        device_alias=alias,
+    )
+    devices.capture_serial(run, port, seconds=seconds, pings=pings, baudrate=baudrate)
+    _finish(run, root or data_root_default())
+
+
+@app.command()
 def reconnect(
     purpose: Annotated[str, typer.Option(help="What this run set out to establish.")],
     firmware: Annotated[str, typer.Option(help="Firmware or hardware revision, as reported.")],

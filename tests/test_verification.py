@@ -437,6 +437,175 @@ def test_polar_reconnect_requires_an_address(tmp_path: Path) -> None:
     assert not list(tmp_path.rglob("*.json"))
 
 
+# ------------------------------------ CL-004-R2: the marker channel's round trip
+
+
+class FakeSerialLink:
+    """A QT Py that answers pings, with a mark and a heartbeat mixed in."""
+
+    def __init__(self, port: str, baudrate: int, timeout: float) -> None:
+        self.port, self.baudrate = port, baudrate
+        self.closed = False
+        self._outbox: list[bytes] = [b"B qtpy-marker/1 rp2040 1\n"]
+        self._token: str | None = None
+        self._replies = 0
+
+    def write(self, payload: bytes) -> None:
+        line = payload.decode("ascii").strip()
+        if line.startswith("P "):
+            self._token = line[2:].strip()
+
+    def flush(self) -> None:
+        return None
+
+    def readline(self) -> bytes:
+        if self._outbox:
+            return self._outbox.pop(0)
+        if self._token is None:
+            return b""
+        token, self._token = self._token, None
+        self._replies += 1
+        if self._replies == 2:
+            self._outbox.append(b"M 0 123456789\n")
+        if self._replies == 3:
+            self._outbox.append(b"H 0 987654321\n")
+        return f"R {token} {1000 * self._replies}\n".encode("ascii")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def test_the_serial_probe_measures_the_spread_not_just_the_mean(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The gate HANDOFF.md puts on CL-007 is latency AND ITS VARIABILITY."""
+    import serial as pyserial
+
+    from consciousness_lab.verification import devices
+
+    monkeypatch.setattr(pyserial, "Serial", FakeSerialLink)
+    run = VerificationRun(
+        subject="qtpy-marker", purpose="p", method="m", device_firmware="qtpy-marker/1"
+    )
+    devices.capture_serial(run, "/dev/ttyACM0", seconds=5.0, pings=5)
+
+    round_trip = next(o for o in run.observations if "round-trip time" in o.what)
+    described = round_trip.value
+    # The spread is what the ticket is gated on, so it must be in the record.
+    for key in ("min", "max", "step_min", "n"):
+        assert key in described
+    assert "SPREAD" in round_trip.how
+
+
+def test_unanswered_pings_are_counted_rather_than_quietly_excluded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A latency figure over only the replies that arrived flatters the link."""
+    import serial as pyserial
+
+    from consciousness_lab.verification import devices
+
+    monkeypatch.setattr(pyserial, "Serial", FakeSerialLink)
+    run = VerificationRun(
+        subject="qtpy-marker", purpose="p", method="m", device_firmware="qtpy-marker/1"
+    )
+    devices.capture_serial(run, "/dev/ttyACM0", seconds=5.0, pings=4)
+    lost = next(o for o in run.observations if "unanswered" in o.what)
+    assert set(lost.value) == {"lost", "attempted"}
+
+
+def test_marks_keep_device_time_and_host_arrival_apart(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """TIMING.md rule 2: never overwrite a captured quantity with a derived one.
+
+    The device's own clock value and the host's arrival time are two different
+    quantities. The probe records both and derives neither from the other — no
+    offset, no drift, no "corrected" time.
+    """
+    import serial as pyserial
+
+    from consciousness_lab.verification import devices
+
+    monkeypatch.setattr(pyserial, "Serial", FakeSerialLink)
+    run = VerificationRun(
+        subject="qtpy-marker", purpose="p", method="m", device_firmware="qtpy-marker/1"
+    )
+    devices.capture_serial(run, "/dev/ttyACM0", seconds=5.0, pings=5)
+
+    marks = next(o for o in run.observations if o.what.startswith("marks that arrived"))
+    assert marks.value[0]["line"] == "M 0 123456789", "the device line is kept verbatim"
+    assert "host_arrival_ns" in marks.value[0]
+    labels = " ".join(o.what for o in run.observations).lower()
+    assert "offset" not in labels and "drift" not in labels and "corrected" not in labels
+
+
+def test_a_port_that_will_not_open_is_a_recorded_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import serial as pyserial
+
+    from consciousness_lab.verification import devices
+
+    def refuse(port: str, baudrate: int, timeout: float) -> None:
+        raise OSError(2, "No such file or directory")
+
+    monkeypatch.setattr(pyserial, "Serial", refuse)
+    run = VerificationRun(
+        subject="qtpy-marker", purpose="p", method="m", device_firmware="qtpy-marker/1"
+    )
+    devices.capture_serial(run, "/dev/nope", seconds=1.0, pings=2)
+    assert run.observations == []
+    assert any("could not open /dev/nope" in f for f in run.failures)
+
+
+def test_silence_names_the_two_likely_causes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A dead channel and a board without boot.py look identical; say both."""
+    from consciousness_lab.verification import devices
+
+    class Silent(FakeSerialLink):
+        def readline(self) -> bytes:
+            return b""
+
+    import serial as pyserial
+
+    monkeypatch.setattr(pyserial, "Serial", Silent)
+    run = VerificationRun(
+        subject="qtpy-marker", purpose="p", method="m", device_firmware="qtpy-marker/1"
+    )
+    devices.capture_serial(run, "/dev/ttyACM0", seconds=0.5, pings=2)
+    failure = next(f for f in run.failures if "no ping was answered" in f)
+    assert "marker firmware" in failure and "boot.py" in failure
+
+
+def test_the_firmware_timestamps_before_it_debounces() -> None:
+    """The one thing in the firmware that must not be got wrong.
+
+    Debounce after the timestamp and the mark is true to first contact; debounce
+    before it and an unmeasured delay has been added to a device whose entire
+    purpose is knowing when. Asserted against the source because there is no way
+    to run CircuitPython here.
+    """
+    source = Path("firmware/qtpy_marker/code.py").read_text(encoding="utf-8")
+    body = source.split("while True:", 1)[1]
+    now_at = body.index("now = time.monotonic_ns()")
+    debounce_at = body.index("DEBOUNCE_MS")
+    assert now_at < debounce_at, "the timestamp must be taken before any debounce logic"
+    assert "time.sleep" not in body, "a sleep in the poll loop widens detection jitter"
+
+
+def test_the_firmware_makes_no_electrical_contact_with_a_participant() -> None:
+    """A switch to a GPIO and ground, and nothing driven anywhere.
+
+    SAFETY.md S6 forbids inventing electrical limits; the way to obey it is to
+    build something with no electrical interface to a person at all.
+    """
+    source = Path("firmware/qtpy_marker/code.py").read_text(encoding="utf-8")
+    assert "Direction.OUTPUT" not in source, "nothing may be driven out"
+    assert "analogio" not in source and "AnalogOut" not in source
+    assert "digitalio.Direction.INPUT" in source
+
+
 # ------------------------------------------------- hardware tests are excluded
 
 

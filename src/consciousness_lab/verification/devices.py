@@ -531,6 +531,142 @@ def _guarded(child: VerificationRun, capture: Callable[[VerificationRun], None])
         child.fail(f"capture raised on its thread: {type(exc).__name__}: {exc}")
 
 
+def capture_serial(
+    run: VerificationRun,
+    port: str,
+    *,
+    seconds: float = DEFAULT_SECONDS,
+    pings: int = 200,
+    baudrate: int = 115200,
+) -> None:
+    """Measure the marker channel's round trip, and record what it emits.
+
+    `docs/HANDOFF.md` gates CL-007 on this: the marker firmware cannot be
+    designed until serial round-trip latency AND ITS VARIABILITY are measured.
+    The variability is the point — a mean round trip says nothing about whether
+    a given mark is trustworthy, and a device whose jitter is unknown is a device
+    whose marks have unknown error bars.
+
+    Sends ``P <token>`` and waits for ``R <token> <device_ns>``. The token means
+    a late reply cannot be mistaken for a prompt one, which a bare round-trip
+    timer would do silently.
+
+    Interprets nothing. It does not decide that the device clock is good, that
+    the jitter is acceptable, or that a mark is aligned with anything.
+    """
+    try:
+        import serial as pyserial
+    except Exception as exc:
+        run.fail(f"pyserial could not be imported: {type(exc).__name__}: {exc}")
+        return
+
+    try:
+        link = pyserial.Serial(port, baudrate, timeout=0.5)
+    except Exception as exc:
+        run.fail(f"could not open {port}: {type(exc).__name__}: {exc}")
+        return
+
+    round_trips_ns: list[float] = []
+    device_times: list[float] = []
+    lost = 0
+    lines: list[str] = []
+    marks: list[dict[str, Any]] = []
+    heartbeats: list[dict[str, Any]] = []
+    banner: str | None = None
+
+    try:
+        deadline = time.monotonic() + seconds
+        for index in range(pings):
+            if time.monotonic() > deadline:
+                break
+            token = f"t{index}"
+            sent_ns = time.monotonic_ns()
+            link.write(f"P {token}\n".encode("ascii"))
+            link.flush()
+            matched = False
+            while time.monotonic_ns() - sent_ns < 500_000_000:
+                chunk = link.readline().decode("ascii", "replace").strip()
+                if not chunk:
+                    continue
+                if len(lines) < 200:
+                    lines.append(chunk)
+                if chunk.startswith("B "):
+                    banner = chunk
+                elif chunk.startswith("M "):
+                    marks.append({"line": chunk, "host_arrival_ns": time.monotonic_ns()})
+                elif chunk.startswith("H "):
+                    heartbeats.append({"line": chunk, "host_arrival_ns": time.monotonic_ns()})
+                elif chunk.startswith(f"R {token} "):
+                    round_trips_ns.append(float(time.monotonic_ns() - sent_ns))
+                    with contextlib.suppress(ValueError, IndexError):
+                        device_times.append(float(chunk.split()[2]))
+                    matched = True
+                    break
+            if not matched:
+                # A reply that never came, or came for a different token. Counted
+                # rather than quietly excluded: a latency figure computed only
+                # over the replies that arrived flatters the link.
+                lost += 1
+    except Exception as exc:
+        run.fail(f"serial exchange failed: {type(exc).__name__}: {exc}")
+    finally:
+        with contextlib.suppress(Exception):
+            link.close()
+
+    run.observe(
+        "serial port and settings used",
+        {"port": port, "baudrate": baudrate},
+        "opened with pyserial; the port name is a host fact, not a device one",
+    )
+    if banner:
+        run.observe(
+            "what the device said it is at boot",
+            banner,
+            "the device's own boot line, verbatim and unparsed",
+        )
+    if not round_trips_ns:
+        run.fail(
+            f"no ping was answered on {port} in {seconds:g}s; the device may not be running "
+            "the marker firmware, or boot.py may not have enabled the USB data channel"
+        )
+    else:
+        run.observe(
+            "round-trip time host->device->host, nanoseconds",
+            describe_series(round_trips_ns),
+            f"{len(round_trips_ns)} token-matched exchanges of 'P <token>' / 'R <token>'; "
+            "the SPREAD is the number CL-007 is gated on, not the mean",
+        )
+        run.observe(
+            "pings that went unanswered",
+            {"lost": lost, "attempted": lost + len(round_trips_ns)},
+            "counted, because a latency figure over only the replies that arrived "
+            "would flatter the link",
+        )
+    if device_times:
+        run.observe(
+            "the device clock values carried in the replies, as a series",
+            describe_series(device_times),
+            "described only; whether this board's clock is usable, and how it drifts "
+            "against the host's, is not decided here",
+        )
+    if marks:
+        run.observe(
+            "marks that arrived during the probe",
+            marks[:50],
+            "each device line verbatim beside the host monotonic time it arrived; "
+            "the two are kept separate and neither is derived from the other",
+        )
+    if heartbeats:
+        run.observe(
+            "heartbeats that arrived during the probe",
+            heartbeats[:50],
+            "device line and host arrival, so offset over time is readable from the "
+            "pair; drift is NOT computed here",
+        )
+    if lines:
+        run.observe("raw lines received", lines, "verbatim, unparsed")
+
+
 def scan_ble(run: VerificationRun, seconds: float = 10.0) -> None:
     """List what the host can see. Answers 'is the stack alive' before anything else.
 

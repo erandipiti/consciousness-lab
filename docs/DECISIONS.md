@@ -850,6 +850,35 @@ asserts that exclusion rather than trusting it.
 platform; whether the study needs a hardware synchronisation path between
 devices. Both are answered by measurement, and neither has been measured.
 
+## D41 — The Mac records; mimisbrunnr stores and processes
+
+**Decided by Erandi, 2026-09-10.** The recording host is the Mac. `mimisbrunnr`
+keeps its role as the place data is stored and analysed, and stops being the
+intended bench machine.
+
+**Why.** Sessions need to happen in more than one environment, and `mimisbrunnr`
+is a desktop. The split costs nothing structurally: `SESSION_FORMAT.md` Q8 makes
+the whole `sessions/<id>/` directory the canonical unit, independently
+interpretable, with the registry rebuildable by scanning packages — so moving a
+recorded session between hosts is what the format was designed for, not a
+workaround.
+
+**What this changes about verification.** `HARDWARE.md` asks which host platforms
+are supported, and the answer only ever holds for the host it was measured on.
+Every device row must therefore be verified **on the Mac**. The BlueZ finding
+recorded on `mimisbrunnr` on 2026-09-08 stays a fact about that machine and
+transfers to nothing.
+
+**Rejected.** WSL, on architecture rather than preference: WSL2 is a VM with no
+path to the host Bluetooth adapter, and reaching one needs a USB dongle passed
+through `usbipd-win` plus a custom kernel built with the Bluetooth modules the
+shipped kernel omits. That would also make it the least-tested of the three BLE
+stacks, in a study whose hardware document already warns that stacks differ
+substantially and that `bleak` abstracts them imperfectly.
+
+**Revisit if.** macOS turns out not to sustain both peripherals on one adapter —
+which is measured by `probe concurrent`, not assumed here.
+
 ---
 
 ## Awaiting a named human

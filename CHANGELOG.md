@@ -9,6 +9,53 @@ Versioning policy is unresolved — see `docs/OPERATIONS.md`.
 
 ## [Unreleased]
 
+### Added — CL-007-A: QT Py marker firmware, the serial probe, and the recording host
+
+**`firmware/qtpy_marker/`** — CircuitPython for the marker channel: a switch that
+reports, over USB serial, when it was pressed, on its own clock. That is all it
+is, and the README says so: placing that instant on a BLE stream's timeline is
+still the open question `TIMING.md` calls the hardest in the study.
+
+- The timestamp is taken on the **first edge**, before debouncing and before any
+  serial write. Debounce first and you have added an unmeasured delay to a
+  device whose whole purpose is knowing when. A test asserts the ordering
+  against the source, since CircuitPython cannot run here.
+- Device time and host arrival time are kept as **two quantities** and neither is
+  derived from the other (`TIMING.md` rule 2). Periodic heartbeats exist so the
+  offset between the clocks can be watched and its *drift* measured rather than
+  an offset taken once being assumed to hold.
+- `boot.py` gives marks their own USB serial channel, so a traceback on the
+  console can never land inside the data stream.
+- **No electrical contact with a participant**: a switch, a GPIO, and ground.
+  Nothing is driven anywhere, and tests assert there is no output pin and no
+  analog out. A version that injects into an EEG channel is a different device
+  and a different decision, needing the exact model, its ADC limits, and a named
+  human (`SAFETY.md` S6).
+
+**`probe serial`** — closes the gate `HANDOFF.md` puts on CL-007: round-trip
+latency **and its variability**. Token-matched, so a late reply cannot pass as a
+prompt one, and unanswered pings are counted rather than quietly excluded — a
+latency figure over only the replies that arrived flatters the link. It
+interprets nothing: no offset, no drift, no corrected time.
+
+This also closes a contradiction: CL-004's acceptance said the QT Py was out of
+scope, while `HANDOFF.md` gated CL-007 on CL-004 having measured serial latency.
+The probe is the measurement; it needs no marker design and no participant.
+
+**`DECISIONS.md` D41 — the Mac records, mimisbrunnr stores and processes.**
+Decided by Erandi. Session packages are designed to move between hosts
+(`SESSION_FORMAT.md` Q8), so the split costs nothing structurally. Consequence:
+every device row must be verified **on the Mac**, and the BlueZ finding recorded
+on mimisbrunnr transfers to nothing. WSL was rejected on architecture: WSL2 has
+no path to the host Bluetooth adapter without a passed-through dongle and a
+custom kernel.
+
+`HARDWARE.md` gains the macOS setup, including the CoreBluetooth permission that
+makes every device look switched off when a terminal does not hold it.
+
+**7 new tests** (510 → 517, plus 1 deselected).
+
+
 ### Added — CL-004: hardware verification harness
 
 Hardware is in hand. It does not unlock writing device adapters — it unlocks

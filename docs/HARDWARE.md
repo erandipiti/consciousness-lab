@@ -87,6 +87,10 @@ uv run consciousness-lab probe reconnect  --device muse  --purpose "..." --firmw
 
 # two peripherals on one adapter, which HARDWARE.md calls unmeasured
 uv run consciousness-lab probe concurrent --polar-address "..." --purpose "..." --firmware "..." --method "..."
+
+# the marker channel's round trip AND ITS SPREAD — the gate CL-007 sits behind.
+# Bench only: no BLE, no participant.
+uv run consciousness-lab probe serial --port /dev/cu.usbmodem101 --purpose "..." --firmware "qtpy-marker/1" --method "..."
 ```
 
 `reconnect` records cycle 0 and cycle 1 under prefixed names and **computes no
@@ -118,6 +122,32 @@ produces no session package, and its output must not become study data.
 Run `probe scan` before blaming a device. A host with no Bluetooth stack and a
 device that is switched off look identical from inside a library that simply
 times out, and confusing the two costs a bench session.
+
+### Setting up the recording host (macOS)
+
+The Mac is the recording host (`DECISIONS.md` D41). From a fresh checkout:
+
+```bash
+xcode-select --install                         # if `git` is not already there
+curl -LsSf https://astral.sh/uv/install.sh | sh
+git clone https://github.com/erandipiti/consciousness-lab.git
+cd consciousness-lab && uv sync --locked --all-groups
+uv run consciousness-lab probe env --purpose "is this Mac ready to record"
+```
+
+**The macOS gotcha that looks like a broken device.** CoreBluetooth requires the
+*application* to hold Bluetooth permission, and a terminal does not have it by
+default. Grant it to your terminal in **System Settings → Privacy & Security →
+Bluetooth**, then restart the terminal. Without it, scans return nothing and
+every device looks switched off — which is why `probe scan` exists and why you
+run it before blaming a device.
+
+Serial ports are `/dev/cu.usbmodem*` on macOS, not `/dev/ttyACM*`.
+
+Recorded sessions can be moved to `mimisbrunnr` for storage and analysis by
+copying the whole `data/sessions/<id>/` directory. That is not a workaround: the
+package is designed to be the canonical, independently interpretable unit and
+the registry is rebuildable by scanning packages (`SESSION_FORMAT.md` Q8).
 
 ### Host readiness — observed, not a device verification
 
