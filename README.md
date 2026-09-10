@@ -8,18 +8,25 @@ Research platform for **Study 001**. This repository holds the acquisition,
 session-handling and analysis code for the study, plus the documentation that
 defines how that code is allowed to behave.
 
-Current milestone: **CL-003 — the asynchronous multi-stream recorder.**
+Current milestone: **CL-007-A — the marker instrument.** Hardware is in hand and
+none of it has been connected.
 
 What exists: the locked environment and validation pipeline (CL-001), Session
 Package v2 as the acquisition data contract (CL-002A/CL-002B, `docs/DECISIONS.md`
-D8–D34), and a recorder that drives several stream sources concurrently into one
-package (CL-003, D35–D39).
+D8–D34), a recorder that drives several stream sources concurrently into one
+package (CL-003, D35–D39), a verification harness that records what a device
+actually does without interpreting it (CL-004, D40), and the QT Py marker
+firmware with the probe that would measure it (CL-007-A, D41–D42).
 
 What does **not** exist, deliberately: any device adapter, any BLE or serial
 transport, any reconstructed timing or cross-device alignment, and any analysis.
 The recorder is defined against an abstract source and exercised by a
-deterministic synthetic one. **No hardware has ever been connected** — see
-[Hardware status](#hardware-status) below, which is unchanged and still binding.
+deterministic synthetic one.
+
+**Nothing has been measured.** No device has been connected on any host, the
+marker firmware has never been flashed, and every row in
+[Hardware status](#hardware-status) still reads *pending verification*. Code
+existing is not a device behaving.
 
 ---
 
