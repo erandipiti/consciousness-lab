@@ -339,7 +339,31 @@ marker stream, and `was_down` may not start from a literal — and the edge rule
 also exercised behaviourally against boot-with-switch-held, which is the case that
 regressed. Both verified by reintroducing the original bug.
 
-**40 new tests** (510 → 550, plus 1 deselected).
+**The strip (CL-007-A-R13), decided by Erandi.** Eleven of twelve review rounds
+found the same root cause: these files explained themselves in prose, and prose
+about an unconnected device is where the wrong claims kept coming from. Six
+guards had been added to police that prose. The proportionate answer was to stop
+having the prose.
+
+`firmware/qtpy_marker/` is now wiring, flashing steps, the wire protocol, and the
+comments that explain why the *code* is shaped as it is — 380 lines down to 226.
+**Every statement about how the device behaves lives in `docs/HARDWARE.md`**, the
+document built to mark what is verified, what is assumed and what is Unknown.
+
+Deliberately kept, because they are not behaviour claims: the safety property
+(no conductor between this device and a person, verifiable by inspection), and
+the code rationale that stops the next reader breaking an invariant — read the
+pin before the clock, debounce after the timestamp, arm from the pin's real
+state, fail closed without the data channel.
+
+The two guards that broke were replaced by **stronger** rules rather than
+relaxed: the marker files may not discuss detection at all and must point at
+`HARDWARE.md`, the README is size-bounded so the strip cannot silently undo
+itself, and a new test asserts the strip **relocated** the knowledge instead of
+deleting it — every fact the files used to assert must still be in `HARDWARE.md`,
+marked Unknown.
+
+**41 new tests** (510 → 551, plus 1 deselected).
 
 
 ### Added — CL-004: hardware verification harness

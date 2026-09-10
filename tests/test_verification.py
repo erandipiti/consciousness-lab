@@ -824,22 +824,39 @@ def test_the_edge_rule_would_not_fire_on_a_switch_held_at_boot() -> None:
     assert marks(released_at_boot, armed_from_pin=True) == 2, "normal presses still count"
 
 
-def test_the_firmware_does_not_claim_serial_rtt_measures_button_detection() -> None:
-    """`probe serial` never touches the GPIO, so it cannot establish that number.
+def test_the_marker_files_do_not_discuss_detection_at_all() -> None:
+    """After the strip, behaviour is HARDWARE.md's job and only its job.
 
-    Claiming a quantity is measured by something that does not measure it is the
-    exact failure this project exists to prevent, and it was in the first head of
-    this ticket.
+    The earlier version of this test required the marker files to *deny*, in
+    prose, that `probe serial` measures button detection. That denial was itself
+    prose about behaviour, and prose about behaviour in these files is what
+    eleven review rounds kept finding wrong. So the files no longer discuss it;
+    the statement lives where statements about devices belong.
     """
     for path in ("firmware/qtpy_marker/code.py", "firmware/qtpy_marker/README.md"):
         text = Path(path).read_text(encoding="utf-8")
-        if "probe serial" not in text:
-            continue
-        # Wherever the probe is named near detection, it must be to DENY the link.
-        assert "does NOT establish" in text or "does **not** establish" in text, path
-    readme = Path("firmware/qtpy_marker/README.md").read_text(encoding="utf-8")
-    assert "unmeasured" in readme
-    assert "does not exist" in readme, "the bench setup that WOULD measure it must be named absent"
+        assert "probe serial" not in text, f"{path} discusses a measurement it cannot make"
+        assert "HARDWARE.md" in text, f"{path} must point at where behaviour is recorded"
+
+
+def test_the_strip_relocated_the_knowledge_rather_than_deleting_it() -> None:
+    """A strip that loses what was known is not a cleanup, it is a regression.
+
+    Everything the marker files used to assert has to still be written down
+    somewhere — and somewhere that marks it Unknown, which is exactly what
+    HARDWARE.md is for.
+    """
+    hardware = Path("docs/HARDWARE.md").read_text(encoding="utf-8")
+    marker = hardware[hardware.index("**QT Py marker channel.**") :]
+    marker = marker[: marker.index("\n- **")]
+    for fact in (
+        "never been flashed",
+        "Serial round-trip latency",
+        "unmeasured",
+        "clock resolution",
+        "polls",
+    ):
+        assert fact in marker, f"the strip lost {fact!r} instead of relocating it"
 
 
 def test_the_gate_change_is_recorded_rather_than_routed_around() -> None:

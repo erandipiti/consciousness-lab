@@ -486,7 +486,14 @@ def test_the_firmware_readme_designs_no_alignment_mechanism() -> None:
     lowered = readme.lower()
     for phrase in ("striking", "alignment chain", "cross-check"):
         assert phrase not in lowered, f"{phrase!r} is alignment design"
-    assert "undesigned" in lowered and "d42" in lowered
+    # After the strip the file no longer argues about what is gated; it points at
+    # the decision and at the document that records behaviour, and stays small.
+    assert "d42" in lowered
+    assert "hardware.md" in lowered
+    assert len(readme.splitlines()) < 110, (
+        "the marker README is wiring, flashing and the wire protocol. Explanatory "
+        "prose about behaviour belongs in HARDWARE.md — that is what the strip was"
+    )
 
 
 def test_the_proposal_survives_as_a_question_rather_than_a_design() -> None:

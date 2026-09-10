@@ -1,62 +1,29 @@
 """QT Py marker channel — CircuitPython firmware.
 
-Drop this on the CIRCUITPY drive as ``code.py``. It needs no libraries beyond
-what CircuitPython ships with. It needs a CircuitPython that has
-``time.monotonic_ns`` and f-strings. Which version is on your board is a board
-fact this repository has not checked — read it off the device rather than
-assuming a floor from anything written here.
+A switch on a USB serial line. Copy this and ``boot.py`` to CIRCUITPY and
+power-cycle the board; see ``README.md`` for wiring and flashing.
 
-WHAT THIS DEVICE IS
-    A switch that says, over USB serial, the device-clock time at which its
-    polling loop FIRST OBSERVED the input go low. That is all, and the wording
-    is the claim: the physical instant the switch closed is earlier by an
-    unknown amount, because the loop samples the pin and how often it does so
-    has never been measured. `TIMING.md` keeps the underlying event and an
-    observation of it as separate quantities; so does this.
+**Every statement about how this behaves lives in ``docs/HARDWARE.md``**, which
+is the document built to mark what is verified, what is assumed and what is
+Unknown. Nothing is claimed here, because nothing here can be: no board has been
+connected.
 
-WHAT IT IS NOT
-    A solution to placing that instant on the EEG or ECG timeline. Those arrive
-    over BLE, whose latency is variable and, for these devices, entirely
-    unmeasured — `HARDWARE.md` says so, and no number for it appears here
-    because nobody has one. `docs/TIMING.md` calls aligning them "the hardest
-    timing question in the study", still open. This firmware produces one input to that
-    problem; it does not answer it, and nothing here should be read as if it did.
+Wire protocol, one ASCII line per record::
 
-WHY THE TIMESTAMP IS TAKEN WHERE IT IS
-    The pin is read first, and the clock is sampled inside the transition, so a
-    mark cannot precede the observation that produced it. Debounce is decided
-    after the timestamp exists; debounce before it and you have added a second
-    unmeasured delay on top of the polling interval that is already there.
+    B <fw> <board> time_unit=ns resolution=unmeasured   at startup
+    M <seq> <device_ns>                                 first observed high->low
+    R <token> <device_ns>                               answering P <token>
+    H <seq> <device_ns>                                 periodically
 
-    None of that makes the mark the physical edge. It makes it an honest record
-    of when the edge was first SEEN, which is the most this device can say until
-    someone measures the gap.
+    host -> device:  P <token>
 
-THE PROTOCOL, one ASCII line per event, ``\\n`` terminated:
+``time_unit=ns`` describes the representation of the numbers. ``device_ns`` is
+this board's own monotonic clock; the host separately records when a line
+arrived. Both are kept and neither is derived from the other
+(``docs/TIMING.md`` rule 2).
 
-    B <fw> <board> time_unit=ns resolution=unmeasured
-                                    once at boot: what the host is talking to.
-                                    `time_unit` describes the REPRESENTATION of
-                                    the numbers below, which is a fact about the
-                                    format. The clock's actual resolution is a
-                                    fact about the board and is unmeasured, so
-                                    it is reported as such rather than guessed.
-    M <seq> <device_ns>              first OBSERVED high->low transition
-    R <token> <device_ns>            reply to a host ping; for round-trip latency
-    H <seq> <device_ns>              periodic heartbeat; makes drift measurable
-
-    Host -> device:  P <token>       ping
-
-    Device time and host arrival time are DIFFERENT QUANTITIES and both are
-    kept. `TIMING.md` rule 2: never overwrite a captured quantity with a derived
-    one. The host records when a line arrived; this device records when its
-    polling loop first observed the transition, on its own clock. Neither is the
-    physical event, and nobody collapses them.
-
-NO ELECTRICAL CONTACT WITH A PARTICIPANT
-    A switch, a GPIO and ground. Nothing here connects to a person, to the Muse
-    or to the H10, and nothing drives a signal into anything. That isolation is
-    a property of the wiring, not a promise in a comment — see README.md.
+The comments below explain why the code is shaped as it is. They are about this
+code, not about any device.
 """
 
 import time
@@ -73,15 +40,13 @@ import usb_cdc
 #: none of them — read the pinout for the model in your hand.
 BUTTON_PIN = board.A0
 
-#: Ignore further edges for this long after a press. A mechanical switch bounces
-#: for a few milliseconds; this is a debounce window, NOT a timing parameter —
-#: the mark was already timestamped before this applies. Raise it if one press
-#: reports twice; that is the only reason to touch it.
+#: Debounce window. The mark is timestamped before this applies, so it changes
+#: which edges are reported and never when one is timed. Raise it if a single
+#: press reports twice; that is the only reason to touch it.
 DEBOUNCE_MS = 25
 
-#: Seconds between heartbeats, or 0 to disable. Heartbeats exist so that the
-#: offset between this device's clock and the host's can be watched over a
-#: session and its DRIFT measured rather than assumed constant (`TIMING.md`).
+#: Seconds between heartbeats, or 0 to disable. They exist so the two clocks can
+#: be compared over a session; what that comparison shows is not decided here.
 HEARTBEAT_SECONDS = 10
 
 FIRMWARE = "qtpy-marker/1"
@@ -103,14 +68,10 @@ def main():
     # middle of the data stream.
     serial = usb_cdc.data
     if serial is None:
-        # FAIL CLOSED. The previous version fell back to the console so a
-        # misconfigured board "still said something" — which put marker records
-        # into the same stream as tracebacks, in exactly the misconfiguration
-        # boot.py exists to prevent. A record indistinguishable from console
-        # noise is worse than no record: it still looks like data.
-        #
-        # So nothing is acquired. The console gets an explanation, once, and the
-        # board idles until someone fixes boot.py and resets it.
+        # FAIL CLOSED. Emitting the protocol on the console would put records
+        # in the same stream as tracebacks, and a record indistinguishable from
+        # console noise still looks like data. So nothing is acquired: the
+        # console gets one explanation and the board idles.
         if usb_cdc.console is not None:
             usb_cdc.console.write(
                 b"FATAL: usb_cdc.data is unavailable, so there is no channel that "
@@ -129,14 +90,11 @@ def main():
     def emit(line):
         serial.write(line.encode("ascii"))
 
-    # monotonic_ns() is the only clock here with usable resolution; the float
-    # monotonic() loses precision as uptime grows, which is exactly wrong for a
-    # device that exists to report a moment.
-    # `time_unit` is a property of the numbers this firmware prints. The board's
-    # actual clock resolution is a property of the board, nobody has measured it,
-    # and `monotonic_ns()` returning integer nanoseconds does not establish it —
-    # a coarse tick scaled into nanoseconds looks identical from here. Reported
-    # unmeasured rather than encoded as a fact (AGENTS.md §7).
+    # monotonic_ns() rather than the float monotonic(), which loses precision as
+    # uptime grows.
+    # `time_unit` describes the numbers this firmware prints. The board's clock
+    # resolution is a board fact, reported unmeasured and never inferred from the
+    # values being printed in nanoseconds (AGENTS.md §7).
     emit(f"B {FIRMWARE} {_board_name()} time_unit=ns resolution=unmeasured\n")
 
     press_seq = 0
@@ -144,29 +102,23 @@ def main():
     last_press_ns = 0
     last_beat_ns = time.monotonic_ns()
     # Armed from the pin's ACTUAL state, never from a literal. Starting at False
-    # means a switch already held at boot satisfies `is_down and not was_down` on
-    # the very first sample and emits an M for a transition nobody observed — a
-    # record whose stated meaning is false, which is the one thing this device
-    # must not produce. Sampling first means a held switch is simply seen as
-    # down, and the next mark waits for a real release and press.
+    # means a switch already held at startup satisfies `is_down and not was_down`
+    # on the first sample and emits an M for a transition nobody observed.
     was_down = not button.value
     inbox = ""
 
     while True:
-        # READ THE PIN FIRST. The timestamp is taken inside the transition, after
-        # the observation that produced it, so it cannot precede the thing it
-        # claims to time. Sampling the clock before the pin biases every mark
-        # EARLY by the pin-read interval — small, but systematic, and systematic
-        # error in a device whose only job is knowing when is the worst kind.
+        # READ THE PIN FIRST, then take the clock inside the transition, so a
+        # mark cannot precede the observation that produced it. Sampling the
+        # clock first biases every mark early by the pin-read interval —
+        # systematic, not noise.
         is_down = not button.value
 
         if is_down and not was_down:
             # The time the transition was OBSERVED, not the time it happened.
             edge_ns = time.monotonic_ns()
             # Debounce decided AFTER the timestamp exists, so the mark stays
-            # tied to the first OBSERVED transition either way. It is not tied
-            # to the physical closure, which happened earlier by an interval
-            # nobody has measured.
+            # tied to the first observed transition either way.
             if edge_ns - last_press_ns > DEBOUNCE_MS * 1_000_000:
                 last_press_ns = edge_ns
                 emit(f"M {press_seq} {edge_ns}\n")
@@ -196,13 +148,8 @@ def main():
             beat_seq += 1
 
         # No sleep, so the pin is sampled as often as the interpreter allows.
-        #
-        # HOW OFTEN THAT IS, IS UNMEASURED. `probe serial` does NOT establish it:
-        # that probe sends a ping and times the reply, which exercises the USB
-        # path and this loop's SERVICE latency, and never touches the button or
-        # the GPIO at all. Treating serial round-trip as evidence about button
-        # detection would be claiming a measured quantity that nobody measured —
-        # see README.md for what would actually establish it.
+        # How often that is, and everything else about behaviour, is in
+        # docs/HARDWARE.md.
 
 
 main()
