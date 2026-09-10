@@ -24,6 +24,7 @@ them**, because enforcing a rule requires stating it — and it is excluded from
 its own scan for exactly that reason.
 """
 
+import re
 from pathlib import Path
 
 #: Physical events a person might produce. There is no legitimate reason for
@@ -330,6 +331,78 @@ def test_that_check_accepts_the_amended_wording() -> None:
     )
     lowered = amended.lower()
     assert any(word in lowered for word in GATED_BY_D42), "naming what IS gated clears it"
+
+
+# --- a magnitude nobody measured, and a quantity called something else ---------
+
+#: Vague or ranged magnitudes. A configuration value is always ONE exact number —
+#: `every 10 s` matches a constant in the firmware — so a range or a "tens of" is
+#: never our own setting and always a claim about how something behaves.
+VAGUE_MAGNITUDE = re.compile(
+    r"\b(tens|hundreds|thousands) of \s*(milli|micro|nano)?seconds\b"
+    # en dash and hyphen both, written as escapes so no ambiguous glyph sits in source
+    r"|\b\d+\s*(to|\u2013|-)\s*\d+\s*(ms|milliseconds|\u00b5s|microseconds|ns|nanoseconds|s\b)",
+    re.IGNORECASE,
+)
+
+
+def test_no_claim_surface_quotes_a_magnitude_nobody_measured() -> None:
+    """AGENTS.md §7: a number about a device is sourced and labelled, or absent.
+
+    The firmware asserted that BLE arrives with "tens to hundreds of milliseconds"
+    of latency. No device has been connected, `HARDWARE.md` records that timing as
+    unmeasured, and there is no source — the number was there to sound
+    authoritative. Saying "unmeasured" in the same sentence does not license it;
+    the number IS the claim.
+
+    A range or a vague order of magnitude is never a configuration value, which is
+    always one exact number. That is the line this draws.
+    """
+    offences = [
+        f"{path}: {match.group(0)!r}"
+        for path in CLAIM_SURFACES
+        for match in VAGUE_MAGNITUDE.finditer(prose_of(path))
+    ]
+    assert not offences, (
+        "a magnitude about device or transport behaviour, with no source and no "
+        "measurement behind it:\n  " + "\n  ".join(offences)
+    )
+
+
+def test_that_magnitude_check_knows_a_claim_from_a_setting() -> None:
+    assert VAGUE_MAGNITUDE.search("arrive with tens to hundreds of milliseconds of latency")
+    assert VAGUE_MAGNITUDE.search("between 20 - 400 ms, variable")
+    # Our own configuration is one exact number and must stay allowed.
+    assert not VAGUE_MAGNITUDE.search("| `H <seq> <device_ns>` | every 10 s | heartbeat |")
+    assert not VAGUE_MAGNITUDE.search("Ignore further edges for 25 ms after a press.")
+
+
+#: Names for quantities this probe does not produce. TIMING.md defines its terms
+#: narrowly; a serial round trip is none of them.
+NOT_WHAT_RTT_IS = ("jitter", "uncertainty", "error bar", "trustworthy")
+
+
+def test_the_serial_probe_does_not_rename_what_it_measured() -> None:
+    """Round-trip time is host scheduling plus USB plus firmware plus the return.
+
+    Calling that spread "device jitter", or the uncertainty of a mark, collapses
+    four quantities into one — which is the thing `TIMING.md` exists to forbid.
+    Deriving either from this number would need a stated procedure and evidence,
+    and neither exists, so the result keeps the only name it has earned.
+    """
+    for path in (
+        Path("src/consciousness_lab/verification/devices.py"),
+        Path("src/consciousness_lab/verification/probe.py"),
+    ):
+        prose = prose_of(path)
+        for sentence in sentences(prose):
+            lowered = sentence.lower()
+            if "round" not in lowered and "rtt" not in lowered and "spread" not in lowered:
+                continue
+            for word in NOT_WHAT_RTT_IS:
+                assert word not in lowered or "not " in lowered or "never" in lowered, (
+                    f"{path} calls the round trip {word!r}: {sentence[:100]}"
+                )
 
 
 # --- the rule applied to the documents this ticket had to correct -------------

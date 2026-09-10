@@ -273,7 +273,31 @@ measurement, names the firmware or the probe, and does not name the mechanism,
 alignment or electrical interface, now fails. Verified by reintroducing the
 superseded wording.
 
-**32 new tests** (510 → 542, plus 1 deselected).
+**Corrected in review (CL-007-A-R10) — a number nobody measured, and a quantity
+called something it is not.**
+
+- The firmware and its README said BLE arrives with *"tens to hundreds of
+  milliseconds"* of latency. No device has been connected, `HARDWARE.md` records
+  that timing as unmeasured, and there was no source: the number was there to
+  sound authoritative. Saying *unmeasured* in the same sentence does not license
+  it — **the number is the claim**. Removed, with the absence stated: no figure
+  appears because nobody has one. Sweeping first found a third instance the
+  review did not name, in `HARDWARE.md`'s own open question, which asserted how
+  long a cough lasts.
+- `capture_serial`'s docstring called the round-trip spread *device jitter* and
+  said it determines whether a mark is trustworthy. A round trip is host
+  scheduling plus USB plus firmware service time plus the return path, summed;
+  it is none of `TIMING.md`'s narrowly defined terms. The result now keeps the
+  only name it has earned — serial round-trip latency and its variability — and
+  says that deriving anything else from it would need a stated procedure and
+  evidence, neither of which exists.
+
+Both guarded. A **vague or ranged magnitude** in a claim surface now fails, on the
+line that a configuration value is always one exact number, so `every 10 s` stays
+legal while *"tens to hundreds"* cannot. And the serial probe may not rename what
+it measured. Both verified by reintroducing the exact defect.
+
+**35 new tests** (510 → 545, plus 1 deselected).
 
 
 ### Added — CL-004: hardware verification harness

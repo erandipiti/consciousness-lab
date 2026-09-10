@@ -14,9 +14,10 @@ WHAT THIS DEVICE IS
 
 WHAT IT IS NOT
     A solution to placing that instant on the EEG or ECG timeline. Those arrive
-    over BLE with tens to hundreds of milliseconds of variable, unmeasured
-    latency, and `docs/TIMING.md` calls aligning them "the hardest timing
-    question in the study", still open. This firmware produces one input to that
+    over BLE, whose latency is variable and, for these devices, entirely
+    unmeasured — `HARDWARE.md` says so, and no number for it appears here
+    because nobody has one. `docs/TIMING.md` calls aligning them "the hardest
+    timing question in the study", still open. This firmware produces one input to that
     problem; it does not answer it, and nothing here should be read as if it did.
 
 WHY THE TIMESTAMP IS TAKEN WHERE IT IS

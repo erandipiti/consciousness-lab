@@ -81,9 +81,9 @@ These are unverified and are recorded so they can be checked, not relied on.
   transient sharp enough to time?** Unknown for both the Athena and the H10.
 - **Does one cough produce a transient in the accelerometers of a head-worn and a
   chest-worn device at once, and do those two transients share an identifiable
-  feature to align on?** Unknown. A cough lasts some hundreds of milliseconds
-  with a build-up, so even if both register it, which instant either one marks
-  is a separate unknown.
+  feature to align on?** Unknown. It is not an impulse — it has a build-up and a
+  duration, neither of them measured here — so even if both devices register it,
+  which instant either one marks is a separate unknown.
 
   These two arise from a proposal by Erandi (2026-09-10): strike the forehead
   with the marker's button so one physical event is both a mark and a mechanical

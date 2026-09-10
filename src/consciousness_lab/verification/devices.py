@@ -632,17 +632,23 @@ def capture_serial(
     that answers a ping and this probe that times it are prerequisites FOR the
     measurement, and had to exist before it could be taken at all.
 
-    Latency AND ITS VARIABILITY, because the variability is the point. A mean
-    round trip says nothing about whether a given mark is trustworthy, and a
-    device whose jitter is unknown is a device whose marks have unknown error
-    bars.
+    What it produces is **serial round-trip latency and its variability**, and
+    that is all it may be called. The round trip contains host scheduling, the
+    USB transport, this firmware's service time and the return path, all summed;
+    it is not the device's own timing behaviour, and it is not the uncertainty of
+    a mark. `TIMING.md` defines its terms narrowly and forbids collapsing
+    distinct quantities into one, so deriving either of those from this number
+    would need a stated procedure and evidence. Neither exists.
+
+    The spread is reported rather than the mean alone, because a mean hides the
+    variability any such derivation would have to account for.
 
     Sends ``P <token>`` and waits for ``R <token> <device_ns>``. The token means
     a late reply cannot be mistaken for a prompt one, which a bare round-trip
     timer would do silently.
 
     Interprets nothing. It does not decide that the device clock is good, that
-    the jitter is acceptable, or that a mark is aligned with anything.
+    the spread is acceptable, or that a mark is aligned with anything.
     """
     try:
         import serial as pyserial

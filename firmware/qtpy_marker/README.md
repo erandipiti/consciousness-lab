@@ -11,9 +11,10 @@ keeps an underlying event and an observation of it as separate quantities; this
 device reports the second and cannot report the first.
 
 **It does not solve alignment.** Placing that instant on the EEG or ECG timeline
-is a different, open problem: those streams arrive over BLE with tens to
-hundreds of milliseconds of variable latency, and `docs/TIMING.md` calls that
-"the hardest timing question in the study". This firmware is one input to it.
+is a different, open problem: those streams arrive over BLE, whose latency is
+variable and, for these devices, entirely unmeasured. No figure for it appears
+here, because nobody has one. `docs/TIMING.md` calls that "the hardest timing
+question in the study". This firmware is one input to it.
 
 ---
 
