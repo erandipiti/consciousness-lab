@@ -145,8 +145,11 @@ def serial(
 ) -> None:
     """Measure the marker channel's round trip and its SPREAD, and record what it emits.
 
-    This is the gate HANDOFF.md puts on CL-007: the marker mechanism cannot be
-    designed until serial round-trip latency and its variability are measured.
+    This produces the measurement CL-007 is gated on. The gate falls on the
+    marker MECHANISM and its electrical interface, never on the instrument
+    (`DECISIONS.md` D42): the firmware and this probe had to exist before any
+    measurement could be taken.
+
     The spread is the number that matters — a mean says nothing about whether a
     given mark can be trusted.
 

@@ -626,11 +626,16 @@ def capture_serial(
 ) -> None:
     """Measure the marker channel's round trip, and record what it emits.
 
-    `docs/HANDOFF.md` gates CL-007 on this: the marker firmware cannot be
-    designed until serial round-trip latency AND ITS VARIABILITY are measured.
-    The variability is the point — a mean round trip says nothing about whether
-    a given mark is trustworthy, and a device whose jitter is unknown is a device
-    whose marks have unknown error bars.
+    This produces the measurement CL-007 is gated on. Per `DECISIONS.md` D42 the
+    gate falls on the marker MECHANISM — how a mark is placed on a stream's
+    timeline, and any electrical interface — not on the instrument: firmware
+    that answers a ping and this probe that times it are prerequisites FOR the
+    measurement, and had to exist before it could be taken at all.
+
+    Latency AND ITS VARIABILITY, because the variability is the point. A mean
+    round trip says nothing about whether a given mark is trustworthy, and a
+    device whose jitter is unknown is a device whose marks have unknown error
+    bars.
 
     Sends ``P <token>`` and waits for ``R <token> <device_ns>``. The token means
     a late reply cannot be mistaken for a prompt one, which a bare round-trip

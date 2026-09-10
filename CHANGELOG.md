@@ -253,7 +253,27 @@ trivially. Presence is not absence.
 Verified by reintroducing the exact two-line-wrapped sentence and confirming it
 fails.
 
-**29 new tests** (510 → 539, plus 1 deselected).
+**Corrected in review (CL-007-A-R9) — source still enforced the rule this PR
+repealed.** `capture_serial`'s docstring said *"the marker firmware cannot be
+designed until serial round-trip latency and its variability are measured"*. D42,
+added in this same pull request, says the opposite: the **instrument** — firmware
+that answers a ping, and the probe that times it — is a prerequisite *for* the
+measurement and had to exist first; only the mechanism and its electrical
+interface stay gated. The repository was giving two incompatible instructions in
+one commit, and closing exactly that contradiction was in this ticket's objective.
+
+Both gate statements in `src/` now match D42. A sweep found the second one in
+`probe.py`, which said *mechanism* and was already correct but read ambiguously;
+it now names what is gated and what is not.
+
+The class is R6's — prose contradicting an authority — one level up: not a
+document against the tree, but source against a **decision**. So it is guarded
+the same way. A sentence in `src/` that asserts something is gated on a
+measurement, names the firmware or the probe, and does not name the mechanism,
+alignment or electrical interface, now fails. Verified by reintroducing the
+superseded wording.
+
+**32 new tests** (510 → 542, plus 1 deselected).
 
 
 ### Added — CL-004: hardware verification harness

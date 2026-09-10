@@ -264,6 +264,74 @@ def test_that_check_does_not_fire_on_the_honest_wording() -> None:
         assert not claims_the_edge(innocent), innocent
 
 
+# --- a superseded rule may survive in prose long after the decision ------------
+
+#: What D42 says is gated: the design. Never the instrument that measures.
+GATED_BY_D42 = ("mechanism", "alignment", "electrical")
+#: What D42 says may precede the measurement, because the measurement needs it.
+NOT_GATED = ("firmware", "probe", "instrument")
+#: Phrasings that assert something is blocked until a measurement exists.
+GATING = (
+    "cannot be designed",
+    "must not start",
+    "do not start it before",
+    "is gated on",
+    "gates cl-007",
+    "gated until",
+)
+
+
+def test_no_source_still_states_the_rule_d42_superseded() -> None:
+    """A decision changes; prose that stated the old rule does not follow it.
+
+    `docs/HANDOFF.md`'s gate said the marker could not be designed until serial
+    round-trip latency was measured. D42 split that: the INSTRUMENT — firmware
+    that answers a ping, and the probe that times it — is a prerequisite for the
+    measurement and had to exist first; only the mechanism and its electrical
+    interface stay gated.
+
+    The amendment was written in this pull request, and two docstrings in `src/`
+    went on stating the superseded rule anyway, so the repository gave two
+    incompatible instructions in the same commit. This is the class R6 caught
+    between documents and the tree, one level up: between prose and a decision.
+    """
+    offences: list[str] = []
+    for path in sorted(Path("src").rglob("*.py")):
+        for sentence in sentences(prose_of(path)):
+            lowered = sentence.lower()
+            if not any(phrase in lowered for phrase in GATING):
+                continue
+            if any(word in lowered for word in NOT_GATED) and not any(
+                word in lowered for word in GATED_BY_D42
+            ):
+                offences.append(f"{path}: {sentence[:100]}")
+    assert not offences, (
+        "source states that the instrument is gated on the measurement it produces, "
+        "which D42 superseded — the gate falls on the mechanism, not the firmware "
+        "or the probe:\n  " + "\n  ".join(offences)
+    )
+
+
+def test_that_check_catches_the_superseded_wording() -> None:
+    superseded = (
+        "docs/HANDOFF.md gates CL-007 on this: the marker firmware cannot be "
+        "designed until serial round-trip latency is measured."
+    )
+    lowered = superseded.lower()
+    assert any(phrase in lowered for phrase in GATING)
+    assert any(word in lowered for word in NOT_GATED)
+    assert not any(word in lowered for word in GATED_BY_D42)
+
+
+def test_that_check_accepts_the_amended_wording() -> None:
+    amended = (
+        "The gate falls on the marker MECHANISM and its electrical interface, "
+        "never on the instrument (DECISIONS.md D42)."
+    )
+    lowered = amended.lower()
+    assert any(word in lowered for word in GATED_BY_D42), "naming what IS gated clears it"
+
+
 # --- the rule applied to the documents this ticket had to correct -------------
 
 
