@@ -879,6 +879,36 @@ substantially and that `bleak` abstracts them imperfectly.
 **Revisit if.** macOS turns out not to sustain both peripherals on one adapter —
 which is measured by `probe concurrent`, not assumed here.
 
+## D42 — The instrument may precede the measurement; the design may not
+
+**Decided by Erandi, 2026-09-10.** `HANDOFF.md` gated CL-007 on CL-004 having
+measured serial round-trip latency and its variability. That gate is split:
+building the **instrument** that produces the measurement — firmware that
+answers a ping, and the probe that times it — is a prerequisite for the
+measurement. Designing the **marker mechanism**, its electrical interface, or how
+a mark is placed on a BLE stream's timeline stays gated on a real measurement
+existing.
+
+**Why.** The gate could not be satisfied as written. `probe serial` measures a
+round trip by sending `P <token>` and awaiting `R <token>`; without firmware that
+replies there is nothing to time, so "CL-004 measures serial RTT" presupposed the
+very thing CL-007 was forbidden to build. A gate that cannot open is not a
+safeguard, it is a stall — and routing around it silently, which is what the
+first CL-007-A head did, is worse than either.
+
+**What did NOT move.** The alignment question. `TIMING.md` still calls placing a
+mark on the BLE timeline the hardest timing question in the study and still calls
+it open, and nothing in CL-007-A answers it. No physical measurement has been
+taken: the firmware has never been flashed and the probe has never seen a board.
+
+**Rejected.** Deleting the gate — it is right about the thing that matters, and
+the original wording is kept in `HANDOFF.md` above the amendment. Leaving it
+unamended and shipping the firmware anyway — that is exactly the silent
+route-around a reviewer caught, and `AGENTS.md` §2 forbids it.
+
+**Revisit if.** A bench measurement contradicts the assumption that a
+marker-referenced strike is sharp enough to be worth having at all.
+
 ---
 
 ## Awaiting a named human

@@ -702,20 +702,67 @@ def test_silence_names_the_two_likely_causes(monkeypatch: pytest.MonkeyPatch) ->
     assert "marker firmware" in failure and "boot.py" in failure
 
 
-def test_the_firmware_timestamps_before_it_debounces() -> None:
-    """The one thing in the firmware that must not be got wrong.
+def test_the_edge_is_observed_before_it_is_timestamped() -> None:
+    """A mark must not be able to precede the observation that produced it.
 
-    Debounce after the timestamp and the mark is true to first contact; debounce
-    before it and an unmeasured delay has been added to a device whose entire
-    purpose is knowing when. Asserted against the source because there is no way
-    to run CircuitPython here.
+    Sampling the clock and THEN reading the GPIO biases every mark early by the
+    pin-read interval. It is small, but systematic rather than noise — the kind
+    of error that survives averaging and never announces itself. Asserted against
+    the source because CircuitPython cannot run here.
     """
     source = Path("firmware/qtpy_marker/code.py").read_text(encoding="utf-8")
     body = source.split("while True:", 1)[1]
-    now_at = body.index("now = time.monotonic_ns()")
+
+    read_at = body.index("is_down = not button.value")
+    edge_at = body.index("edge_ns = time.monotonic_ns()")
+    assert read_at < edge_at, "the pin must be read before the clock is sampled"
+
+    # The edge timestamp is taken INSIDE the transition branch, not before it.
+    transition_at = body.index("if is_down and not was_down:")
+    assert transition_at < edge_at, "the timestamp must live inside the transition path"
+
+    # And the debounce decision comes after the timestamp exists.
     debounce_at = body.index("DEBOUNCE_MS")
-    assert now_at < debounce_at, "the timestamp must be taken before any debounce logic"
+    assert edge_at < debounce_at, "debounce must not precede the timestamp"
+
+    # The mark carries the edge clock, never the loop's housekeeping one.
+    mark_line = next(line for line in body.splitlines() if 'emit(f"M ' in line)
+    assert "edge_ns" in mark_line and "{now}" not in mark_line
+
     assert "time.sleep" not in body, "a sleep in the poll loop widens detection jitter"
+
+
+def test_the_firmware_does_not_claim_serial_rtt_measures_button_detection() -> None:
+    """`probe serial` never touches the GPIO, so it cannot establish that number.
+
+    Claiming a quantity is measured by something that does not measure it is the
+    exact failure this project exists to prevent, and it was in the first head of
+    this ticket.
+    """
+    for path in ("firmware/qtpy_marker/code.py", "firmware/qtpy_marker/README.md"):
+        text = Path(path).read_text(encoding="utf-8")
+        if "probe serial" not in text:
+            continue
+        # Wherever the probe is named near detection, it must be to DENY the link.
+        assert "does NOT establish" in text or "does **not** establish" in text, path
+    readme = Path("firmware/qtpy_marker/README.md").read_text(encoding="utf-8")
+    assert "unmeasured" in readme
+    assert "does not exist" in readme, "the bench setup that WOULD measure it must be named absent"
+
+
+def test_the_gate_change_is_recorded_rather_than_routed_around() -> None:
+    """AGENTS.md §2: a repository gate is not stepped over quietly."""
+    handoff = Path("docs/HANDOFF.md").read_text(encoding="utf-8")
+    assert "Gate amended" in handoff
+    assert "D42" in handoff
+    # The original wording is preserved above the amendment, not edited away.
+    assert "Do not start it before CL-004 has measured serial round-trip latency" in handoff
+    # And the amendment is explicit that nothing has actually been measured.
+    assert "No physical measurement has been taken" in handoff
+
+    decisions = Path("docs/DECISIONS.md").read_text(encoding="utf-8")
+    assert "## D42" in decisions
+    assert "Decided by Erandi" in decisions.split("## D42")[1][:400], "authorisation is attributed"
 
 
 def test_the_firmware_makes_no_electrical_contact_with_a_participant() -> None:

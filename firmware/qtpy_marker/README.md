@@ -78,10 +78,27 @@ being assumed to hold at the end.
 
 ## Where the timestamp is taken, and why it matters
 
-`code.py` timestamps the **first edge**, before debouncing and before writing
-anything to serial. Debounce after the timestamp and the mark stays true to
-first contact. Debounce before it and you have silently added an unmeasured
-delay to a device whose entire purpose is knowing when something happened.
+The pin is **read first**, and the clock is sampled **inside the transition**,
+after the observation that produced it:
+
+```python
+is_down = not button.value  # observe
+if is_down and not was_down:
+    edge_ns = time.monotonic_ns()  # then time it
+    if edge_ns - last_press_ns > DEBOUNCE_MS * 1_000_000:
+        ...
+```
+
+Two things are being avoided, and only one of them is obvious.
+
+**Debounce after the timestamp, never before.** Debounce first and you have
+silently added an unmeasured delay to a device whose entire purpose is knowing
+when something happened.
+
+**Sample the clock after the pin, never before.** Reading `monotonic_ns()` and
+*then* the GPIO biases every mark EARLY by the pin-read interval. It is small,
+but it is systematic rather than noise, and a systematic error is the kind that
+survives averaging and never announces itself.
 
 ## What is still unknown about this device
 
@@ -89,10 +106,21 @@ Nothing below is a defect. They are the things that have not been measured, and
 a number written here before measurement would be invented.
 
 - **Detection jitter of the polling loop.** CircuitPython gives no user
-  interrupts, so the switch is polled. How tight that loop actually is on your
-  board is a measured number: run `consciousness-lab probe serial`.
-- **USB serial round-trip latency and its variability.** Same probe. This is the
-  gate `docs/HANDOFF.md` puts on CL-007.
+  interrupts, so the switch is polled, and how often the pin is actually sampled
+  on your board is **unmeasured**.
+
+  `probe serial` does **not** establish it. That probe sends a ping and times
+  the reply: it exercises the USB path and this loop's *service* latency, and it
+  never touches the button or the GPIO. Reading serial round-trip as evidence
+  about button detection would be claiming a measured quantity that nobody
+  measured — the exact error this project exists to prevent.
+
+  What *would* establish it: driving the input from a source whose own timing is
+  known — a signal generator or a second microcontroller pulsing the line — and
+  comparing its edge against the `M` line the board emits. **That bench setup
+  does not exist**, and nothing here should be read as if the number were known.
+- **USB serial round-trip latency and its variability.** This one `probe serial`
+  does measure, and it is the gate `docs/HANDOFF.md` puts on CL-007.
 - **Whether the board's clock drifts against the host's, and how fast.** The
   heartbeats produce the data; nobody has read it yet.
 

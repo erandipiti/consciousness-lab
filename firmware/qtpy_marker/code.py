@@ -108,15 +108,26 @@ def main():
     inbox = ""
 
     while True:
-        now = time.monotonic_ns()
+        # READ THE PIN FIRST. The timestamp is taken inside the transition, after
+        # the observation that produced it, so it cannot precede the thing it
+        # claims to time. Sampling the clock before the pin biases every mark
+        # EARLY by the pin-read interval — small, but systematic, and systematic
+        # error in a device whose only job is knowing when is the worst kind.
         is_down = not button.value
 
-        # First edge only, timestamped before anything else happens.
-        if is_down and not was_down and now - last_press_ns > DEBOUNCE_MS * 1_000_000:
-            last_press_ns = now
-            emit(f"M {press_seq} {now}\n")
-            press_seq += 1
+        if is_down and not was_down:
+            edge_ns = time.monotonic_ns()
+            # Debounce decided AFTER the timestamp exists, so the mark stays
+            # true to first contact either way.
+            if edge_ns - last_press_ns > DEBOUNCE_MS * 1_000_000:
+                last_press_ns = edge_ns
+                emit(f"M {press_seq} {edge_ns}\n")
+                press_seq += 1
         was_down = is_down
+
+        # Housekeeping clock, read after the edge path so nothing above waits on
+        # it. This is NOT the mark's timestamp.
+        now = time.monotonic_ns()
 
         # A host ping, answered immediately so the round trip measures the link
         # and not this loop's other work.
@@ -136,11 +147,14 @@ def main():
             emit(f"H {beat_seq} {now}\n")
             beat_seq += 1
 
-        # No sleep. Polling as fast as the interpreter allows keeps detection
-        # jitter as small as this platform can make it. How small is a MEASURED
-        # number, not an assumed one: `consciousness-lab probe serial` records
-        # the round-trip distribution, and until it has run, treat the detection
-        # latency of this loop as unknown.
+        # No sleep, so the pin is sampled as often as the interpreter allows.
+        #
+        # HOW OFTEN THAT IS, IS UNMEASURED. `probe serial` does NOT establish it:
+        # that probe sends a ping and times the reply, which exercises the USB
+        # path and this loop's SERVICE latency, and never touches the button or
+        # the GPIO at all. Treating serial round-trip as evidence about button
+        # detection would be claiming a measured quantity that nobody measured —
+        # see README.md for what would actually establish it.
 
 
 main()

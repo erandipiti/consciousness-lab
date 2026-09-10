@@ -97,7 +97,32 @@ nothing for it to be compared against — and the comparison is the operator's,
 not the probe's. Plus how to move evidence and sessions back to mimisbrunnr,
 which is what `SESSION_FORMAT.md` Q8 designed the package to allow.
 
-**13 new tests** (510 → 523, plus 1 deselected).
+**Corrected in review (CL-007-A-R3).** Three findings, all correct:
+
+- **The clock was sampled before the GPIO was read**, so a mark could precede the
+  observation that produced it — biased early by the pin-read interval, and
+  systematic rather than noise, which is the kind of error that survives
+  averaging and never announces itself. The pin is now read first and the clock
+  sampled *inside* the transition. The test previously only proved the timestamp
+  preceded debounce; it now proves it follows the observation.
+- **The firmware and README claimed `probe serial` measures the polling loop's
+  detection jitter. It does not** — that probe times a ping reply and never
+  touches the button or the GPIO. Claiming a quantity is measured by something
+  that does not measure it is the exact failure this project exists to prevent,
+  and it was in code written to prevent it. The number is now stated as
+  unmeasured, with the bench setup that *would* establish it named and marked as
+  not existing.
+- **The CL-007 gate was routed around.** `HANDOFF.md` forbade starting CL-007
+  before CL-004 had measured serial round-trip latency, and this ticket shipped
+  firmware with no measurement taken. The gate is now amended on the record
+  (`DECISIONS.md` D42, authorised by Erandi), with the original wording preserved
+  above the amendment: it was **unsatisfiable as written**, because `probe
+  serial` needs a device that replies, so "CL-004 measures serial RTT"
+  presupposed the firmware CL-007 was forbidden to build. Only the *instrument*
+  half moved. The alignment design stays gated, and the amendment says plainly
+  that no physical measurement exists — the firmware has never been flashed.
+
+**15 new tests** (510 → 525, plus 1 deselected).
 
 
 ### Added — CL-004: hardware verification harness

@@ -141,6 +141,28 @@ where the answer to "hardware sync path or post-hoc alignment?" becomes load-
 bearing. Do not start it before CL-004 has measured serial round-trip latency
 and its variability.
 
+> ### Gate amended (CL-007-A, 2026-09-10) — see `DECISIONS.md` D42
+>
+> The original gate is kept above because it was right about the thing that
+> matters. It was, however, **unsatisfiable as written**: `probe serial` measures
+> a round trip by sending `P <token>` and awaiting `R <token>`, so it needs a
+> device that replies. No firmware, no measurement, and the gate could never
+> open.
+>
+> Split in two, and only the first half moved:
+>
+> - **The instrument** — firmware that replies, and the probe that times it — is
+>   a *prerequisite for* the measurement, not a consequence of it. Authorised by
+>   Erandi on 2026-09-10, who asked for the firmware and the wiring directly.
+> - **The design** — the marker mechanism, its electrical interface, and how a
+>   mark is placed on a BLE stream's timeline — stays gated exactly as written,
+>   on a real measurement existing.
+>
+> **No physical measurement has been taken.** Nothing merged under CL-007-A may
+> be read as having opened the gate: the firmware has never been flashed, `probe
+> serial` has never been run against a board, and every timing number about this
+> device remains unknown.
+
 ### CL-008 — Multi-device session end to end
 
 All three sources under the recorder concurrently, producing a real Session
