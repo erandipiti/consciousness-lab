@@ -53,8 +53,11 @@ These are unverified and are recorded so they can be checked, not relied on.
   (CL-007-A) and **has never been flashed to a board**. Nothing about it has been
   observed: not that it runs, not that it enumerates as a serial device, not that
   it emits a single line. Serial round-trip latency and its variability remain
-  unmeasured, and the polling loop's detection jitter is unmeasured and has no
-  bench setup that would measure it.
+  unmeasured, and so does the gap between a switch closing and the firmware
+  observing it — the firmware polls, so a mark is the time an edge was *seen*,
+  never the edge itself, and no bench setup exists that would measure the
+  difference. The board's clock resolution is unmeasured too: the firmware
+  prints nanoseconds, which is a fact about the format and not about the clock.
 
   The marker mechanism, its electrical interface, and how a marker is placed on
   a common timeline with the BLE streams remain **undesigned and gated**

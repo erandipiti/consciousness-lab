@@ -1,7 +1,14 @@
 # QT Py marker channel
 
-A switch that reports, over USB serial, exactly when it was pressed — on its own
-clock. That is the whole device.
+A switch that reports, over USB serial, the device-clock time at which its
+polling loop **first observed** the input go low. That is the whole device, and
+the wording is the claim.
+
+The physical instant the switch closed is **earlier by an unknown amount**. The
+loop samples the pin, and how often it does so has never been measured, so the
+gap between the edge and the observation of it is unmeasured too. `TIMING.md`
+keeps an underlying event and an observation of it as separate quantities; this
+device reports the second and cannot report the first.
 
 **It does not solve alignment.** Placing that instant on the EEG or ECG timeline
 is a different, open problem: those streams arrive over BLE with tens to
@@ -61,12 +68,19 @@ One ASCII line per event, `\n` terminated.
 
 | line | when | meaning |
 |---|---|---|
-| `B <fw> <board> <ns_per_tick>` | once at boot | what the host is talking to |
-| `M <seq> <device_ns>` | button, first contact | a mark |
+| `B <fw> <board> time_unit=ns resolution=unmeasured` | once at boot | what the host is talking to |
+| `M <seq> <device_ns>` | first **observed** high→low transition | a mark |
 | `R <token> <device_ns>` | answering `P <token>` | round-trip latency probe |
 | `H <seq> <device_ns>` | every 10 s | heartbeat, so drift is measurable |
 
 Host to device: `P <token>\n`.
+
+`time_unit=ns` describes the **representation** of the numbers below — a fact
+about the format, which is knowable from here. The board's actual clock
+**resolution** is a fact about the board, nobody has measured it, and
+`time.monotonic_ns()` returning integer nanoseconds does not establish it: a
+coarse tick scaled into nanoseconds is indistinguishable from a fine one at this
+end. So it is reported unmeasured rather than encoded as a number.
 
 `device_ns` is this board's own monotonic clock. The host separately records
 when the line arrived. **They are different quantities and both are kept** —
@@ -105,9 +119,13 @@ survives averaging and never announces itself.
 Nothing below is a defect. They are the things that have not been measured, and
 a number written here before measurement would be invented.
 
-- **Detection jitter of the polling loop.** CircuitPython gives no user
-  interrupts, so the switch is polled, and how often the pin is actually sampled
-  on your board is **unmeasured**.
+- **The gap between a switch closing and this firmware observing it.** That gap
+  is what separates `M` from the physical edge, and it is **unmeasured**.
+  CircuitPython gives no user interrupts, so the pin is polled, and how often it
+  is actually sampled on your board has never been established.
+- **The board's clock resolution.** Unmeasured, and reported as such in the boot
+  banner rather than assumed from the fact that the values are printed in
+  nanoseconds.
 
   `probe serial` does **not** establish it. That probe sends a ping and times
   the reply: it exercises the USB path and this loop's *service* latency, and it

@@ -99,6 +99,64 @@ def test_the_guard_does_not_cry_wolf() -> None:
         assert names_event(innocent) is None, innocent
 
 
+# --- the same rule, applied to precision rather than to vocabulary ------------
+
+#: Phrases that claim a timing precision nobody has measured. The marker polls,
+#: so it can only ever report when it OBSERVED an edge; the edge itself was
+#: earlier by an unmeasured interval.
+OVERCLAIMS = (
+    "exactly when",
+    "precisely when",
+    "the exact moment",
+    "the instant it was",
+    "at the moment of",
+)
+
+MARKER_FILES = (
+    Path("firmware/qtpy_marker/code.py"),
+    Path("firmware/qtpy_marker/README.md"),
+)
+
+
+def test_the_marker_never_claims_to_time_the_physical_edge() -> None:
+    """It times an observation of the edge. Those are two quantities.
+
+    The firmware and its README both opened with "exactly when it was pressed"
+    while the same head recorded the polling interval as unmeasured — a claim
+    contradicted by a document in the same commit. `TIMING.md` keeps an
+    underlying event and an observation of it apart, and so must this.
+    """
+    for path in MARKER_FILES:
+        lowered = path.read_text(encoding="utf-8").lower()
+        for phrase in OVERCLAIMS:
+            assert phrase not in lowered, (
+                f"{path} claims {phrase!r}; the marker reports when it OBSERVED an "
+                "edge, and the gap to the physical edge is unmeasured"
+            )
+
+
+def test_the_marker_says_what_its_timestamp_actually_is() -> None:
+    """Removing a false claim is not the same as making a true one."""
+    for path in MARKER_FILES:
+        lowered = path.read_text(encoding="utf-8").lower()
+        assert "observed" in lowered, f"{path} must say the mark is an observation"
+        assert "unmeasured" in lowered, f"{path} must keep the gap explicit"
+
+
+def test_the_boot_banner_encodes_no_unmeasured_timing_fact() -> None:
+    """`time.monotonic_ns()` printing nanoseconds says nothing about the tick.
+
+    A coarse clock scaled into nanoseconds is indistinguishable from a fine one
+    at this end, so the banner reports the REPRESENTATION as a fact and the
+    resolution as unmeasured.
+    """
+    code = Path("firmware/qtpy_marker/code.py").read_text(encoding="utf-8")
+    banner = next(line for line in code.splitlines() if 'emit(f"B ' in line)
+    assert "time_unit=ns" in banner, "the format is knowable and is stated"
+    assert "resolution=unmeasured" in banner, "the clock's resolution is not, and says so"
+    assert "ns_per_tick" not in code, "a per-tick number would assert what nobody measured"
+
+
 # --- the rule applied to the documents this ticket had to correct -------------
 
 

@@ -204,7 +204,31 @@ confirming it fails.
 This is the second time stale status statements needed a ticket: CL-003-R3 existed
 only to correct three that had been false since CL-002B.
 
-**23 new tests** (510 → 533, plus 1 deselected).
+**Corrected in review (CL-007-A-R7) — two timing claims nobody had measured.**
+Same class as R3–R5, escaping through a guard that was too narrow: the vocabulary
+check catches code *naming a physical event*, and neither of these named one.
+
+- **The marker said it reports "exactly when it was pressed."** It polls. It can
+  only report the device-clock time at which the loop *first observed* the input
+  go low; the physical closure is earlier by an interval this same head records
+  as unmeasured. A claim contradicted by a document in the same commit, for the
+  second time in this PR. `M` is now described as the first **observed** high→low
+  transition, with the gap to the physical edge kept explicit in both the
+  firmware and its README.
+- **The boot banner hard-coded `ns_per_tick` to `1`.** `time.monotonic_ns()`
+  returning integer nanoseconds says nothing about the board's tick — a coarse
+  clock scaled into nanoseconds is indistinguishable from a fine one at this end.
+  The banner now reports `time_unit=ns resolution=unmeasured`: the representation
+  is knowable from here and is stated as fact, the resolution is not and says so.
+
+The guard is widened rather than the instances patched, which is the third time
+that has been the right move in this PR. `test_vocabulary.py` now also refuses
+absolute-precision phrasing in the marker files, requires them to say the mark is
+an *observation* and to keep the gap *unmeasured*, and forbids any per-tick number
+in the banner. Both new guards were verified by reintroducing the exact defect and
+confirming they fail.
+
+**26 new tests** (510 → 536, plus 1 deselected).
 
 
 ### Added — CL-004: hardware verification harness

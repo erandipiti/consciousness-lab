@@ -5,8 +5,12 @@ what CircuitPython ships with. Written for CircuitPython 8 or newer (it uses
 f-strings and ``time.monotonic_ns``); current QT Py boards ship 9.x.
 
 WHAT THIS DEVICE IS
-    A switch that says, over USB serial, exactly when it was pressed, on its own
-    clock. That is all. It is precise about itself.
+    A switch that says, over USB serial, the device-clock time at which its
+    polling loop FIRST OBSERVED the input go low. That is all, and the wording
+    is the claim: the physical instant the switch closed is earlier by an
+    unknown amount, because the loop samples the pin and how often it does so
+    has never been measured. `TIMING.md` keeps the underlying event and an
+    observation of it as separate quantities; so does this.
 
 WHAT IT IS NOT
     A solution to placing that instant on the EEG or ECG timeline. Those arrive
@@ -16,15 +20,25 @@ WHAT IT IS NOT
     problem; it does not answer it, and nothing here should be read as if it did.
 
 WHY THE TIMESTAMP IS TAKEN WHERE IT IS
-    ``t = monotonic_ns()`` runs on the FIRST edge, before debouncing and before
-    anything is written to serial. Debounce after the timestamp and the mark
-    stays true to first contact; debounce before it and you have silently added
-    an unmeasured delay to a device whose entire purpose is knowing when.
+    The pin is read first, and the clock is sampled inside the transition, so a
+    mark cannot precede the observation that produced it. Debounce is decided
+    after the timestamp exists; debounce before it and you have added a second
+    unmeasured delay on top of the polling interval that is already there.
+
+    None of that makes the mark the physical edge. It makes it an honest record
+    of when the edge was first SEEN, which is the most this device can say until
+    someone measures the gap.
 
 THE PROTOCOL, one ASCII line per event, ``\\n`` terminated:
 
-    B <fw> <board> <ns_per_tick>     once at boot: what the host is talking to
-    M <seq> <device_ns>              a press, at first contact
+    B <fw> <board> time_unit=ns resolution=unmeasured
+                                    once at boot: what the host is talking to.
+                                    `time_unit` describes the REPRESENTATION of
+                                    the numbers below, which is a fact about the
+                                    format. The clock's actual resolution is a
+                                    fact about the board and is unmeasured, so
+                                    it is reported as such rather than guessed.
+    M <seq> <device_ns>              first OBSERVED high->low transition
     R <token> <device_ns>            reply to a host ping; for round-trip latency
     H <seq> <device_ns>              periodic heartbeat; makes drift measurable
 
@@ -98,7 +112,12 @@ def main():
     # monotonic_ns() is the only clock here with usable resolution; the float
     # monotonic() loses precision as uptime grows, which is exactly wrong for a
     # device that exists to report a moment.
-    emit(f"B {FIRMWARE} {_board_name()} 1\n")
+    # `time_unit` is a property of the numbers this firmware prints. The board's
+    # actual clock resolution is a property of the board, nobody has measured it,
+    # and `monotonic_ns()` returning integer nanoseconds does not establish it —
+    # a coarse tick scaled into nanoseconds looks identical from here. Reported
+    # unmeasured rather than encoded as a fact (AGENTS.md §7).
+    emit(f"B {FIRMWARE} {_board_name()} time_unit=ns resolution=unmeasured\n")
 
     press_seq = 0
     beat_seq = 0
@@ -116,6 +135,7 @@ def main():
         is_down = not button.value
 
         if is_down and not was_down:
+            # The time the transition was OBSERVED, not the time it happened.
             edge_ns = time.monotonic_ns()
             # Debounce decided AFTER the timestamp exists, so the mark stays
             # true to first contact either way.
