@@ -157,6 +157,113 @@ def test_the_boot_banner_encodes_no_unmeasured_timing_fact() -> None:
     assert "ns_per_tick" not in code, "a per-tick number would assert what nobody measured"
 
 
+# --- the physical edge and an observation of it are two things -----------------
+
+#: Verbs that say the device *tells you* something.
+REPORTING = ("report", "says", "record", "emit")
+#: Words for the physical event, as opposed to seeing it.
+PHYSICAL_EDGE = ("pressed", "closed", "the press", "closure")
+
+#: Where a claim about this device is load-bearing. CHANGELOG.md is deliberately
+#: absent: it is a history, and quoting a past error while describing its fix is
+#: what a history is for.
+CLAIM_SURFACES = (
+    Path("firmware/qtpy_marker/code.py"),
+    Path("firmware/qtpy_marker/README.md"),
+    Path("firmware/README.md"),
+    Path("docs/HARDWARE.md"),
+)
+
+
+def prose_of(path: Path) -> str:
+    """Only the prose. Code is not prose, and splitting it on periods is nonsense.
+
+    A first version scanned `.py` files whole and joined a trailing comment to the
+    next `def` because neither ended in a period, inventing a sentence nobody
+    wrote. Comments and docstrings are where claims live; attribute access is not
+    a claim.
+    """
+    if path.suffix != ".py":
+        return path.read_text(encoding="utf-8")
+    import ast
+
+    source = path.read_text(encoding="utf-8")
+    parts: list[str] = []
+    for line in source.splitlines():
+        _, marker, comment = line.partition("#")
+        if marker and not line.strip().startswith(("'", '"')):
+            parts.append(comment.strip() + ".")
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            doc = ast.get_docstring(node)
+            if doc:
+                parts.append(doc)
+    return "\n".join(parts)
+
+
+def sentences(text: str) -> list[str]:
+    """Sentences, with wrapping removed.
+
+    Whitespace is normalised first because every check in this file that matched
+    a raw substring has been broken at least once by a line wrap — including one
+    introduced by the very edit that was fixing the sentence. A guard that a
+    reflow can defeat is not a guard.
+    """
+    flat = " ".join(text.split())
+    return [part.strip() for part in flat.replace("—", ".").split(".") if part.strip()]
+
+
+def claims_the_edge(text: str) -> list[str]:
+    """Sentences that say the device reports the physical event itself.
+
+    The device polls. It can report when it OBSERVED a transition; the closure
+    was earlier by an unmeasured amount. A sentence that pairs a reporting verb
+    with the physical event and never says "observed" has collapsed the two,
+    which `TIMING.md` exists to prevent and `AGENTS.md` §7 forbids.
+    """
+    guilty = []
+    for sentence in sentences(text):
+        lowered = sentence.lower()
+        if "observ" in lowered:
+            continue
+        if any(verb in lowered for verb in REPORTING) and any(
+            word in lowered for word in PHYSICAL_EDGE
+        ):
+            guilty.append(sentence)
+    return guilty
+
+
+def test_no_document_says_the_device_reports_the_physical_edge() -> None:
+    hits = [
+        f"{path}: {sentence[:90]}"
+        for path in CLAIM_SURFACES
+        for sentence in claims_the_edge(prose_of(path))
+    ]
+    assert not hits, (
+        "a reporting verb paired with the physical event, with no mention of "
+        "observing it — the marker times an observation, and the edge was earlier by "
+        "an unmeasured amount:\n  " + "\n  ".join(hits)
+    )
+
+
+def test_that_check_catches_both_sentences_that_got_through() -> None:
+    """Both were real, and one survived a round because a line wrap hid it."""
+    assert claims_the_edge("This firmware reports when its switch closed, on its own clock.")
+    assert claims_the_edge("a switch that reports, over USB serial, when it was pressed")
+    # The wrapped form must be caught identically; normalising is the whole point.
+    assert claims_the_edge("This firmware reports when its switch\nclosed, on its own clock.")
+
+
+def test_that_check_does_not_fire_on_the_honest_wording() -> None:
+    for innocent in (
+        "This firmware reports the device-clock time at which its polling loop first "
+        "observed the input go low, not when the switch physically closed.",
+        "The physical instant the switch closed is earlier by an unknown amount.",
+        "A switch that reports the first observed high-low transition.",
+    ):
+        assert not claims_the_edge(innocent), innocent
+
+
 # --- the rule applied to the documents this ticket had to correct -------------
 
 

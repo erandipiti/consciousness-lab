@@ -12,9 +12,11 @@ Versioning policy is unresolved — see `docs/OPERATIONS.md`.
 ### Added — CL-007-A: QT Py marker firmware, the serial probe, and the recording host
 
 **`firmware/qtpy_marker/`** — CircuitPython for the marker channel: a switch that
-reports, over USB serial, when it was pressed, on its own clock. That is all it
-is, and the README says so: placing that instant on a BLE stream's timeline is
-still the open question `TIMING.md` calls the hardest in the study.
+reports, over USB serial, the device-clock time at which its polling loop first
+*observed* the input go low. Not when the switch physically closed, which is
+earlier by an unmeasured amount. That is all it is, and the README says so:
+placing even that instant on a BLE stream's timeline is still the open question
+`TIMING.md` calls the hardest in the study.
 
 - The timestamp is taken on the **first edge**, before debouncing and before any
   serial write. Debounce first and you have added an unmeasured delay to a
@@ -228,7 +230,30 @@ an *observation* and to keep the gap *unmeasured*, and forbids any per-tick numb
 in the banner. Both new guards were verified by reintroducing the exact defect and
 confirming they fail.
 
-**26 new tests** (510 → 536, plus 1 deselected).
+**Corrected in review (CL-007-A-R8) — R7's fix, undone three paragraphs later.**
+The README's opening correctly said `M` is the first *observed* transition, and a
+later section still said *"this firmware reports when its switch closed"*. Same
+defect, same file, same head. A second instance sat in this changelog.
+
+The deeper problem was the guard R7 added: it checked that the honest words were
+**present** somewhere in the file, which a contradiction elsewhere passes
+trivially. Presence is not absence.
+
+- The guard is now **sentence-level and wrap-proof**. A reporting verb paired with
+  the physical event, in a sentence that never says *observed*, fails. Whitespace
+  is normalised first, because the sentence that survived a whole review round did
+  so by being split across two lines — including one wrap introduced by the very
+  edit that was fixing it.
+- It reads **prose only**. A first version split `.py` files on periods, joined a
+  trailing comment to the next `def`, and invented a sentence nobody wrote;
+  comments and docstrings are extracted properly now.
+- `CHANGELOG.md` is deliberately outside its scope: a history that quotes a past
+  error while describing its fix is doing its job.
+
+Verified by reintroducing the exact two-line-wrapped sentence and confirming it
+fails.
+
+**29 new tests** (510 → 539, plus 1 deselected).
 
 
 ### Added — CL-004: hardware verification harness

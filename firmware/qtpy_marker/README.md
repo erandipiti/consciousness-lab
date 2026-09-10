@@ -144,8 +144,10 @@ a number written here before measurement would be invented.
 
 ## What this device cannot tell you
 
-A mark is related to nothing but itself. This firmware reports when its switch
-closed, on its own clock, and that is the entire claim.
+A mark is related to nothing but itself. This firmware reports the device-clock
+time at which its polling loop first observed the input go low, and that is the
+entire claim — not when the switch physically closed, which was earlier by an
+unmeasured amount.
 
 **How a mark gets related to an EEG or ECG stream is undesigned, and designing it
 is gated** — `DECISIONS.md` D42: the marker mechanism, its electrical interface,
