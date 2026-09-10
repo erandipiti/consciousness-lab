@@ -437,6 +437,130 @@ def test_polar_reconnect_requires_an_address(tmp_path: Path) -> None:
     assert not list(tmp_path.rglob("*.json"))
 
 
+# --------------------- CL-007-A-R1: every stream the device offers, not just ECG
+
+
+class FakeSetting:
+    def __init__(self, kind: str, values: list[int]) -> None:
+        self.type, self.array_length = kind, values
+
+
+class FakeSettings:
+    def __init__(self, feature: str, settings: list[FakeSetting]) -> None:
+        self.measurement_type, self.settings, self.error_code = feature, settings, "OK"
+
+
+def test_settings_come_from_the_device_and_gaps_are_reported_not_filled() -> None:
+    """Choosing a sample rate ourselves would be inventing a device parameter."""
+    from consciousness_lab.verification.devices import _settings_to_kwargs
+
+    settings = FakeSettings(
+        "ACC",
+        [
+            FakeSetting("SAMPLE_RATE", [52, 104]),
+            FakeSetting("RESOLUTION", [16]),
+            FakeSetting("RANGE", [8]),
+        ],
+    )
+    kwargs, unresolved = _settings_to_kwargs(settings, {"sample_rate", "resolution", "range"})
+    assert kwargs == {"sample_rate": 52, "resolution": 16, "range": 8}
+    assert unresolved == []
+
+    partial, missing = _settings_to_kwargs(
+        FakeSettings("ECG", [FakeSetting("SAMPLE_RATE", [130])]),
+        {"sample_rate", "resolution"},
+    )
+    assert partial == {"sample_rate": 130}
+    assert missing == ["resolution"], "a gap is reported, never filled with something plausible"
+
+
+def test_a_feature_with_no_starter_is_reported_rather_than_skipped() -> None:
+    """'The library cannot start this' is a finding about the library."""
+    from consciousness_lab.verification import devices
+
+    assert set(devices._PMD_STARTERS) >= {"ECG", "ACC"}, (
+        "ACC is the channel that carries a tap or a cough; capturing only ECG would leave "
+        "the alignment question unmeasurable while looking like a working capture"
+    )
+
+
+def test_every_offered_stream_is_started_and_described_without_being_named(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The behavioural test: ACC must actually be captured, and never interpreted.
+
+    Capturing only ECG would leave the alignment question unmeasurable while
+    looking like a working capture — the accelerometer is the channel that
+    carries a physical event. And nothing here may decide that a stream IS an
+    accelerometer or that a transient in it IS anything at all.
+    """
+    from consciousness_lab.verification import devices
+
+    started: list[str] = []
+
+    class FakeFrame:
+        def __init__(self, timestamp: int, n: int) -> None:
+            self.timestamp, self.data = timestamp, list(range(n))
+
+    class FakePolarDevice:
+        def __init__(self, address: str) -> None:
+            self.address = address
+
+        async def connect(self) -> None:
+            return None
+
+        async def disconnect(self) -> None:
+            return None
+
+        async def get_available_features(self) -> list[str]:
+            return ["ECG", "ACC", "PPI"]  # PPI has no starter in the library
+
+        async def request_stream_settings(self, feature: str) -> FakeSettings:
+            common = [FakeSetting("SAMPLE_RATE", [130]), FakeSetting("RESOLUTION", [14])]
+            if feature == "ACC":
+                common.append(FakeSetting("RANGE", [8]))
+            return FakeSettings(feature, common)
+
+        async def start_ecg_stream(
+            self, ecg_callback: Callable[..., None], sample_rate: int, resolution: int
+        ) -> None:
+            started.append("ECG")
+            ecg_callback(FakeFrame(1000, 5))
+
+        async def start_acc_stream(
+            self,
+            acc_callback: Callable[..., None],
+            sample_rate: int,
+            resolution: int,
+            range: int,
+            channels: int | None = None,
+        ) -> None:
+            started.append("ACC")
+            acc_callback(FakeFrame(2000, 3))
+
+    import polar_python
+
+    monkeypatch.setattr(polar_python, "PolarDevice", FakePolarDevice)
+    run = VerificationRun(subject="polar-h10", purpose="p", method="m", device_firmware="1")
+    devices._capture_polar_pmd(run, 0.01, "AA:BB:CC:DD:EE:FF")
+
+    assert sorted(started) == ["ACC", "ECG"], "the accelerometer must be captured too"
+    used = next(o for o in run.observations if "streams started" in o.what)
+    assert used.value["ACC"] == {"sample_rate": 130, "resolution": 14, "range": 8}
+    assert "none chosen here" in used.how
+
+    labels = [o.what for o in run.observations]
+    assert any(label.startswith("ACC: host arrival times") for label in labels)
+    assert any(label.startswith("ECG: shape of each delivered frame") for label in labels)
+    # Structural description only — no physiological naming anywhere in the record.
+    joined = " ".join(labels).lower()
+    for word in ("tap", "cough", "impact", "heart", "bpm", "cardiac", "motion"):
+        assert word not in joined, f"{word!r} is an interpretation, not an observation"
+
+    # A feature the library cannot start is a reported finding, not a silent skip.
+    assert any("PPI" in f and "no way to start it" in f for f in run.failures)
+
+
 # ------------------------------------ CL-004-R2: the marker channel's round trip
 
 

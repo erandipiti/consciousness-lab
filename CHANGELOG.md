@@ -53,7 +53,30 @@ custom kernel.
 `HARDWARE.md` gains the macOS setup, including the CoreBluetooth permission that
 makes every device look switched off when a terminal does not hold it.
 
-**7 new tests** (510 → 517, plus 1 deselected).
+**Corrected before review returned (CL-007-A-R1).** Two things:
+
+- **`capture_polar` started ECG and nothing else.** The accelerometer is the
+  channel that carries a physical event, so an ECG-only capture left the whole
+  alignment question unmeasurable while looking like a working capture — the
+  exact failure this package exists to prevent. It now starts every stream the
+  device offers that polar-python can start, with every parameter read from the
+  device's own settings response and gaps *reported* rather than filled in. A
+  feature the library cannot start is a recorded finding about the library.
+- **A settings-matching bug** meant no parameter was ever resolved: the device
+  labels a setting `SAMPLE_RATE` while the library's parameter is `sample_rate`,
+  and the comparison was case-sensitive, so it silently matched nothing and read
+  as "the device did not answer".
+
+The firmware README's section on striking was rewritten. The design was always
+that **the button is the striking face** — the impact presses the switch — and
+the previous text framed that as a correction rather than as the design. It now
+lays out the alignment chain honestly: two sharp, marker-timestamped legs from
+striking each device, with a cough as the independent cross-check that both
+sensed one physical event. A cough is a few hundred milliseconds with a
+build-up, so its instant is ambiguous; it is the right confirmation and the
+wrong ruler.
+
+**10 new tests** (510 → 520, plus 1 deselected).
 
 
 ### Added — CL-004: hardware verification harness

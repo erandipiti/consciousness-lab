@@ -96,19 +96,41 @@ a number written here before measurement would be invented.
 - **Whether the board's clock drifts against the host's, and how fast.** The
   heartbeats produce the data; nobody has read it yet.
 
-## The tapping idea, and its one flaw
+## Striking with the button, and what it does and does not give you
 
-If the plan is to strike the headband so the impact appears in the Muse's
-accelerometer *and* as a mark on this channel, then **the impact and the button
-press must be the same physical event**. Press the button and then tap, and the
-two are separated by human coordination error — tens of milliseconds, variable,
-which is the same order as the BLE uncertainty you were trying to escape.
+The intended use is that **the button is the striking face**: the QT Py is tapped
+against the forehead, and the impact is what presses the switch. That matters,
+and it is the whole reason the mark is worth anything.
 
-Mount the switch on the face that strikes, so the impact presses it. Then the
-mark and the mechanical shock are one event, within the switch's travel.
+The alternative — press, then tap — separates the two by human coordination
+error: tens of milliseconds, variable, the same order as the BLE uncertainty the
+marker exists to escape. Mount the switch so the impact presses it and the mark
+and the mechanical shock are one event, within the switch's travel.
 
-A tap on the forehead is well coupled to a device on the forehead. It is **not**
-well coupled to a chest strap: the body damps it heavily. Marking both devices
-with one strike on the head is an assumption, and it is measurable — do not
-build a session protocol on it before `probe concurrent` has shown the transient
-in both accelerometer streams.
+### The alignment chain, and where it is weakest
+
+| link | how | sharpness |
+|---|---|---|
+| marker ↔ Muse | strike the headband with the button | an impulse; sharp |
+| marker ↔ H10 | strike the strap body with the button | same mechanism; sharp |
+| Muse ↔ H10 | a cough | a shared physiological event, but not an impulse |
+
+A **cough** is genuinely sensed by both: it jolts the head and it moves the chest
+wall, so it should appear in both accelerometers, and it leaves EMG in the EEG
+and motion artefact in the ECG. As a *cross-check* that both devices really did
+observe one physical event, it is exactly the right instrument.
+
+As a *ruler*, it is softer than a tap, and it is worth knowing why before
+building on it. A cough is not an impulse — it is a few hundred milliseconds
+with a build-up, so "the instant of the cough" is ambiguous, and the head jolt
+and the chest wall motion are mechanically different events that need not peak
+together. Whatever feature you align on carries that ambiguity as error.
+
+Which is why the table has two marker-referenced legs. Striking **both** devices
+gives two sharp, independently marker-timestamped links, and the cough then
+serves as the independent confirmation that the alignment they imply is real.
+
+None of the above is established. Whether a strike shows cleanly in the Muse's
+accelerometer, whether a cough shows in both, and how sharp either transient is,
+are things `probe concurrent` records and a human reads. Do not build a session
+protocol on any of it first.
