@@ -2,8 +2,14 @@
 
 Microcontroller firmware for the QT Py marker device.
 
-**Empty at CL-001.** No firmware has been written and the marker mechanism is
-undesigned — see [`../docs/HARDWARE.md`](../docs/HARDWARE.md).
+**One firmware exists: [`qtpy_marker/`](qtpy_marker/), added at CL-007-A.** It has
+**never been flashed to a board**, so nothing about its behaviour has been
+observed. The marker *mechanism* — how a mark is placed on a common timeline with
+the BLE streams — remains undesigned and gated (`../docs/DECISIONS.md` D42).
+
+Code existing is not a device behaving; see
+[`../docs/HARDWARE.md`](../docs/HARDWARE.md), where the QT Py row still reads
+*Pending verification*.
 
 Firmware is built and flashed independently of the Python package. The open
 questions that block work here are the marker semantics

@@ -174,7 +174,37 @@ three times and that it does not fire on ordinary prose; the flashing
 instruction that collided with it was reworded rather than exempted, because a
 guard with exceptions accumulates exceptions until it means nothing.
 
-**20 new tests** (510 → 530, plus 1 deselected).
+**Corrected in review (CL-007-A-R6) — the authority documents contradicted the
+tree.** Adding firmware made four statements false and none of them was updated:
+`HARDWARE.md`'s status row still said *no firmware written*, its assumptions
+section still said *No firmware exists in `firmware/`*, `firmware/README.md`
+still said *Empty at CL-001*, and `HANDOFF.md`'s layer table still said the
+acquisition layer had no firmware. `HARDWARE.md` is the project's authority on
+what exists versus what is assumed versus what is verified; a change that
+invalidates one of its statements and leaves it standing turns the authority into
+a liar, quietly, because nothing fails.
+
+All four corrected to the truthful boundary, and the boundary is the point:
+**firmware exists and has never been flashed.** The QT Py row still reads
+*Pending verification*. Nothing about the firmware's behaviour has been observed
+— not that it runs, not that it enumerates as a serial device, not that it emits
+one line. Serial round-trip latency stays unmeasured, detection jitter stays
+unmeasured with no bench setup that would measure it, and the marker mechanism
+stays gated by D42. **Code existing is not a device behaving**, and the documents
+now say so in those words.
+
+`tests/test_documents_match_the_tree.py` makes it mechanical. Statements that can
+be checked against the filesystem are, in both directions — a document may not
+claim firmware is absent while it is present, nor present once it is gone — and
+the QT Py row is separately asserted to still read *Pending verification*, because
+the risk in updating a document to admit code exists is that it drifts toward
+sounding verified. The guard was tested by reintroducing the false statement and
+confirming it fails.
+
+This is the second time stale status statements needed a ticket: CL-003-R3 existed
+only to correct three that had been false since CL-002B.
+
+**23 new tests** (510 → 533, plus 1 deselected).
 
 
 ### Added — CL-004: hardware verification harness

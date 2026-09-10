@@ -16,7 +16,7 @@ Five layers were declared at CL-001. Three now hold code.
 |---|---|
 | `storage` | **done for v2.** Canonical JSON, exact 64-bit integers, payload framing, Arrow schemas, chunk writer, package layout, verifier. |
 | `session` | **done for v2.** Allocator, lifecycle, annotations, writer, finalizer, registry, recovery, and the CL-003 recorder. |
-| `acquisition` | **EMPTY.** No device adapter, no BLE, no serial, no firmware. This is where the next work goes. |
+| `acquisition` | **EMPTY.** No device adapter, no BLE transport, no serial transport. (Marker firmware exists under `firmware/`, which is not this layer and is not importable Python.) |
 | `analysis` | **empty.** Not started. No ticket is open, and none should be until acquisition produces real data. |
 | `core` | **not created.** The ticket that needs shared types creates it. |
 
@@ -134,9 +134,11 @@ streams it does not expose is an open question — answer it in CL-004, not here
 
 ### CL-007 — Marker channel: QT Py firmware and adapter
 
-`HARDWARE.md`: *no firmware exists in `firmware/`. The marker mechanism, its
-electrical interface, and how a marker is placed on a common timeline with the
-BLE streams are undesigned.* This ticket designs all three, and it is the one
+`HARDWARE.md`, **as it read when this ticket was written**: *no firmware exists in
+`firmware/`. The marker mechanism, its electrical interface, and how a marker is
+placed on a common timeline with the BLE streams are undesigned.* The first
+clause is no longer true — CL-007-A added `firmware/qtpy_marker/`, never flashed
+— and `HARDWARE.md` now says so. The rest still holds. This ticket designs all three, and it is the one
 where the answer to "hardware sync path or post-hoc alignment?" becomes load-
 bearing. Do not start it before CL-004 has measured serial round-trip latency
 and its variability.
@@ -146,8 +148,8 @@ and its variability.
 > The original gate is kept above because it was right about the thing that
 > matters. It was, however, **unsatisfiable as written**: `probe serial` measures
 > a round trip by sending `P <token>` and awaiting `R <token>`, so it needs a
-> device that replies. No firmware, no measurement, and the gate could never
-> open.
+> device that replies. With no firmware in the tree there could be no
+> measurement, and the gate could never open.
 >
 > Split in two, and only the first half moved:
 >

@@ -15,7 +15,7 @@ Planned devices for Study 001, and the verification status of each.
 |---|---|---|---|---|
 | Muse S Athena | EEG (and whatever else the device exposes) | BLE | `brainflow` | **Pending verification** — never connected |
 | Polar H10 | Cardiac | BLE | `polar-python` (over `bleak`) | **Pending verification** — never connected |
-| Adafruit QT Py | Marker / synchronisation channel | USB serial | `pyserial` | **Pending verification** — no firmware written |
+| Adafruit QT Py | Marker / synchronisation channel | USB serial | `pyserial` | **Pending verification** — firmware written (CL-007-A), never flashed |
 
 ## What "verified" means here
 
@@ -49,10 +49,17 @@ These are unverified and are recorded so they can be checked, not relied on.
   Its maintenance status, its coverage of the device's data streams, and the
   fidelity with which it exposes device-side timing are all unverified. Whether
   the study needs streams this library does not expose is an open question.
-- **QT Py marker channel.** No firmware exists in `firmware/`. The marker
-  mechanism, its electrical interface, and how a marker is placed on a common
-  timeline with the BLE streams are undesigned. Serial round-trip latency and
-  its variability are unmeasured.
+- **QT Py marker channel.** Firmware now exists in `firmware/qtpy_marker/`
+  (CL-007-A) and **has never been flashed to a board**. Nothing about it has been
+  observed: not that it runs, not that it enumerates as a serial device, not that
+  it emits a single line. Serial round-trip latency and its variability remain
+  unmeasured, and the polling loop's detection jitter is unmeasured and has no
+  bench setup that would measure it.
+
+  The marker mechanism, its electrical interface, and how a marker is placed on
+  a common timeline with the BLE streams remain **undesigned and gated**
+  (`DECISIONS.md` D42). Code existing is not a device behaving: this row stays
+  *Pending verification* until someone connects the unit and observes it.
 - **BLE generally.** Concurrent connections to two BLE peripherals from one
   host adapter, and the effect of that on packet-arrival jitter, are unmeasured.
   Assume nothing about co-existence until it is tested.
