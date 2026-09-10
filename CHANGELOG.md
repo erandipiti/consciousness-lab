@@ -76,7 +76,28 @@ sensed one physical event. A cough is a few hundred milliseconds with a
 build-up, so its instant is ambiguous; it is the right confirmation and the
 wrong ruler.
 
-**10 new tests** (510 → 520, plus 1 deselected).
+**The Mac, prepared (D41).** `scripts/bootstrap-mac.sh` — idempotent, installs
+nothing silently, and finishes by running `probe env`, so the first thing that
+happens on that machine is evidence about it rather than an assumption. It is
+honest about the one thing it cannot do: CoreBluetooth grants Bluetooth access
+to the *application*, and without it every scan returns nothing and every device
+looks switched off. The script names the symptom, not just the fix.
+
+Checked rather than assumed: `uv.lock` already resolves for macOS — `bleak`
+pulls `pyobjc-framework-corebluetooth` under a `sys_platform == 'darwin'` marker
+and BrainFlow ships a `py3-none-any` wheel — so `uv sync --locked` needs no
+special handling on the Mac. That was the risk worth finding before a bench
+session, not during one.
+
+`HARDWARE.md` gains **a bench session in order**, because the order is not
+arbitrary: each step either produces evidence the next needs, or separates a
+host problem from a device problem before an hour is spent confusing them. The
+solo Muse and Polar probes must run before the concurrent one or there is
+nothing for it to be compared against — and the comparison is the operator's,
+not the probe's. Plus how to move evidence and sessions back to mimisbrunnr,
+which is what `SESSION_FORMAT.md` Q8 designed the package to allow.
+
+**13 new tests** (510 → 523, plus 1 deselected).
 
 
 ### Added — CL-004: hardware verification harness

@@ -125,29 +125,82 @@ times out, and confusing the two costs a bench session.
 
 ### Setting up the recording host (macOS)
 
-The Mac is the recording host (`DECISIONS.md` D41). From a fresh checkout:
+The Mac is the recording host (`DECISIONS.md` D41). Three lines, then a script
+that does the rest and checks its own work:
 
 ```bash
-xcode-select --install                         # if `git` is not already there
 curl -LsSf https://astral.sh/uv/install.sh | sh
 git clone https://github.com/erandipiti/consciousness-lab.git
-cd consciousness-lab && uv sync --locked --all-groups
-uv run consciousness-lab probe env --purpose "is this Mac ready to record"
+cd consciousness-lab && ./scripts/bootstrap-mac.sh
 ```
 
-**The macOS gotcha that looks like a broken device.** CoreBluetooth requires the
-*application* to hold Bluetooth permission, and a terminal does not have it by
-default. Grant it to your terminal in **System Settings → Privacy & Security →
-Bluetooth**, then restart the terminal. Without it, scans return nothing and
-every device looks switched off — which is why `probe scan` exists and why you
-run it before blaming a device.
+`bootstrap-mac.sh` is idempotent, installs nothing silently, and finishes by
+running `probe env` — so the first thing that happens on the machine is evidence
+about it rather than an assumption. The lock is already resolved for macOS
+(`bleak` pulls `pyobjc-framework-corebluetooth` under a `sys_platform ==
+'darwin'` marker), so `uv sync --locked` needs no special handling.
+
+**The one thing no script can do, and it looks exactly like broken hardware.**
+CoreBluetooth grants Bluetooth access to the *application*, and a terminal does
+not have it by default. Without it every scan returns nothing and every device
+looks switched off.
+
+> System Settings → Privacy & Security → Bluetooth → enable your terminal,
+> then **quit and reopen** the terminal — a new tab is not enough.
+
+That is why `probe scan` exists and why it comes before every device probe: a
+host with no permission and a device with a flat battery are indistinguishable
+from inside a library that simply times out.
 
 Serial ports are `/dev/cu.usbmodem*` on macOS, not `/dev/ttyACM*`.
 
-Recorded sessions can be moved to `mimisbrunnr` for storage and analysis by
-copying the whole `data/sessions/<id>/` directory. That is not a workaround: the
-package is designed to be the canonical, independently interpretable unit and
-the registry is rebuildable by scanning packages (`SESSION_FORMAT.md` Q8).
+### A bench session, in order
+
+The order is not arbitrary. Each step either produces evidence the next one
+needs, or separates a host problem from a device problem before you can waste an
+hour confusing them.
+
+| # | command | what it settles |
+|---|---|---|
+| 1 | `probe env` | is this host capable at all — before any device is blamed |
+| 2 | `probe scan` | does the host *see* anything; gets you the H10's address |
+| 3 | `probe serial --port /dev/cu.usbmodem*` | the marker's round trip and its spread. No BLE, no participant — do it while the others charge |
+| 4 | `probe muse` | what the Athena actually delivers, alone |
+| 5 | `probe polar --address <from step 2>` | what the H10 actually delivers, alone |
+| 6 | `probe reconnect --device muse` | what a reconnect does to counters and timebase |
+| 7 | `probe concurrent --polar-address <…>` | whether one adapter sustains both |
+
+Steps 4 and 5 must run **alone** before step 7, or step 7 has nothing to be
+compared against — and the comparison is the operator's, not the probe's.
+
+Every command needs `--purpose` and `--method` in your own words, and a device
+command needs `--firmware`. They have no defaults and the run refuses to be
+written without them: they are part of what a verification *is* (`AGENTS.md`
+§7), and a report missing its provenance is worse than no report because it
+still looks like evidence.
+
+**When something fails, read the failure before re-running.** A failure is a
+recorded finding, not an error to retry past. "No notification arrived" and "the
+scan saw nothing" mean different things and point at different halves of the
+system.
+
+### Getting the evidence back to mimisbrunnr
+
+```bash
+rsync -av data/verification/ mimisbrunnr:~/projects/consciousness-lab/data/verification/
+rsync -av data/sessions/     mimisbrunnr:~/projects/consciousness-lab/data/sessions/
+```
+
+Copying whole directories is not a workaround. `SESSION_FORMAT.md` Q8 makes the
+entire `sessions/<id>/` directory the canonical, independently interpretable
+unit, with the registry rebuildable by scanning packages — moving a session
+between hosts is what the format was built for. Rebuild the index after:
+
+```bash
+uv run python -c "from consciousness_lab.session import registry; \
+from consciousness_lab.storage.paths import DataRoot; \
+from pathlib import Path; registry.rebuild(DataRoot(Path('data')))"
+```
 
 ### Host readiness — observed, not a device verification
 

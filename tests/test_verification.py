@@ -730,6 +730,47 @@ def test_the_firmware_makes_no_electrical_contact_with_a_participant() -> None:
     assert "digitalio.Direction.INPUT" in source
 
 
+# --------------------------------------------- the Mac bootstrap is honest
+
+
+def test_the_bootstrap_script_is_valid_bash_and_idempotent_by_construction() -> None:
+    """It runs on a machine that is not this one, so it gets checked here.
+
+    A broken bootstrap is discovered at the bench, which is the most expensive
+    place to discover anything.
+    """
+    import subprocess
+
+    script = Path("scripts/bootstrap-mac.sh")
+    assert script.is_file() and script.stat().st_mode & 0o111, "must be executable"
+    syntax = subprocess.run(["bash", "-n", str(script)], capture_output=True, text=True)
+    assert syntax.returncode == 0, syntax.stderr
+
+    source = script.read_text(encoding="utf-8")
+    # Re-runnable: it must not assume a fresh machine.
+    assert "already inside the checkout" in source
+    assert "if command -v uv" in source, "an existing uv must not be reinstalled"
+    # It ends by producing evidence rather than by declaring success.
+    assert "probe env" in source
+
+
+def test_the_bootstrap_does_not_pretend_to_grant_bluetooth_permission() -> None:
+    """Only a human clicking in System Settings can, and saying otherwise wastes a session."""
+    source = Path("scripts/bootstrap-mac.sh").read_text(encoding="utf-8")
+    assert "cannot do" in source
+    assert "Privacy & Security" in source
+    assert "looks switched off" in source, "the symptom must be named, not just the fix"
+
+
+def test_the_bench_runbook_orders_solo_probes_before_the_concurrent_one() -> None:
+    """Step 7 has nothing to compare against unless 4 and 5 ran alone first."""
+    doc = Path("docs/HARDWARE.md").read_text(encoding="utf-8")
+    bench = doc[doc.index("### A bench session, in order") :]
+    for earlier, later in (("probe scan", "probe polar"), ("probe muse", "probe concurrent")):
+        assert bench.index(earlier) < bench.index(later), f"{earlier} must precede {later}"
+    assert "must run **alone** before step 7" in bench
+
+
 # ------------------------------------------------- hardware tests are excluded
 
 
