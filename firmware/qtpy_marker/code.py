@@ -103,9 +103,24 @@ def main():
     # middle of the data stream.
     serial = usb_cdc.data
     if serial is None:
-        # Fall back so a misconfigured board still says something rather than
-        # appearing dead. The README explains how to enable the data channel.
-        serial = usb_cdc.console
+        # FAIL CLOSED. The previous version fell back to the console so a
+        # misconfigured board "still said something" — which put marker records
+        # into the same stream as tracebacks, in exactly the misconfiguration
+        # boot.py exists to prevent. A record indistinguishable from console
+        # noise is worse than no record: it still looks like data.
+        #
+        # So nothing is acquired. The console gets an explanation, once, and the
+        # board idles until someone fixes boot.py and resets it.
+        if usb_cdc.console is not None:
+            usb_cdc.console.write(
+                b"FATAL: usb_cdc.data is unavailable, so there is no channel that "
+                b"carries marks and nothing else.\r\n"
+                b"Copy boot.py to CIRCUITPY and POWER-CYCLE the board; boot.py runs "
+                b"only at reset.\r\n"
+                b"No marks will be emitted until then.\r\n"
+            )
+        while True:
+            time.sleep(1)
 
     button = digitalio.DigitalInOut(BUTTON_PIN)
     button.direction = digitalio.Direction.INPUT
@@ -128,7 +143,13 @@ def main():
     beat_seq = 0
     last_press_ns = 0
     last_beat_ns = time.monotonic_ns()
-    was_down = False
+    # Armed from the pin's ACTUAL state, never from a literal. Starting at False
+    # means a switch already held at boot satisfies `is_down and not was_down` on
+    # the very first sample and emits an M for a transition nobody observed — a
+    # record whose stated meaning is false, which is the one thing this device
+    # must not produce. Sampling first means a held switch is simply seen as
+    # down, and the next mark waits for a real release and press.
+    was_down = not button.value
     inbox = ""
 
     while True:

@@ -317,7 +317,29 @@ it measured. Both verified by reintroducing the exact defect.
 
 All three variants verified by reintroducing them and confirming the guards fail.
 
-**37 new tests** (510 → 547, plus 1 deselected).
+**Corrected in review (CL-007-A-R12) — two integrity defects in the firmware
+itself, not in its prose.**
+
+- **The marker stream failed open.** When `usb_cdc.data` was unavailable the
+  firmware fell back to `usb_cdc.console` and emitted the whole protocol there —
+  in exactly the misconfiguration `boot.py` exists to prevent, putting marker
+  records in the same stream as tracebacks. A record indistinguishable from
+  console noise is worse than no record, because it still looks like data. It now
+  **fails closed**: nothing is acquired, the console gets one explanation naming
+  the fix and that `boot.py` runs only at reset, and the board idles.
+- **A mark could be synthesised at boot.** `was_down` started at `False`, so a
+  switch already held when the loop starts satisfied `is_down and not was_down`
+  on the first sample and emitted an `M` for a transition nobody observed — a
+  record whose stated meaning is false, which is the single thing this device
+  must not produce. It is now armed from the pin's actual state, so a held switch
+  is simply seen as down and the next mark waits for a real release and press.
+
+Both regressed structurally with `ast` — no assignment may make the console the
+marker stream, and `was_down` may not start from a literal — and the edge rule is
+also exercised behaviourally against boot-with-switch-held, which is the case that
+regressed. Both verified by reintroducing the original bug.
+
+**40 new tests** (510 → 550, plus 1 deselected).
 
 
 ### Added — CL-004: hardware verification harness

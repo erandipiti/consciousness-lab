@@ -61,8 +61,13 @@ one into that without both.
    - `boot.py` — gives the marker stream its own serial channel
    - `code.py` — the firmware
 3. **Power-cycle the board.** `boot.py` runs only at reset; a soft reload will
-   not enable the data channel, and marks would then share the console with
-   tracebacks.
+   not enable the data channel.
+
+If the data channel is missing the firmware **acquires nothing**. It writes an
+explanation to the console and idles. That is deliberate: emitting marks on the
+console would put records in the same stream as tracebacks, and a record
+indistinguishable from console noise is worse than no record, because it still
+looks like data.
 
 ## The protocol
 
@@ -72,6 +77,10 @@ One ASCII line per event, `\n` terminated.
 |---|---|---|
 | `B <fw> <board> time_unit=ns resolution=unmeasured` | once at boot | what the host is talking to |
 | `M <seq> <device_ns>` | first **observed** high→low transition | a mark |
+
+A switch already held when the board starts is **not** a transition: the loop
+arms itself from the pin's actual state, so the first `M` waits for a real
+release and press. Every `M` corresponds to a transition that was observed.
 | `R <token> <device_ns>` | answering `P <token>` | round-trip latency probe |
 | `H <seq> <device_ns>` | every 10 s | heartbeat, so drift is measurable |
 

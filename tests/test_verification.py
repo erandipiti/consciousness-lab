@@ -711,7 +711,10 @@ def test_the_edge_is_observed_before_it_is_timestamped() -> None:
     the source because CircuitPython cannot run here.
     """
     source = Path("firmware/qtpy_marker/code.py").read_text(encoding="utf-8")
-    body = source.split("while True:", 1)[1]
+    # The LAST `while True:` is the polling loop. An earlier one is the
+    # fail-closed idle loop, which is allowed to sleep and must, so that a
+    # misconfigured board does not spin a core forever.
+    body = source.rsplit("while True:", 1)[1]
 
     read_at = body.index("is_down = not button.value")
     edge_at = body.index("edge_ns = time.monotonic_ns()")
@@ -730,6 +733,95 @@ def test_the_edge_is_observed_before_it_is_timestamped() -> None:
     assert "edge_ns" in mark_line and "{now}" not in mark_line
 
     assert "time.sleep" not in body, "a sleep in the poll loop widens detection jitter"
+    idle = source.split("while True:", 1)[1][: source.split("while True:", 1)[1].find("\n\n")]
+    assert "time.sleep" in idle, (
+        "the fail-closed idle loop must sleep; spinning a core because boot.py is "
+        "missing helps nobody"
+    )
+
+
+def test_the_marker_stream_never_falls_back_to_the_console() -> None:
+    """Fail closed. A record indistinguishable from console noise still looks like data.
+
+    The firmware used to fall back to `usb_cdc.console` when the dedicated data
+    channel was missing, so that a misconfigured board "still said something" —
+    which put marker records into the same stream as tracebacks, in exactly the
+    misconfiguration `boot.py` exists to prevent. Checked with `ast` rather than
+    by string search: what matters is that no assignment makes the console the
+    stream that marks are written to.
+    """
+    import ast
+
+    tree = ast.parse(Path("firmware/qtpy_marker/code.py").read_text(encoding="utf-8"))
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Assign):
+            continue
+        names = {t.id for t in node.targets if isinstance(t, ast.Name)}
+        if "serial" not in names:
+            continue
+        source = ast.unparse(node.value)
+        assert "console" not in source, (
+            f"the marker stream must never become the console: {ast.unparse(node)}"
+        )
+    body = Path("firmware/qtpy_marker/code.py").read_text(encoding="utf-8")
+    assert "FATAL" in body, "the operator must be told why nothing is being acquired"
+    assert "POWER-CYCLE" in body, "and what to do, since boot.py only runs at reset"
+
+
+def test_a_switch_held_at_boot_cannot_synthesise_a_mark() -> None:
+    """Every M must correspond to a transition that was actually observed.
+
+    `was_down = False` meant a switch already held when the loop starts satisfies
+    `is_down and not was_down` on the very first sample, emitting an M for a
+    high->low transition nobody saw. A record whose stated meaning is false is
+    the one thing this device must not produce.
+
+    Asserted structurally: the initial value must come from reading the pin, not
+    from a literal.
+    """
+    import ast
+
+    tree = ast.parse(Path("firmware/qtpy_marker/code.py").read_text(encoding="utf-8"))
+    initialisers = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Assign)
+        and any(isinstance(t, ast.Name) and t.id == "was_down" for t in node.targets)
+    ]
+    assert initialisers, "was_down must be initialised somewhere"
+    first = ast.unparse(initialisers[0].value)
+    assert not isinstance(initialisers[0].value, ast.Constant), (
+        f"was_down starts from a literal ({first}), so a switch held at boot emits a "
+        "mark for a transition nobody observed"
+    )
+    assert "button.value" in first, f"it must be armed from the pin's actual state: {first}"
+
+
+def test_the_edge_rule_would_not_fire_on_a_switch_held_at_boot() -> None:
+    """The rule itself, exercised. The firmware cannot run here; its logic can.
+
+    Mirrors `is_down and not was_down` against the two startup states, so the
+    regression is behavioural and not only structural.
+    """
+
+    def marks(samples: list[bool], armed_from_pin: bool) -> int:
+        was_down = samples[0] if armed_from_pin else False
+        emitted = 0
+        for is_down in samples:
+            if is_down and not was_down:
+                emitted += 1
+            was_down = is_down
+        return emitted
+
+    held_then_released_then_pressed = [True, True, False, False, True]
+    assert marks(held_then_released_then_pressed, armed_from_pin=True) == 1, (
+        "one real press after the release; the boot state is not a transition"
+    )
+    assert marks(held_then_released_then_pressed, armed_from_pin=False) == 2, (
+        "the old initialisation invents a mark at boot — this is what regressed"
+    )
+    released_at_boot = [False, False, True, False, True]
+    assert marks(released_at_boot, armed_from_pin=True) == 2, "normal presses still count"
 
 
 def test_the_firmware_does_not_claim_serial_rtt_measures_button_detection() -> None:
