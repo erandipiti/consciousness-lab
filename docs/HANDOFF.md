@@ -71,7 +71,7 @@ doing something wrong.
 Scope for each is **recovered from the repository, not invented** — the method
 CL-003 used. Every claim below cites where the requirement is already written.
 
-### CL-004 — Device characterisation harness  ← START HERE
+### CL-004 — Device characterisation harness  ✅ merged (ac880ce)
 
 **Not an adapter.** A harness that connects each physical device and *records
 what it actually does*, in the format `docs/HARDWARE.md` §"Recording a
@@ -133,6 +133,15 @@ stream coverage and timing fidelity are unverified. Whether the study needs
 streams it does not expose is an open question — answer it in CL-004, not here.
 
 ### CL-007 — Marker channel: QT Py firmware and adapter
+
+> **CL-007-A merged (c90828f)**: the instrument only — firmware, `probe serial`,
+> and the recording-host decision. The mechanism, its electrical interface and the
+> alignment question remain gated; see the amendment below.
+>
+> **← START HERE is now the bench**, not a ticket: `scripts/bootstrap-mac.sh` on the
+> Mac, then the probe sequence in `HARDWARE.md` → *A bench session, in order*.
+> CL-005 and CL-006 are designed from what those probes observe, so neither can
+> start until they have run.
 
 `HARDWARE.md`, **as it read when this ticket was written**: *no firmware exists in
 `firmware/`. The marker mechanism, its electrical interface, and how a marker is
