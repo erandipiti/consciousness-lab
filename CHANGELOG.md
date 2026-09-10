@@ -297,7 +297,27 @@ line that a configuration value is always one exact number, so `every 10 s` stay
 legal while *"tens to hundreds"* cannot. And the serial probe may not rename what
 it measured. Both verified by reintroducing the exact defect.
 
-**35 new tests** (510 → 545, plus 1 deselected).
+**Corrected in review (CL-007-A-R11).**
+
+- **Two semantic variants of the observed-vs-physical collapse.** `code.py` said
+  the device "records when the thing happened by its own clock" and that
+  debouncing after the timestamp keeps the mark "true to first contact". Both
+  name the physical event as the thing being timed, which the same file's
+  contract denies. The sentence guard missed them because it required a
+  reporting verb beside an edge word, and neither phrasing had that shape — the
+  defect is semantic, so a guard built on one phrasing catches one phrasing. The
+  verb and event-noun lists are widened accordingly.
+- **Universal claims about a board nobody has connected.** `code.py` said `A0`
+  exists on every QT Py variant and named a subset, and that current boards ship
+  CircuitPython 9.x; the README repeated the pin claim. A pinout is a device fact
+  like any other, and `HARDWARE.md` does not record which model this even is.
+  Both now say to read the pinout and the CircuitPython version off the board in
+  hand. A new guard refuses universal or version claims about hardware while
+  allowing instructions to go look.
+
+All three variants verified by reintroducing them and confirming the guards fail.
+
+**37 new tests** (510 → 547, plus 1 deselected).
 
 
 ### Added — CL-004: hardware verification harness

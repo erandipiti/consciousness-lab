@@ -160,10 +160,32 @@ def test_the_boot_banner_encodes_no_unmeasured_timing_fact() -> None:
 
 # --- the physical edge and an observation of it are two things -----------------
 
-#: Verbs that say the device *tells you* something.
-REPORTING = ("report", "says", "record", "emit")
-#: Words for the physical event, as opposed to seeing it.
-PHYSICAL_EDGE = ("pressed", "closed", "the press", "closure")
+#: Verbs that say the device *tells you* or *keeps* something. Widened after a
+#: round where "records when the thing happened" and "true to first contact"
+#: both slipped past a narrower list: the defect is semantic, so a guard built
+#: on one phrasing catches one phrasing.
+REPORTING = (
+    "report",
+    "says",
+    "record",
+    "emit",
+    "timestamp",
+    "true to",
+    "tied to",
+    "keeps the mark",
+    "marks when",
+)
+#: Names for the physical event, as opposed to seeing it happen.
+PHYSICAL_EDGE = (
+    "pressed",
+    "closed",
+    "the press",
+    "closure",
+    "first contact",
+    "thing happened",
+    "something happened",
+    "when it happened",
+)
 
 #: Where a claim about this device is load-bearing. CHANGELOG.md is deliberately
 #: absent: it is a history, and quoting a past error while describing its fix is
@@ -331,6 +353,46 @@ def test_that_check_accepts_the_amended_wording() -> None:
     )
     lowered = amended.lower()
     assert any(word in lowered for word in GATED_BY_D42), "naming what IS gated clears it"
+
+
+# --- claims about a board nobody has connected --------------------------------
+
+#: Universal or version claims about hardware. No board has been connected and
+#: `HARDWARE.md` does not even record which model this is, so "every variant"
+#: and "boards ship X" are assertions about devices this repository has never met.
+BOARD_CLAIM = re.compile(
+    r"\b(every|all|any)\s+(qt\s*py|variant|board)"
+    r"|\bboards\s+ship\b"
+    r"|\bexists\s+on\s+(every|all)\b",
+    re.IGNORECASE,
+)
+
+
+def test_the_marker_asserts_nothing_universal_about_boards_it_has_never_met() -> None:
+    """AGENTS.md §7 applies to pinouts and firmware versions too.
+
+    `code.py` said A0 exists on every QT Py variant and named a subset, and that
+    current boards ship CircuitPython 9.x. Nobody has connected a board, and
+    `HARDWARE.md` does not record which model this even is. A pinout is a device
+    fact like any other.
+    """
+    offences = [
+        f"{path}: {match.group(0)!r}"
+        for path in MARKER_FILES
+        for match in BOARD_CLAIM.finditer(prose_of(path))
+    ]
+    assert not offences, (
+        "a universal claim about hardware this repository has never connected; say what "
+        "to read off the board in hand instead:\n  " + "\n  ".join(offences)
+    )
+
+
+def test_that_board_check_separates_a_claim_from_an_instruction() -> None:
+    assert BOARD_CLAIM.search("A0 exists on every QT Py variant")
+    assert BOARD_CLAIM.search("current QT Py boards ship 9.x")
+    # Telling someone to read their own board asserts nothing.
+    assert not BOARD_CLAIM.search("Read the pinout for the model in your hand")
+    assert not BOARD_CLAIM.search("Set BUTTON_PIN to a free GPIO on your board")
 
 
 # --- a magnitude nobody measured, and a quantity called something else ---------

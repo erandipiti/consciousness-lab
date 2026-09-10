@@ -34,8 +34,9 @@ One momentary switch. Nothing else.
 - One leg of the switch to **A0**, the other to **GND**.
 - No resistor. The firmware enables the internal pull-up, so the pin idles high
   and reads low when pressed.
-- Any free GPIO works; `A0` exists on every QT Py variant. Change `BUTTON_PIN`
-  in `code.py` if you use another.
+- The pin is a **board fact this repository has not verified** — no board has been
+  connected. Read the pinout for the model in your hand, pick a free GPIO, and set
+  `BUTTON_PIN` in `code.py` to it. `A0` is only what the file happens to ship with.
 
 ### What this wiring deliberately does not touch
 
@@ -107,8 +108,8 @@ if is_down and not was_down:
 Two things are being avoided, and only one of them is obvious.
 
 **Debounce after the timestamp, never before.** Debounce first and you have
-silently added an unmeasured delay to a device whose entire purpose is knowing
-when something happened.
+silently added a second unmeasured delay — on top of the polling interval that is
+already between the physical closure and the observation of it.
 
 **Sample the clock after the pin, never before.** Reading `monotonic_ns()` and
 *then* the GPIO biases every mark EARLY by the pin-read interval. It is small,

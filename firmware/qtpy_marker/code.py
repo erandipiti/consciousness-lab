@@ -1,8 +1,10 @@
 """QT Py marker channel — CircuitPython firmware.
 
 Drop this on the CIRCUITPY drive as ``code.py``. It needs no libraries beyond
-what CircuitPython ships with. Written for CircuitPython 8 or newer (it uses
-f-strings and ``time.monotonic_ns``); current QT Py boards ship 9.x.
+what CircuitPython ships with. It needs a CircuitPython that has
+``time.monotonic_ns`` and f-strings. Which version is on your board is a board
+fact this repository has not checked — read it off the device rather than
+assuming a floor from anything written here.
 
 WHAT THIS DEVICE IS
     A switch that says, over USB serial, the device-clock time at which its
@@ -47,8 +49,9 @@ THE PROTOCOL, one ASCII line per event, ``\\n`` terminated:
 
     Device time and host arrival time are DIFFERENT QUANTITIES and both are
     kept. `TIMING.md` rule 2: never overwrite a captured quantity with a derived
-    one. The host records when a line arrived; this device records when the
-    thing happened by its own clock; nobody collapses them.
+    one. The host records when a line arrived; this device records when its
+    polling loop first observed the transition, on its own clock. Neither is the
+    physical event, and nobody collapses them.
 
 NO ELECTRICAL CONTACT WITH A PARTICIPANT
     A switch, a GPIO and ground. Nothing here connects to a person, to the Muse
@@ -65,8 +68,9 @@ import usb_cdc
 # --- things you may need to change for your board -----------------------------
 
 #: The GPIO the switch is wired to, active-low against the internal pull-up.
-#: A0 exists on every QT Py variant (SAMD21, RP2040, ESP32-S2/S3). Any free
-#: GPIO works; change this one line.
+#: Set it to a free GPIO ON YOUR BOARD. Which pins a given QT Py exposes is a
+#: board fact, no board has been connected, and this repository has verified
+#: none of them — read the pinout for the model in your hand.
 BUTTON_PIN = board.A0
 
 #: Ignore further edges for this long after a press. A mechanical switch bounces
@@ -139,7 +143,9 @@ def main():
             # The time the transition was OBSERVED, not the time it happened.
             edge_ns = time.monotonic_ns()
             # Debounce decided AFTER the timestamp exists, so the mark stays
-            # true to first contact either way.
+            # tied to the first OBSERVED transition either way. It is not tied
+            # to the physical closure, which happened earlier by an interval
+            # nobody has measured.
             if edge_ns - last_press_ns > DEBOUNCE_MS * 1_000_000:
                 last_press_ns = edge_ns
                 emit(f"M {press_seq} {edge_ns}\n")
